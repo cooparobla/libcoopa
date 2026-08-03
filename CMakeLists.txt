@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0)
 cmake_policy(VERSION 3.0)
 
-project(trav)
+project(libcoopa)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 20)
@@ -19,4 +19,4 @@ configure_file(configuration/root_directory.h.in configuration/root_directory.h)
 include_directories(${CMAKE_BINARY_DIR}/configuration)
 
 # Add executable
-add_executable(trav coopa/test.cpp)
+add_executable(libcoopa test.cpp)
