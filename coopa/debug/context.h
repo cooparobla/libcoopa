@@ -19,7 +19,7 @@
 
 #include <coopa/debug/printer.h>
 
-namespace trav {
+namespace coopa {
 namespace debug {
 
 /**

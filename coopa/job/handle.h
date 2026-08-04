@@ -13,7 +13,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /// @brief Sentinel value representing an uninitialized or invalid handle.
@@ -223,6 +223,6 @@ private:
 };
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // JOB_HANDLE_H

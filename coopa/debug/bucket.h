@@ -18,7 +18,7 @@
 #include <iomanip>   // For std::put_time and std::setfill, std::setw
 #include <sstream>   // For std::stringstream
 
-namespace trav {
+namespace coopa {
 namespace debug {
 
 /**

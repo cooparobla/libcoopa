@@ -21,7 +21,7 @@
 
 #include <coopa/job/platform.h>
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**
@@ -231,6 +231,6 @@ private:
 };
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // COOPA_JOB_WORK_STEALING_DEQUE_H

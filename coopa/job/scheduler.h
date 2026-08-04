@@ -27,7 +27,7 @@
 #include <coopa/job/engine.h>
 #include <coopa/job/platform.h>
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**
@@ -358,6 +358,6 @@ private:
 };
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // JOBS_SCHEDULER_H

@@ -4,8 +4,8 @@
  *
  * Optimized for realtime/game-engine use with:
  * - Lock-free Chase-Lev work-stealing deques (zero mutex acquisitions in hot path)
+ * - Per-thread submission inboxes preserving single-producer Chase-Lev invariant
  * - Pre-allocated counter pool (zero heap allocations per job submission)
- * - Event-driven dependency promotion (O(1) per completion instead of O(N) scan)
  * - Spinning-then-sleeping worker strategy (avoids CV syscall overhead)
  * - Cache-line-padded per-thread state to prevent false sharing
  * - Explicit begin_frame()/end_frame() lifecycle for deterministic cleanup
@@ -41,7 +41,7 @@
 /// @brief Categorization tag for jobs (used for dedication and metrics).
 using JobType = uint32_t;
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**
@@ -98,11 +98,12 @@ public:
             c.store(0, std::memory_order_relaxed);
         }
 
-        // Initialize per-thread work-stealing deques.
+        // Initialize per-thread work-stealing deques and submission inboxes.
         for (unsigned int i = 0; i < num_threads_; ++i) {
             per_thread_deques_.push_back(
                 std::make_unique<WorkStealingDeque<Job>>(pool_capacity / num_threads_ + 256)
             );
+            per_thread_inboxes_.push_back(std::make_unique<ThreadInbox>());
         }
 
         // All threads start as general-purpose.
@@ -248,12 +249,20 @@ public:
         if (dep_count > 0) {
             std::lock_guard<std::mutex> lock(pending_jobs_mutex_);
             pending_jobs_.push_back(std::move(new_job));
+            // Wake a worker so it can check for promotable jobs.
+            wake_one_worker();
             return;
         }
 
-        // No dependencies — push directly to a worker deque.
+        // No dependencies — deposit into the target worker's inbox.
+        // Workers drain their inbox into their own deque, preserving the
+        // Chase-Lev single-producer invariant (only the owner pushes).
         unsigned int queue_index = resolve_queue_index(type);
-        per_thread_deques_[queue_index]->push(std::move(new_job));
+        {
+            auto& inbox = *per_thread_inboxes_[queue_index];
+            std::lock_guard<std::mutex> lock(inbox.mutex);
+            inbox.jobs.push_back(std::move(new_job));
+        }
 
         // Wake a worker.
         wake_one_worker();
@@ -298,7 +307,9 @@ public:
             for (const auto& task_func : task_funcs) {
                 Job new_job(task_func, type, new_handle, nullptr, 0);
                 unsigned int queue_index = resolve_queue_index(type);
-                per_thread_deques_[queue_index]->push(std::move(new_job));
+                auto& inbox = *per_thread_inboxes_[queue_index];
+                std::lock_guard<std::mutex> lock(inbox.mutex);
+                inbox.jobs.push_back(std::move(new_job));
             }
             wake_all_workers();
         }
@@ -456,6 +467,9 @@ private:
      */
     void worker_thread_loop(unsigned int thread_id, std::atomic<bool>& stop_flag) {
         while (!stop_flag.load(std::memory_order_acquire)) {
+            // Drain submission inbox into our own deque (owner-only push).
+            drain_inbox(thread_id);
+
             // Spin phase: try to find work without sleeping.
             bool found_work = false;
             for (uint32_t spin = 0; spin < k_worker_spin_count; ++spin) {
@@ -476,6 +490,31 @@ private:
             });
         }
         logger_->info("Worker thread " + std::to_string(thread_id) + " exiting.");
+    }
+
+    /**
+     * @brief Drains a worker's submission inbox into its Chase-Lev deque.
+     *
+     * This is the critical bridge that preserves the single-producer invariant:
+     * external threads deposit jobs into the inbox (mutex-guarded), and the
+     * owning worker moves them into its deque via push() (owner-only).
+     *
+     * @param thread_id The worker thread index whose inbox to drain.
+     */
+    void drain_inbox(unsigned int thread_id) {
+        auto& inbox = *per_thread_inboxes_[thread_id];
+        std::vector<Job> local_jobs;
+
+        {
+            std::lock_guard<std::mutex> lock(inbox.mutex);
+            if (inbox.jobs.empty()) return;
+            local_jobs = std::move(inbox.jobs);
+            inbox.jobs.clear();
+        }
+
+        for (auto& job : local_jobs) {
+            per_thread_deques_[thread_id]->push(std::move(job));
+        }
     }
 
     // --- Dependency Promotion ---
@@ -523,10 +562,17 @@ private:
         Job job_to_execute;
         bool job_found = false;
 
-        // 1. Try own deque.
+        // 1. If called by a worker, drain own inbox first, then try own deque.
         if (thread_id >= 0 && static_cast<unsigned int>(thread_id) < num_threads_) {
+            drain_inbox(static_cast<unsigned int>(thread_id));
             if (per_thread_deques_[thread_id]->pop(job_to_execute)) {
                 job_found = true;
+            }
+        } else {
+            // Guest worker (main thread): drain all inboxes into worker deques
+            // since workers may be sleeping with jobs queued in their inboxes.
+            for (unsigned int i = 0; i < num_threads_; ++i) {
+                drain_inbox(i);
             }
         }
 
@@ -600,13 +646,30 @@ private:
 
     // --- Member Variables ---
 
+    /**
+     * @struct ThreadInbox
+     * @brief Mutex-guarded submission inbox for a single worker thread.
+     *
+     * External threads (main thread, other submitters) deposit jobs here.
+     * The owning worker drains the inbox into its Chase-Lev deque at the
+     * start of each work-search iteration, preserving the single-producer
+     * invariant required by Chase-Lev.
+     */
+    struct ThreadInbox {
+        std::mutex mutex;       /**< Guards concurrent deposits from submitters. */
+        std::vector<Job> jobs;  /**< Pending jobs awaiting drain into the deque. */
+    };
+
     trav::debug::Logger* logger_ = nullptr;
     unsigned int num_threads_;
     CounterPool counter_pool_; /**< Pre-allocated pool of atomic counters. */
     std::vector<std::unique_ptr<trav::job::Thread>> worker_threads_;
 
-    /// @brief Per-thread lock-free work-stealing deques.
+    /// @brief Per-thread lock-free work-stealing deques (owner push/pop only).
     std::vector<std::unique_ptr<WorkStealingDeque<Job>>> per_thread_deques_;
+
+    /// @brief Per-thread submission inboxes (any thread deposits, owner drains).
+    std::vector<std::unique_ptr<ThreadInbox>> per_thread_inboxes_;
 
     /// @brief Pending jobs awaiting dependency resolution.
     std::vector<Job> pending_jobs_;
@@ -640,6 +703,6 @@ private:
 };
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // JOB_ENGINE_H

@@ -17,7 +17,7 @@
 #include <map>
 #include <string>
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**

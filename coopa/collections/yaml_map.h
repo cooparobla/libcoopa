@@ -18,12 +18,12 @@
 #include <coopa/debug/logger.h>
 
 /**
- * @namespace trav
+ * @namespace coopa
  * @brief Root namespace for the libcoopa library.
  */
-namespace trav {
+namespace coopa {
 /**
- * @namespace trav::collections
+ * @namespace coopa::collections
  * @brief Namespace containing collection utilities.
  */
 namespace collections {
@@ -299,6 +299,6 @@ private:
 };
 
 } // namespace collections
-} // namespace trav
+} // namespace coopa
 
 #endif // YAML_MAP_H

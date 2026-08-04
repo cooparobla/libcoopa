@@ -11,7 +11,7 @@
 #include <condition_variable>
 #include <algorithm> // For std::remove_if, std::find, etc.
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**

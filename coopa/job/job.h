@@ -23,7 +23,7 @@
 /// @brief Categorization tag for jobs (used for dedication and metrics).
 using JobType = uint32_t;
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**
@@ -271,6 +271,6 @@ struct Job {
 };
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // JOB_H

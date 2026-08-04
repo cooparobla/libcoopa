@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**
@@ -42,6 +42,6 @@ inline constexpr uint8_t k_max_inline_dependencies = 4;
 inline constexpr uint32_t k_worker_spin_count = 256;
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // COOPA_JOB_PLATFORM_H

@@ -150,7 +150,7 @@ void test_file_util() {
 }
 
 void test_yaml_map() {
-    trav::collections::YAMLMap map;
+    coopa::collections::YAMLMap map;
     map.set<int>("some_int", 42);
     map.set<std::string>("some_str", "hello");
     ASSERT_EQ(map.get<int>("some_int", 0), 42);
@@ -159,7 +159,7 @@ void test_yaml_map() {
     std::string test_yaml = "test_temp_config.yaml";
     map.save(test_yaml);
 
-    trav::collections::YAMLMap map_loaded = trav::collections::YAMLMap::load(test_yaml);
+    coopa::collections::YAMLMap map_loaded = coopa::collections::YAMLMap::load(test_yaml);
     ASSERT_EQ(map_loaded.get<int>("some_int", 0), 42);
     ASSERT_EQ(map_loaded.get<std::string>("some_str", ""), "hello");
     ASSERT_TRUE(map_loaded.exists("some_int"));
@@ -173,7 +173,7 @@ void test_yaml_map() {
     ASSERT_EQ(vec_loaded[1], 2);
     ASSERT_EQ(vec_loaded[2], 3);
 
-    trav::collections::YAMLMap nested;
+    coopa::collections::YAMLMap nested;
     nested.set<double>("pi", 3.14159);
     map_loaded.set<fkyaml::node>("nested", nested.get_raw_node());
     auto nested_loaded = map_loaded.get_node("nested");
@@ -183,7 +183,7 @@ void test_yaml_map() {
 }
 
 void test_parallel_queue() {
-    trav::job::ParallelQueue<int> queue;
+    coopa::job::ParallelQueue<int> queue;
     ASSERT_TRUE(queue.empty());
     ASSERT_EQ(queue.size(), 0);
 
@@ -204,7 +204,7 @@ void test_parallel_queue() {
 }
 
 void test_parallel_vector() {
-    trav::job::ParallelVector<std::string> pvec;
+    coopa::job::ParallelVector<std::string> pvec;
     ASSERT_TRUE(pvec.empty());
 
     pvec.push_back("a");
@@ -238,7 +238,7 @@ void test_parallel_vector() {
 }
 
 void test_parallel_map() {
-    trav::job::ParallelMap<std::string, int> pmap;
+    coopa::job::ParallelMap<std::string, int> pmap;
     pmap.add("one", 1);
     pmap.add("two", 2);
     ASSERT_TRUE(pmap.contains("one"));
@@ -257,11 +257,11 @@ void test_parallel_map() {
 }
 
 void test_job_engine() {
-    trav::job::JobEngine engine(4);
+    coopa::job::JobEngine engine(4);
     engine.begin_frame();
     
     std::atomic<int> counter{0};
-    trav::job::JobHandle handle = engine.create_handle();
+    coopa::job::JobHandle handle = engine.create_handle();
     
     engine.submit([&]() {
         counter.fetch_add(1);
@@ -281,8 +281,8 @@ struct ComponentA {};
 struct ComponentB {};
 
 void test_job_scheduler() {
-    trav::job::JobEngine engine(4);
-    trav::job::JobScheduler scheduler(engine);
+    coopa::job::JobEngine engine(4);
+    coopa::job::JobScheduler scheduler(engine);
 
     scheduler.begin_frame();
 
@@ -308,8 +308,8 @@ void test_job_scheduler() {
 }
 
 void test_job_scheduler_main_thread() {
-    trav::job::JobEngine engine(4);
-    trav::job::JobScheduler scheduler(engine);
+    coopa::job::JobEngine engine(4);
+    coopa::job::JobScheduler scheduler(engine);
 
     scheduler.begin_frame();
 
@@ -329,13 +329,13 @@ void test_job_scheduler_main_thread() {
 }
 
 void test_job_engine_dependencies() {
-    trav::job::JobEngine engine(4);
+    coopa::job::JobEngine engine(4);
     engine.begin_frame();
 
     std::atomic<int> value{0};
 
     // Job A: sets value to 10 after a short delay.
-    trav::job::JobHandle handle_a = engine.create_handle();
+    coopa::job::JobHandle handle_a = engine.create_handle();
     engine.submit([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         value.store(10, std::memory_order_release);
@@ -344,8 +344,8 @@ void test_job_engine_dependencies() {
     // Job B: depends on A, multiplies value by 3.
     // If dependency works, B runs after A and value becomes 30.
     // If dependency is broken, B may run before A and value could be 0*3=0 or 10.
-    trav::job::JobHandle handle_b = engine.create_handle();
-    trav::job::JobHandle deps_b[] = { handle_a };
+    coopa::job::JobHandle handle_b = engine.create_handle();
+    coopa::job::JobHandle deps_b[] = { handle_a };
     engine.submit([&]() {
         int v = value.load(std::memory_order_acquire);
         value.store(v * 3, std::memory_order_release);
@@ -358,7 +358,7 @@ void test_job_engine_dependencies() {
 }
 
 void test_job_engine_chained_dependencies() {
-    trav::job::JobEngine engine(4);
+    coopa::job::JobEngine engine(4);
     engine.begin_frame();
 
     // Track execution order: A must run before B, B before C.
@@ -366,7 +366,7 @@ void test_job_engine_chained_dependencies() {
     std::atomic<bool> order_correct{true};
 
     // Job A: sets sequence to 1.
-    trav::job::JobHandle handle_a = engine.create_handle();
+    coopa::job::JobHandle handle_a = engine.create_handle();
     engine.submit([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         int expected = 0;
@@ -376,8 +376,8 @@ void test_job_engine_chained_dependencies() {
     }, 1, handle_a);
 
     // Job B: depends on A, sets sequence to 2.
-    trav::job::JobHandle handle_b = engine.create_handle();
-    trav::job::JobHandle deps_b[] = { handle_a };
+    coopa::job::JobHandle handle_b = engine.create_handle();
+    coopa::job::JobHandle deps_b[] = { handle_a };
     engine.submit([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         int expected = 1;
@@ -387,8 +387,8 @@ void test_job_engine_chained_dependencies() {
     }, 1, handle_b, deps_b, 1);
 
     // Job C: depends on B (transitively on A), sets sequence to 3.
-    trav::job::JobHandle handle_c = engine.create_handle();
-    trav::job::JobHandle deps_c[] = { handle_b };
+    coopa::job::JobHandle handle_c = engine.create_handle();
+    coopa::job::JobHandle deps_c[] = { handle_b };
     engine.submit([&]() {
         int expected = 2;
         if (!sequence.compare_exchange_strong(expected, 3)) {
@@ -404,7 +404,7 @@ void test_job_engine_chained_dependencies() {
 }
 
 void test_job_engine_fan_in_dependencies() {
-    trav::job::JobEngine engine(4);
+    coopa::job::JobEngine engine(4);
     engine.begin_frame();
 
     // Two independent jobs (A and B) must both complete before C runs.
@@ -412,22 +412,22 @@ void test_job_engine_fan_in_dependencies() {
     std::atomic<bool> c_ran_after_both{false};
 
     // Job A: increments completed_count after delay.
-    trav::job::JobHandle handle_a = engine.create_handle();
+    coopa::job::JobHandle handle_a = engine.create_handle();
     engine.submit([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
         completed_count.fetch_add(1, std::memory_order_release);
     }, 1, handle_a);
 
     // Job B: increments completed_count after different delay.
-    trav::job::JobHandle handle_b = engine.create_handle();
+    coopa::job::JobHandle handle_b = engine.create_handle();
     engine.submit([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         completed_count.fetch_add(1, std::memory_order_release);
     }, 1, handle_b);
 
     // Job C: depends on BOTH A and B.
-    trav::job::JobHandle handle_c = engine.create_handle();
-    trav::job::JobHandle deps_c[] = { handle_a, handle_b };
+    coopa::job::JobHandle handle_c = engine.create_handle();
+    coopa::job::JobHandle deps_c[] = { handle_a, handle_b };
     engine.submit([&]() {
         // Both A and B should have completed (count == 2) before C runs.
         c_ran_after_both.store(
@@ -443,7 +443,7 @@ void test_job_engine_fan_in_dependencies() {
 }
 
 void test_work_stealing_deque() {
-    trav::job::WorkStealingDeque<int> deque(16);
+    coopa::job::WorkStealingDeque<int> deque(16);
 
     // Empty checks.
     ASSERT_TRUE(deque.empty_approx());
@@ -480,18 +480,18 @@ void test_work_stealing_deque() {
 }
 
 void test_debug_logging() {
-    trav::debug::Logger logger("TestLogger");
+    coopa::debug::Logger logger("TestLogger");
     logger.info("This is an info log");
     logger.warn("This is a warning log");
     logger.error("This is an error log");
 
-    trav::debug::DebugManager manager;
+    coopa::debug::DebugManager manager;
     auto& ctx = manager.get_context();
     ctx.info("Message from context 1", "TAG_1");
     ctx.info("Message from context 2", "TAG_2");
     manager.show();
 
-    trav::debug::DebugBucket bucket;
+    coopa::debug::DebugBucket bucket;
     auto& bctx = bucket.get_context();
     bctx.info("Bucket message 1", "BUCKET_TAG");
     bucket.show();

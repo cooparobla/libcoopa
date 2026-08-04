@@ -15,7 +15,7 @@
 #include <utility>  // For std::move, std::forward
 #include <vector>   // For snapshot method
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**

@@ -20,7 +20,7 @@
 
 #include <coopa/debug/logger.h>
 
-namespace trav {
+namespace coopa {
 namespace job {
 
 /**
@@ -128,6 +128,6 @@ private:
 };
 
 } // namespace job
-} // namespace trav
+} // namespace coopa
 
 #endif // NGIN_JOB_THREAD_H

@@ -9,7 +9,7 @@
 #include <chrono>
 #include <string>
 
-namespace trav {
+namespace coopa {
 namespace debug {
 
 /**
