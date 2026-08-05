@@ -198,10 +198,10 @@ private:
     void recompute_() const {
         // Local matrix: T * R * S
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position_);
-        glm::mat4 R = glm::eulerAngleXYZ(
-            glm::radians(rotation_degrees_.x),
+        glm::mat4 R = glm::eulerAngleZYX(
+            glm::radians(rotation_degrees_.z),
             glm::radians(rotation_degrees_.y),
-            glm::radians(rotation_degrees_.z)
+            glm::radians(rotation_degrees_.x)
         );
         glm::mat4 S = glm::scale(glm::mat4(1.0f), scale_);
         local_matrix_ = T * R * S;
