@@ -142,7 +142,39 @@ public:
         return scene;
     }
 
+    /**
+     * @brief Signature for an externally-registered component parser.
+     *
+     * Receives the raw component YAML node and the SceneObject it should attach
+     * to (already carrying its TransformComponent). Implementations should call
+     * `obj.add_component<T>()` and populate it from `node`.
+     */
+    using ComponentParser = std::function<void(const fkyaml::node& node, SceneObject& obj)>;
+
+    /**
+     * @brief Registers a parser for a component YAML tag not built into SceneLoader.
+     *
+     * Lets libraries outside libcoopa (e.g. uicoopa) extend scene loading without
+     * SceneLoader depending on them. Registering the same tag twice replaces the
+     * previous parser. Built-in tags (e.g. "!Transform", "!MeshRenderer") cannot
+     * be overridden — they are handled before the registry is consulted.
+     *
+     * @param tag YAML tag string as it appears in the scene file, e.g. "!RectTransform".
+     * @param fn  Parser invoked when a component node carries this tag.
+     */
+    static void register_component_parser(const std::string& tag, ComponentParser fn) {
+        parsers_()[tag] = std::move(fn);
+    }
+
 private:
+    /**
+     * @brief Function-local static registry of externally-registered component parsers.
+     */
+    static std::unordered_map<std::string, ComponentParser>& parsers_() {
+        static std::unordered_map<std::string, ComponentParser> registry;
+        return registry;
+    }
+
     /**
      * @brief Loads a CAMLMap from a path, detecting .yaml vs .caml by extension.
      */
@@ -492,8 +524,15 @@ private:
                 }
             }
             anim->parse_node(node);
+        } else {
+            // Not a built-in tag — consult the externally-registered registry.
+            // Unrecognized tags still fall through silently for forward compatibility.
+            auto& registry = parsers_();
+            auto it = registry.find(tag);
+            if (it != registry.end()) {
+                it->second(node, obj);
+            }
         }
-        // Unknown tags are silently ignored for forward compatibility.
     }
 
     /**
