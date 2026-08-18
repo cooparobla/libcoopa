@@ -1,6 +1,14 @@
 # Scene Module (`coopa::scene`)
 
-The `scene` module provides the scene graph hierarchy, component-based entity model, scene lifecycle management, and YAML/CAML scene loading for **Blendy**.
+The `scene` module provides the scene graph hierarchy, component-based entity
+model, scene lifecycle management, and YAML scene loading. It is
+**dependency-free**: nothing in this module includes gfxcoopa, caml, uicoopa,
+or any other sibling repo — only libcoopa's own vendored `fkYAML` and `glm`.
+Every renderer-specific or UI-specific component (mesh renderers, cameras,
+lights, GI/reflection probes, RectTransform, ...) lives outside libcoopa and
+is parsed via `SceneLoader::register_component_parser()`, never by this
+module directly. gfxcoopa's `engine::components::register_render_components()`
+and uicoopa's `register_ui_components()` are the two current registrants.
 
 ---
 
@@ -36,8 +44,9 @@ The `scene` module provides the scene graph hierarchy, component-based entity mo
                                 ┌───────────────────────┐
                                 │       Component       │
                                 ├───────────────────────┤
-                                │ Transform, Mesh,      │
-                                │ Camera, Lights...     │
+                                │ Transform, Animation  │  (defined here)
+                                │ MeshRenderer, Camera,  │  (defined by gfxcoopa)
+                                │ RectTransform, Canvas  │  (defined by uicoopa)
                                 └───────────────────────┘
 ```
 
@@ -50,17 +59,21 @@ The `scene` module provides the scene graph hierarchy, component-based entity mo
 │                                 SCENE LOADING LIFECYCLE                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 
-  Application           SceneManager            SceneLoader           caml::CAMLMap
-      │                      │                       │                      │
-      │── load_scene(path) ─►│                       │                      │
-      │                      │── load(path, ...) ───►│                      │
-      │                      │                       │── load_map_(path) ──►│
-      │                      │                       │◄─ fkyaml::node ──────│
-      │                      │                       │
-      │                      │                       │── Build Scene Tree
-      │                      │                       │── Upload GPU Meshes
-      │                      │◄── Scene Instance ────│
-      │◄── Scene Ready ──────│
+  Application            SceneManager             SceneLoader              fkYAML
+      │                       │                        │                     │
+      │── register_component_parser(...) for every non-Transform/Animation component
+      │                       │                        │                     │
+      │── load_scene(path) ──►│                        │                     │
+      │                       │── load(path) ─────────►│                     │
+      │                       │                        │── deserialize() ───►│
+      │                       │                        │◄─ fkyaml::node ─────│
+      │                       │                        │
+      │                       │                        │── Build Scene Tree
+      │                       │                        │── Dispatch each component
+      │                       │                        │   node to its registered
+      │                       │                        │   parser by tag/type name
+      │                       │◄── Scene Instance ─────│
+      │◄── Scene Ready ───────│
 ```
 
 ---
@@ -70,10 +83,10 @@ The `scene` module provides the scene graph hierarchy, component-based entity mo
 | Class | Primary Owner | Contained Members | Responsibility |
 |---|---|---|---|
 | `SceneManager` | Main Engine Application | `std::unique_ptr<Scene>` | High-level orchestrator managing active scene swapping and lifecycle |
-| `Scene` | `SceneManager` | `std::vector<std::unique_ptr<SceneObject>>` | Root scene node holding top-level objects, active camera, and directional light pointers |
+| `Scene` | `SceneManager` | `std::vector<std::unique_ptr<SceneObject>>` | Root scene node holding top-level objects; generic component queries |
 | `SceneObject` | `Scene` or parent `SceneObject` | `std::vector<std::unique_ptr<Component>>`, `children` | Entity node holding component instances and recursive child hierarchy |
-| `Component` | `SceneObject` | Non-owning raw `owner` pointer | Abstract base class for transform, visual, lighting, probe, and animation behaviors |
-| `SceneLoader` | `SceneManager` (transient context) | Asset cache maps (`Mesh`, GPU resources) | Parses `.yaml`/`.caml` scene descriptions and uploads GPU assets |
+| `Component` | `SceneObject` | Non-owning raw `owner` pointer | Abstract base class for all component behaviors |
+| `SceneLoader` | Static/stateless | Registry of external `ComponentParser`s | Parses `.yaml` scene descriptions, dispatching non-built-in components externally |
 
 ---
 
@@ -89,44 +102,58 @@ Abstract base class for all scene components:
 
 ### [`scene.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene.h)
 
-Root container for a loaded scene:
-- Owns all root-level `SceneObject` instances via `std::unique_ptr`.
-- Tracks pointers to the active primary `CameraComponent` and `DirectionalLightComponent`.
-- Provides traversal helper queries:
-  - `get_renderable_objects()`: Returns flat vector of objects containing a `MeshRenderer`.
-  - `get_point_lights()`: Collects all active `PointLightComponent` instances.
-  - `get_gi_probe_volumes()`: Collects active `GiProbeVolumeComponent` instances.
-  - `get_reflection_probes()`: Collects active `ReflectionProbeComponent` instances.
-  - `find_object(name)`: Depth-first search for an object by name.
+Root container for a loaded scene. Owns all root-level `SceneObject` instances
+via `std::unique_ptr`, and knows nothing about any specific component type —
+callers use these generic templated queries instead:
+- `get_components<T>()`: Flat vector of every active `T` in the hierarchy.
+- `find_objects_with<T>()`: Flat vector of every active `SceneObject` carrying a `T`.
+- `find_first_component<T>()`: The first active `T` found, pre-order.
+- `find_object(name)`: Depth-first search for an object by name.
+
+Renderer-facing code (blendy, gfxcoopa's GI system) builds these into a more
+convenient shape via gfxcoopa's `engine::components::SceneView` adapter rather
+than calling them directly.
 
 ### [`scene_object.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_object.h)
 
 The core node in the scene tree (equivalent to Unity's `GameObject`):
 - Holds object name, active state flag, non-owning parent pointer, list of owned components, and list of owned child objects.
 - Component API: `add_component<T>(...)`, `get_component<T>()`, `attach_component(...)`.
-- Convenient getters: `get_transform()`, `get_mesh_renderer()`, `get_animation()`.
-- Hierarchy API: `add_child(...)`, `for_each_recursive(fn)`.
+- Convenient getter: `get_transform()` (the one component type this module defines).
+- Hierarchy API: `add_child(...)`, `detach_child(...)`, `set_parent(...)`, `find_descendant(name)`, `for_each_recursive(fn)`.
 - Life-cycle methods (`start()`, `update(dt)`) recurse through attached components and active children.
 
 ### [`scene_manager.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_manager.h)
 
 High-level manager for scene lifecycle:
-- Wraps scene loading (`load_scene`) via `SceneLoader`.
+- Wraps scene loading (`load_scene`) via `SceneLoader`. Default-constructible —
+  carries no GPU handles of its own.
 - Owns the currently active `Scene`.
 - Delegates frame updates (`update(delta_time)`) to the active scene.
 
 ### [`scene_loader.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)
 
-Parser and GPU asset loader for scene files:
-- Supports both `.yaml` and `.caml` extensions using `caml::CAMLMap`.
-- Parses Blender-exported YAML structures (`!Transform`, `!MeshRenderer`, `!Camera`, `!Light`, `!GiProbeVolume`, `!ReflectionProbe`, `!Animation`).
-- Deduplicates and uploads GPU mesh resources (`coopa::gfx::engine::Mesh`) into a mesh cache.
+Parser for YAML scene files:
+- Understands hierarchy plus the two component types this module defines:
+  `!Transform` / `type: Transform` and `!Animation` / `type: Animation`.
+- Every other component name is dispatched to whatever parser was registered
+  for it via `register_component_parser(name, fn)`; unregistered names are
+  silently skipped. A leading `!` is stripped before matching, so a YAML tag
+  and a `type:` key spelling reach the same registered parser.
+- `set_document_loader(fn)` lets an application route parsing through
+  something other than a plain file on disk — e.g. an encrypted/compressed
+  container — without this module depending on whatever that requires.
+- `ParseContext{scene_path, scene_dir}` is passed to every parser so it can
+  resolve asset paths relative to the scene file.
 
 ---
 
 ## Component Submodule
 
-For detailed documentation on individual component types, see the [Components Submodule README](file:///home/coopa/git/libcoopa/coopa/scene/components/README.md).
+For detailed documentation on the two component types defined here, see the
+[Components Submodule README](file:///home/coopa/git/libcoopa/coopa/scene/components/README.md).
+Renderer components live in gfxcoopa's `engine/components/`; UI components
+live in uicoopa's `uicoopa/`.
 
 ---
 
@@ -135,19 +162,19 @@ For detailed documentation on individual component types, see the [Components Su
 ```cpp
 #include <coopa/scene/scene_manager.h>
 #include <coopa/scene/scene_object.h>
-#include <coopa/scene/components/transform_component.h>
-#include <coopa/scene/components/mesh_renderer.h>
+#include <gfxcoopa/engine/components/register.h>
 
-// 1. Initialize scene manager
-coopa::scene::SceneManager manager(device, allocator, command_pool);
+// 1. Register every non-Transform/Animation component this application needs.
+coopa::gfx::engine::components::register_render_components(device, allocator, cmd_pool);
 
-// 2. Load scene from YAML description file
+// 2. Initialize scene manager and load a scene.
+coopa::scene::SceneManager manager;
 manager.load_scene("assets/scenes/gi_cornell_box/scene.yaml");
 
-// 3. Obtain active scene
-auto* scene = manager.get_active_scene();
+// 3. Obtain active scene.
+auto& scene = manager.get_active_scene();
 
-// 4. Update scene hierarchy per frame
+// 4. Update scene hierarchy per frame.
 float delta_time = 0.016f; // 60 FPS frame delta
 manager.update(delta_time);
 ```

@@ -9,12 +9,12 @@
 #include <coopa/scene/component.h>
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/components/transform_component.h>
-#include <caml/caml.h>
 #include <fkYAML/node.hpp>
 #include <glm/glm.hpp>
 #include <string>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 
 namespace coopa {
@@ -57,8 +57,11 @@ public:
     void load_from_yaml(const std::string& filepath) {
         animation_file = filepath;
         try {
-            caml::CAMLMap map = caml::CAMLMap::load_yaml(filepath);
-            const auto& root = map.get_raw_node();
+            std::ifstream ifs(filepath);
+            if (!ifs) {
+                throw std::runtime_error("failed to open file");
+            }
+            fkyaml::node root = fkyaml::node::deserialize(ifs);
             parse_node(root);
         } catch (const std::exception& e) {
             std::cerr << "[AnimationComponent] Failed to load animation file '"

@@ -2,8 +2,10 @@
  * @file scene_object.h
  * @brief Named scene node with a component list and child hierarchy.
  *
- * SceneObject is the "GameObject" of the scene graph. Each object always has
- * a TransformComponent as its first component (added at construction).
+ * SceneObject is the "GameObject" of the scene graph. It carries no
+ * assumptions about which component types exist — those are supplied by
+ * callers (e.g. SceneLoader adds a TransformComponent to every parsed
+ * object, but a programmatically-built SceneObject starts with none).
  * Components are owned via unique_ptr; children are also owned.
  */
 
@@ -11,6 +13,7 @@
 #define COOPA_SCENE_SCENE_OBJECT_H
 
 #include <coopa/scene/component.h>
+#include <coopa/scene/components/transform_component.h>
 #include <algorithm>
 #include <memory>
 #include <vector>
@@ -22,12 +25,6 @@
 namespace coopa {
 namespace scene {
 
-// Forward declarations to avoid circular includes.
-// Implementations are provided inline after the class definition.
-class TransformComponent;
-class MeshRenderer;
-class AnimationComponent;
-
 /**
  * @class SceneObject
  * @brief A named node in the scene hierarchy, owning components and child objects.
@@ -35,7 +32,7 @@ class AnimationComponent;
  * Usage:
  * @code
  * auto obj = std::make_unique<SceneObject>("Cube");
- * auto* mesh = obj->add_component<MeshRenderer>();
+ * auto* tc = obj->add_component<TransformComponent>();
  * obj->add_child(std::make_unique<SceneObject>("Child"));
  * @endcode
  */
@@ -44,8 +41,9 @@ public:
     /**
      * @brief Constructs a SceneObject with the given name.
      *
-     * A TransformComponent is always added first (added by SceneLoader after construction
-     * to allow forward-declaration of TransformComponent).
+     * Carries no components until add_component()/attach_component() is
+     * called — SceneLoader adds a TransformComponent to every object it
+     * parses, but that is a loader convention, not a guarantee of this class.
      *
      * @param name The object's name.
      * @param active Whether the object is active on creation.
@@ -150,26 +148,15 @@ public:
     /**
      * @brief Returns the TransformComponent (convenience alias for get_component<TransformComponent>).
      *
-     * Avoids template syntax in generic pipeline code.
+     * Avoids template syntax in generic pipeline code. TransformComponent is
+     * the one component type the scene system itself defines, so this
+     * accessor is safe to keep here without pulling in any external module.
      *
      * @return Pointer to the TransformComponent, or nullptr if missing.
      */
-    TransformComponent* get_transform() const;
-
-    /**
-     * @brief Returns the MeshRenderer component (convenience alias).
-     *
-     * Avoids template syntax in generic pipeline code.
-     *
-     * @return Pointer to the MeshRenderer, or nullptr if missing.
-     */
-    MeshRenderer* get_mesh_renderer() const;
-
-    /**
-     * @brief Returns the AnimationComponent (convenience alias).
-     * @return Pointer to the AnimationComponent, or nullptr if missing.
-     */
-    AnimationComponent* get_animation() const;
+    TransformComponent* get_transform() const {
+        return get_component<TransformComponent>();
+    }
 
     /**
      * @brief Directly attaches a pre-constructed component (takes ownership).
@@ -190,6 +177,16 @@ public:
 
     /**
      * @brief Adds a child SceneObject (takes ownership).
+     *
+     * Only the SceneObject ownership link is established here — a child's
+     * TransformComponent (if any) is NOT auto-linked to this object's
+     * Transform, because SceneLoader::parse_object_ already performs that
+     * linking explicitly (via TransformComponent::set_parent_transform)
+     * before calling add_child, and doing it again here would register the
+     * child's Transform twice in the parent's dirty-propagation list.
+     * Callers building a hierarchy by hand must link transforms themselves;
+     * set_parent() below does this automatically for reparenting.
+     *
      * @param child The child to add. Its parent pointer is set to this.
      * @return Raw pointer to the child.
      */
@@ -204,7 +201,9 @@ public:
      * @brief Detaches a child from this object without destroying it.
      *
      * The returned unique_ptr owns the detached subtree; the child's parent
-     * pointer is cleared. Caller is responsible for re-parenting or discarding it.
+     * pointer is cleared, and its TransformComponent (if any) is unlinked
+     * from this object's Transform child-list so no dangling pointer is left
+     * behind for dirty-flag propagation.
      *
      * @param child Pointer to the direct child to detach.
      * @return Owning pointer to the detached child, or nullptr if not found.
@@ -214,6 +213,12 @@ public:
             [child](const std::unique_ptr<SceneObject>& c) { return c.get() == child; });
         if (it == children_.end()) return nullptr;
         std::unique_ptr<SceneObject> detached = std::move(*it);
+        if (auto* child_tc = detached->get_transform()) {
+            if (auto* self_tc = get_transform()) {
+                self_tc->transform().remove_child(&child_tc->transform());
+            }
+            child_tc->transform().set_parent(nullptr);
+        }
         children_.erase(it);
         detached->parent_ = nullptr;
         return detached;
@@ -223,10 +228,11 @@ public:
      * @brief Reparents this object under new_parent, preserving the subtree.
      *
      * Detaches this object from its current parent (if any) and adds it to
-     * new_parent's children. No-op if new_parent is already the current parent.
-     * Does not update any coopa::util::Transform parent links; callers that use
-     * TransformComponent must call TransformComponent::set_parent_transform
-     * separately to keep world-matrix propagation correct.
+     * new_parent's children. No-op if new_parent is already the current
+     * parent. If this object carries a TransformComponent, its Transform is
+     * also re-linked under new_parent's TransformComponent (or unlinked to
+     * root if new_parent has none) — detach_child() already unlinks it from
+     * the old Transform parent, so this only needs to (re)link the new side.
      *
      * @param new_parent The SceneObject to become the new parent. Must not be null.
      * @throws std::runtime_error if this object has no current SceneObject parent
@@ -241,6 +247,10 @@ public:
                 "(likely a Scene root object); reparent it via Scene::root_objects() instead.");
         }
         std::unique_ptr<SceneObject> self_owned = parent_->detach_child(this);
+        if (auto* self_tc = self_owned->get_transform()) {
+            auto* new_parent_tc = new_parent->get_transform();
+            self_tc->set_parent_transform(new_parent_tc ? &new_parent_tc->transform() : nullptr);
+        }
         new_parent->add_child(std::move(self_owned));
     }
 
@@ -272,6 +282,24 @@ public:
         }
     }
 
+    /**
+     * @brief Depth-first search for a descendant with the given name.
+     *
+     * Excludes this object itself — only children and further descendants
+     * are considered. Useful for resolving cross-references stored as names
+     * in scene YAML (e.g. ScrollRect::content) once the whole tree exists.
+     *
+     * @param name Name to search for.
+     * @return Non-owning pointer to the first matching descendant, or nullptr.
+     */
+    SceneObject* find_descendant(const std::string& name) const {
+        for (const auto& child : children_) {
+            if (child->name() == name) return child.get();
+            if (SceneObject* found = child->find_descendant(name)) return found;
+        }
+        return nullptr;
+    }
+
     // --- Lifecycle ---
 
     /**
@@ -300,31 +328,6 @@ private:
     std::vector<std::unique_ptr<Component>>  components_; /**< Owned components. */
     std::vector<std::unique_ptr<SceneObject>>children_;  /**< Owned children. */
 };
-
-} // namespace scene
-} // namespace coopa
-
-// Inline implementations of get_transform() and get_mesh_renderer().
-// These are defined AFTER the class to allow use of incomplete types inside the class,
-// and use the component headers which may themselves include scene_object.h (guarded by include guards).
-#include <coopa/scene/components/transform_component.h>
-#include <coopa/scene/components/mesh_renderer.h>
-#include <coopa/scene/components/animation_component.h>
-
-namespace coopa {
-namespace scene {
-
-inline TransformComponent* SceneObject::get_transform() const {
-    return get_component<TransformComponent>();
-}
-
-inline MeshRenderer* SceneObject::get_mesh_renderer() const {
-    return get_component<MeshRenderer>();
-}
-
-inline AnimationComponent* SceneObject::get_animation() const {
-    return get_component<AnimationComponent>();
-}
 
 } // namespace scene
 } // namespace coopa

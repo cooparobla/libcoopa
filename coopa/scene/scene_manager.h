@@ -11,9 +11,6 @@
 
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_loader.h>
-#include <gfxcoopa/core/device.h>
-#include <gfxcoopa/memory/allocator.h>
-#include <gfxcoopa/command/command_pool.h>
 #include <memory>
 #include <string>
 #include <stdexcept>
@@ -27,7 +24,7 @@ namespace scene {
  *
  * Usage:
  * @code
- * SceneManager mgr(device, allocator, cmd_pool);
+ * SceneManager mgr;
  * mgr.load_scene("assets/scenes/cube/scene.yaml");
  * // Per frame:
  * mgr.update(delta_time);
@@ -36,30 +33,20 @@ namespace scene {
  */
 class SceneManager {
 public:
-    /**
-     * @brief Constructs the manager with the Vulkan resources needed for mesh loading.
-     * @param device    Vulkan logical device.
-     * @param allocator VMA allocator.
-     * @param cmd_pool  Command pool for staging transfers.
-     */
-    SceneManager(coopa::gfx::core::Device&         device,
-                 coopa::gfx::memory::Allocator&    allocator,
-                 coopa::gfx::command::CommandPool& cmd_pool)
-        : device_(device), allocator_(allocator), cmd_pool_(cmd_pool)
-    {}
+    SceneManager() = default;
 
     /**
      * @brief Loads a scene from the given path (replaces any previously active scene).
      *
-     * Accepts both .yaml and .caml files.
+     * Any component types beyond Transform/Animation must already have their
+     * parsers registered (see SceneLoader::register_component_parser) — this
+     * class holds no rendering-specific resources of its own.
      *
      * @param path Path to the scene file.
      * @throws std::runtime_error on load failure.
      */
     void load_scene(const std::string& path) {
-        active_scene_ = std::make_unique<Scene>(
-            SceneLoader::load(path, device_, allocator_, cmd_pool_)
-        );
+        active_scene_ = std::make_unique<Scene>(SceneLoader::load(path));
     }
 
     /**
@@ -93,10 +80,7 @@ public:
     }
 
 private:
-    coopa::gfx::core::Device&         device_;    /**< Vulkan device (not owned). */
-    coopa::gfx::memory::Allocator&    allocator_; /**< VMA allocator (not owned). */
-    coopa::gfx::command::CommandPool& cmd_pool_;  /**< Command pool (not owned). */
-    std::unique_ptr<Scene>            active_scene_; /**< Owned active scene. */
+    std::unique_ptr<Scene> active_scene_; /**< Owned active scene. */
 };
 
 } // namespace scene
