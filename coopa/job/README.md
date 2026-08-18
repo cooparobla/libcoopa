@@ -40,8 +40,8 @@ graph TD
 #include <coopa/job/scheduler.h>
 
 void game_frame() {
-    trav::job::JobEngine engine;
-    trav::job::JobScheduler scheduler(engine);
+    coopa::job::JobEngine engine;
+    coopa::job::JobScheduler scheduler(engine);
 
     struct Position { float x, y; };
     struct Velocity { float dx, dy; };
@@ -80,11 +80,11 @@ void game_frame() {
 #include <coopa/job/engine.h>
 
 void direct_submit() {
-    trav::job::JobEngine engine(4); // 4 worker threads
+    coopa::job::JobEngine engine(4); // 4 worker threads
     engine.begin_frame();
 
     // Allocate a handle from the counter pool
-    trav::job::JobHandle handle = engine.create_handle();
+    coopa::job::JobHandle handle = engine.create_handle();
 
     // Submit jobs
     engine.submit([]() { /* work A */ }, 1, handle);

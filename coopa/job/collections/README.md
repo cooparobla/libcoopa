@@ -23,7 +23,7 @@ The `job/collections` module provides thread-safe wrappers for standard data str
 #include <coopa/job/collections/queue.h>
 
 void producer_consumer_sample() {
-    trav::job::ParallelQueue<int> tasks;
+    coopa::job::ParallelQueue<int> tasks;
     
     // Thread A: Push tasks
     tasks.push(42);

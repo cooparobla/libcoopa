@@ -73,7 +73,7 @@ public:
             ss << std::put_time(&tm_snapshot, "%H:%M:%S") << '.'
                << std::setfill('0') << std::setw(3) << ms.count();
             
-            // Format output similar to trav::debug::Logger class
+            // Format output similar to coopa::debug::Logger class
             std::cout << ss.str() << " [INFO]::(parallel)::[\e[3m" << log_msg.type << "\e[0m]"
                       << " " << log_msg.message << std::endl;
         }
@@ -88,7 +88,7 @@ public:
     }
 
 private:
-    trav::job::ParallelQueue<LogMessage> log_queue_; /**< Thread-safe queue storing logged messages. */
+    coopa::job::ParallelQueue<LogMessage> log_queue_; /**< Thread-safe queue storing logged messages. */
     DebugContext context_ = DebugContext(log_queue_); /**< Associated log context wrapper. */
 };
 

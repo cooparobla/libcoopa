@@ -29,6 +29,7 @@
 #include <coopa/job/thread.h>
 #include <coopa/job/engine.h>
 #include <coopa/job/scheduler.h>
+#include <coopa/event/signal.h>
 
 // ANSI Colors for nice UI
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -497,6 +498,203 @@ void test_debug_logging() {
     bucket.show();
 }
 
+// ---------------------------------------------------------
+// coopa::event::Signal
+// ---------------------------------------------------------
+
+void test_signal_basic_emit() {
+    using coopa::event::Signal;
+    using coopa::event::k_invalid_slot;
+
+    Signal<int> s;
+    int a = 0, b = 0;
+    s.connect([&](int v) { a += v; });
+    s.connect([&](int v) { b += v; });
+    ASSERT_TRUE(s.slot_count() == 2);
+
+    s.emit(5);
+    ASSERT_TRUE(a == 5 && b == 5);
+    s.emit(5);
+    ASSERT_TRUE(a == 10 && b == 10);
+
+    Signal<> empty_signal;
+    ASSERT_TRUE(empty_signal.slot_count() == 0);
+    empty_signal.emit();  // no-op, must not throw/crash
+
+    auto c = empty_signal.connect({});  // empty std::function is ignored
+    ASSERT_TRUE(c.id() == k_invalid_slot);
+    ASSERT_TRUE(empty_signal.slot_count() == 0);
+}
+
+void test_signal_disconnect() {
+    using coopa::event::Signal;
+
+    Signal<int> s;
+    int a = 0, b = 0, c = 0;
+    s.connect([&](int v) { a += v; });
+    auto cb = s.connect([&](int v) { b += v; });
+    s.connect([&](int v) { c += v; });
+
+    ASSERT_TRUE(cb.disconnect());
+    ASSERT_TRUE(s.slot_count() == 2);
+
+    s.emit(1);
+    ASSERT_TRUE(a == 1 && b == 0 && c == 1);  // order preserved after removing the middle slot
+
+    ASSERT_TRUE(!cb.connected());
+    ASSERT_TRUE(!cb.disconnect());       // already gone
+    ASSERT_TRUE(!s.disconnect(99999));   // unknown id
+}
+
+void test_signal_scoped_connection() {
+    using coopa::event::Signal;
+    using coopa::event::ScopedConnection;
+
+    Signal<> s;
+    int count = 0;
+    {
+        ScopedConnection sc = s.connect_scoped([&] { ++count; });
+        ASSERT_TRUE(s.slot_count() == 1);
+        s.emit();
+    }
+    ASSERT_TRUE(s.slot_count() == 0);  // scope exit disconnected it
+    s.emit();
+    ASSERT_TRUE(count == 1);
+
+    ScopedConnection outer;
+    {
+        ScopedConnection inner = s.connect_scoped([&] { ++count; });
+        outer = std::move(inner);  // move-construct/assign out of the inner scope
+    }
+    ASSERT_TRUE(s.slot_count() == 1);
+    s.emit();
+    ASSERT_TRUE(count == 2);
+
+    ScopedConnection other = s.connect_scoped([&] { ++count; });
+    ASSERT_TRUE(s.slot_count() == 2);
+    outer = std::move(other);  // move-assign over a live connection disconnects the old one
+    ASSERT_TRUE(s.slot_count() == 1);
+
+    auto released = outer.release();  // gives up ownership without disconnecting
+    ASSERT_TRUE(released.connected());
+}
+
+void test_signal_reentrancy_self_disconnect() {
+    using coopa::event::Signal;
+    using coopa::event::Connection;
+
+    Signal<> s;
+    int calls = 0;
+    int after_disconnect_marker = 0;
+    Connection self;
+    self = s.connect([&] {
+        ++calls;
+        self.disconnect();
+        // If Signal destroyed the running std::function on disconnect() (rather than
+        // tombstoning it), this write would be use-after-free.
+        after_disconnect_marker = 42;
+    });
+
+    s.emit();
+    ASSERT_TRUE(calls == 1);
+    ASSERT_TRUE(after_disconnect_marker == 42);
+    s.emit();
+    ASSERT_TRUE(calls == 1);  // it really disconnected
+}
+
+void test_signal_reentrancy_connect_during_emit() {
+    using coopa::event::Signal;
+    using coopa::event::Connection;
+    using coopa::event::k_invalid_slot;
+
+    Signal<> s;
+    int a_calls = 0, b_calls = 0, c_calls = 0;
+    Connection c_conn;
+    s.connect([&] {
+        ++a_calls;
+        s.connect([&] { ++b_calls; });  // connecting mid-emit must not run this emit
+        if (c_conn.id() != k_invalid_slot) c_conn.disconnect();
+    });
+    c_conn = s.connect([&] { ++c_calls; });
+
+    s.emit();
+    ASSERT_TRUE(a_calls == 1);
+    ASSERT_TRUE(b_calls == 0);  // connected during this emit: runs next time, not now
+    ASSERT_TRUE(c_calls == 0);  // disconnected earlier in this same emit: skipped
+    ASSERT_TRUE(s.slot_count() == 2);  // a + b; c was removed
+
+    s.emit();
+    ASSERT_TRUE(b_calls == 1);
+}
+
+void test_signal_disconnect_all_and_id_reuse() {
+    using coopa::event::Signal;
+
+    Signal<> s;
+    auto c1 = s.connect([] {});
+    auto c2 = s.connect([] {});
+    auto c3 = s.connect([] {});
+
+    s.disconnect_all();
+    ASSERT_TRUE(s.empty());
+    s.emit();  // no-op
+    ASSERT_TRUE(!c1.connected() && !c2.connected() && !c3.connected());
+
+    int fired = 0;
+    s.connect([&] { ++fired; });
+    s.emit();
+    ASSERT_TRUE(fired == 1);
+    ASSERT_TRUE(!c1.connected());  // ids are never reused, so the old token stays dead
+}
+
+void test_signal_connection_outlives_signal() {
+    using coopa::event::Signal;
+    using coopa::event::ScopedConnection;
+
+    auto sig = std::make_unique<Signal<>>();
+    auto conn = sig->connect([] {});
+    ScopedConnection sc = sig->connect_scoped([] {});
+
+    sig.reset();
+
+    ASSERT_TRUE(!conn.connected());
+    ASSERT_TRUE(!conn.disconnect());
+    // sc's destructor runs at scope exit and must not crash on the dead signal.
+}
+
+void test_signal_destroyed_from_slot() {
+    using coopa::event::Signal;
+
+    auto sig = std::make_unique<Signal<>>();
+    bool ran = false;
+    sig->connect([&] {
+        ran = true;
+        sig.reset();  // destroys the Signal while its own emit() is on the stack
+    });
+
+    sig->emit();  // must unwind cleanly rather than touching *sig afterward
+    ASSERT_TRUE(ran);
+}
+
+void test_signal_reference_args_no_copy() {
+    using coopa::event::Signal;
+
+    struct Payload {
+        int copies = 0;
+        Payload() = default;
+        Payload(const Payload& other) : copies(other.copies + 1) {}
+    };
+
+    Signal<const Payload&> s;
+    int seen_copies = 0;
+    s.connect([&](const Payload& p) { seen_copies += p.copies; });
+    s.connect([&](const Payload& p) { seen_copies += p.copies; });
+
+    Payload p;
+    s.emit(p);
+    ASSERT_TRUE(seen_copies == 0);  // emit() forwards the reference, never copies the argument
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -518,6 +716,15 @@ int main() {
     RUN_TEST(test_job_engine_fan_in_dependencies);
     RUN_TEST(test_work_stealing_deque);
     RUN_TEST(test_debug_logging);
+    RUN_TEST(test_signal_basic_emit);
+    RUN_TEST(test_signal_disconnect);
+    RUN_TEST(test_signal_scoped_connection);
+    RUN_TEST(test_signal_reentrancy_self_disconnect);
+    RUN_TEST(test_signal_reentrancy_connect_during_emit);
+    RUN_TEST(test_signal_disconnect_all_and_id_reuse);
+    RUN_TEST(test_signal_connection_outlives_signal);
+    RUN_TEST(test_signal_destroyed_from_slot);
+    RUN_TEST(test_signal_reference_args_no_copy);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

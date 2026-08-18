@@ -9,7 +9,7 @@ The main component is `YAMLMap` (defined in [`yaml_map.h`](./yaml_map.h)), which
 - **Constructors**: Supports default empty mappings or wrapping pre-existing `fkYAML` nodes.
 - **I/O Functions**: Loads configuration files safely (`load`) and serializes modifications back to files (`save`).
 - **Data Access & Mutators**: Offers template-based getters (`get`) and setters (`set`) supporting standard scalars as well as sequences/vectors of elements.
-- **Diagnostics logging**: Integration with `trav::debug::Logger` for formatting/dumping configuration states.
+- **Diagnostics logging**: Integration with `coopa::debug::Logger` for formatting/dumping configuration states.
 
 ## Basic Usage Example
 
@@ -18,10 +18,10 @@ The main component is `YAMLMap` (defined in [`yaml_map.h`](./yaml_map.h)), which
 #include <coopa/debug/logger.h>
 
 void load_and_log_config() {
-    trav::debug::Logger logger("App");
+    coopa::debug::Logger logger("App");
     
     // Load config
-    auto config = trav::collections::YAMLMap::load("config.yaml");
+    auto config = coopa::collections::YAMLMap::load("config.yaml");
     
     // Read values with default fallbacks
     std::string api_url = config.get<std::string>("api_url", "http://localhost");

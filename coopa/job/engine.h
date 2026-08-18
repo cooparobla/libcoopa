@@ -83,7 +83,7 @@ public:
      */
     JobEngine(unsigned int num_threads = std::thread::hardware_concurrency(),
               uint32_t pool_capacity = k_default_job_pool_capacity)
-        : logger_(new trav::debug::Logger("JobEngine")),
+        : logger_(new coopa::debug::Logger("JobEngine")),
           num_threads_(num_threads > 0 ? num_threads : 1),
           counter_pool_(pool_capacity),
           submit_thread_index_(0),
@@ -112,7 +112,7 @@ public:
 
         // Spawn worker threads.
         for (unsigned int i = 0; i < num_threads_; ++i) {
-            worker_threads_.emplace_back(std::make_unique<trav::job::Thread>(
+            worker_threads_.emplace_back(std::make_unique<coopa::job::Thread>(
                 i,
                 [this](unsigned int thread_id, std::atomic<bool>& stop_flag, std::mutex& /*mtx*/, std::condition_variable& /*cv*/) {
                     this->worker_thread_loop(thread_id, stop_flag);
@@ -660,10 +660,10 @@ private:
         std::vector<Job> jobs;  /**< Pending jobs awaiting drain into the deque. */
     };
 
-    trav::debug::Logger* logger_ = nullptr;
+    coopa::debug::Logger* logger_ = nullptr;
     unsigned int num_threads_;
     CounterPool counter_pool_; /**< Pre-allocated pool of atomic counters. */
-    std::vector<std::unique_ptr<trav::job::Thread>> worker_threads_;
+    std::vector<std::unique_ptr<coopa::job::Thread>> worker_threads_;
 
     /// @brief Per-thread lock-free work-stealing deques (owner push/pop only).
     std::vector<std::unique_ptr<WorkStealingDeque<Job>>> per_thread_deques_;

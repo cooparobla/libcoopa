@@ -32,7 +32,7 @@ public:
      * @brief Constructs a DebugContext associated with a specific queue.
      * @param log_queue The ParallelQueue to push log messages into.
      */
-    DebugContext(trav::job::ParallelQueue<LogMessage>& log_queue) : Printer(), log_queue_(log_queue) {}
+    DebugContext(coopa::job::ParallelQueue<LogMessage>& log_queue) : Printer(), log_queue_(log_queue) {}
 
     /**
      * @brief Pushes a new log message into the queue with the current system time.
@@ -47,7 +47,7 @@ public:
     }
 
 private:
-    trav::job::ParallelQueue<LogMessage>& log_queue_; /**< Reference to the destination queue. */
+    coopa::job::ParallelQueue<LogMessage>& log_queue_; /**< Reference to the destination queue. */
 };
 
 }

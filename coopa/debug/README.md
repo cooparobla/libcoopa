@@ -21,7 +21,7 @@ Best for synchronous initialization scripts:
 #include <coopa/debug/logger.h>
 
 void sample() {
-    trav::debug::Logger logger("Engine");
+    coopa::debug::Logger logger("Engine");
     logger.info("Initializing engine resources...");
     logger.warn("Unresolved assets prefix fallback triggered.");
 }
@@ -35,7 +35,7 @@ Best for worker threads where interleaving stdout is undesirable:
 #include <coopa/debug/manager.h>
 
 void sample_parallel() {
-    trav::debug::DebugManager manager;
+    coopa::debug::DebugManager manager;
     auto& ctx = manager.get_context();
 
     // Log from multiple worker threads

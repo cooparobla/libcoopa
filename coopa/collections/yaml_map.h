@@ -280,7 +280,7 @@ public:
      * @brief Dumps the current YAML node's content to the logger.
      * @param logger Logger instance to print to.
      */
-    void log(trav::debug::Logger& logger) const {
+    void log(coopa::debug::Logger& logger) const {
         logger.info("YAMLMap Content:\n" + to_string_());
     }
 

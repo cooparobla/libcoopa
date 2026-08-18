@@ -21,7 +21,7 @@
 class FileUtil {
 private:
     typedef std::string (*Builder) (const std::string& path); /**< Function pointer type to path builders. */
-    static inline trav::debug::Logger* logger_ = new trav::debug::Logger("File"); /**< Shared static logger for file transactions. */
+    static inline coopa::debug::Logger* logger_ = new coopa::debug::Logger("File"); /**< Shared static logger for file transactions. */
 
 public:
     static inline const std::string ASSETS_PREFIX = "assets/"; /**< Standard prefix for assets folders. */

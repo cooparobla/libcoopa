@@ -45,7 +45,7 @@ public:
      */
     Thread(unsigned int id,
            std::function<void(unsigned int, std::atomic<bool>&, std::mutex&, std::condition_variable&)> thread_loop_func,
-           trav::debug::Logger* logger)
+           coopa::debug::Logger* logger)
         : id_(id),
           stop_flag_(false),
           thread_loop_func_(std::move(thread_loop_func)),
@@ -124,7 +124,7 @@ private:
     std::mutex mutex_;          /**< Per-thread mutex (passed to callback for compatibility). */
     std::condition_variable cv_; /**< Per-thread CV (passed to callback for compatibility). */
     std::function<void(unsigned int, std::atomic<bool>&, std::mutex&, std::condition_variable&)> thread_loop_func_;
-    trav::debug::Logger* logger_; /**< Pointer to the shared logger instance (non-owning). */
+    coopa::debug::Logger* logger_; /**< Pointer to the shared logger instance (non-owning). */
 };
 
 } // namespace job
