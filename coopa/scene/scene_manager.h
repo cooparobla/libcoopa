@@ -79,6 +79,17 @@ public:
         if (active_scene_) active_scene_->update(delta_time);
     }
 
+    /**
+     * @brief Calls late_update() on the active scene (if any).
+     *
+     * Call once per frame, after update() — see Component::late_update()'s
+     * doc for why the two are separate passes.
+     * @param delta_time Frame delta time in seconds.
+     */
+    void late_update(float delta_time) {
+        if (active_scene_) active_scene_->late_update(delta_time);
+    }
+
 private:
     std::unique_ptr<Scene> active_scene_; /**< Owned active scene. */
 };

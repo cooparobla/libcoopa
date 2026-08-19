@@ -14,6 +14,7 @@
 #define COOPA_SCENE_SCENE_H
 
 #include <coopa/scene/scene_object.h>
+#include <coopa/event/event_bus.h>
 #include <string>
 #include <vector>
 #include <memory>
@@ -42,11 +43,31 @@ public:
         : name_(std::move(name))
     {}
 
-    // Non-copyable, movable.
+    // Non-copyable, movable. Move operations re-stamp every component's
+    // Component::scene back-pointer to the NEW Scene address (see
+    // restamp_scene_pointers_()) — without this, a Scene moved after start()
+    // has run (e.g. SceneLoader::load()'s `return scene;`, then moved again
+    // into SceneManager's unique_ptr<Scene>) would leave every component
+    // pointing at a dangling, already-destroyed Scene.
     Scene(const Scene&) = delete;
     Scene& operator=(const Scene&) = delete;
-    Scene(Scene&&) = default;
-    Scene& operator=(Scene&&) = default;
+
+    Scene(Scene&& other) noexcept
+        : name_(std::move(other.name_)),
+          root_objects_(std::move(other.root_objects_)),
+          events_(std::move(other.events_))
+    {
+        restamp_scene_pointers_();
+    }
+
+    Scene& operator=(Scene&& other) noexcept {
+        if (this == &other) return *this;
+        name_         = std::move(other.name_);
+        root_objects_ = std::move(other.root_objects_);
+        events_       = std::move(other.events_);
+        restamp_scene_pointers_();
+        return *this;
+    }
 
     // --- Accessors ---
 
@@ -79,9 +100,13 @@ public:
     /**
      * @brief Calls start() on all root objects (recursively).
      *
-     * Should be called once after the scene is fully loaded.
+     * Should be called once after the scene is fully loaded. Also stamps
+     * every component's Component::scene back-pointer to this Scene (just
+     * before that component's own start() runs), so start()/update()/
+     * late_update() can all reach scene->events() from within a component.
      */
     void start() {
+        restamp_scene_pointers_();
         for (auto& obj : root_objects_) obj->start();
     }
 
@@ -96,6 +121,42 @@ public:
     void update(float delta_time) {
         for (auto& obj : root_objects_) obj->update(delta_time);
     }
+
+    /**
+     * @brief Calls late_update(dt) on all root objects (recursively).
+     *
+     * Call once per frame, after update(dt) — see Component::late_update()
+     * for why the two are separate passes.
+     *
+     * @param delta_time Frame delta time in seconds.
+     */
+    void late_update(float delta_time) {
+        for (auto& obj : root_objects_) obj->late_update(delta_time);
+    }
+
+    /**
+     * @brief Stamps Component::scene on every component in obj's subtree,
+     *        without calling start() on any of them.
+     *
+     * For attaching a subtree to this Scene after start() has already run
+     * once (e.g. dynamically spawning a new SceneObject mid-game) — the
+     * ordinary path (a subtree present at load time) is already covered by
+     * start(). Idempotent; safe to call on a subtree that already belongs to
+     * this Scene.
+     *
+     * @param obj Root of the subtree to adopt. Must already be reachable
+     *            from this Scene's root_objects() (e.g. via add_root_object()
+     *            or SceneObject::add_child()) — this only stamps the
+     *            back-pointer, it does not change ownership.
+     */
+    void adopt(SceneObject& obj) {
+        obj.for_each_recursive([this](SceneObject& o) {
+            for (auto& comp : o.components()) comp->scene = this;
+        });
+    }
+
+    /** @brief The scene-wide named EventBus — see coopa/event/event_bus.h. */
+    coopa::event::EventBus& events() { return events_; }
 
     // --- Generic queries ---
 
@@ -170,8 +231,26 @@ public:
     }
 
 private:
+    /**
+     * @brief Stamps Component::scene = this on every component in the hierarchy.
+     *
+     * Regardless of active() — an initially-inactive object's components
+     * should still be able to reach scene->events() once reactivated later
+     * via set_active(true). Shared by start() and the move operations (a
+     * moved-into Scene has a different address than the one that may have
+     * already run start() before the move — see the move ctor/assignment doc).
+     */
+    void restamp_scene_pointers_() {
+        for (auto& root : root_objects_) {
+            root->for_each_recursive([this](SceneObject& obj) {
+                for (auto& comp : obj.components()) comp->scene = this;
+            });
+        }
+    }
+
     std::string                               name_;         /**< Scene name. */
     std::vector<std::unique_ptr<SceneObject>> root_objects_; /**< Owned root objects. */
+    coopa::event::EventBus                    events_;       /**< Scene-wide named signal bus. */
 };
 
 } // namespace scene

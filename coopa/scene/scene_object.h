@@ -321,6 +321,21 @@ public:
         for (auto& child : children_) child->update(delta_time);
     }
 
+    /**
+     * @brief Calls late_update(dt) on all components, then recurses to active children.
+     *
+     * Mirrors update()'s exact shape (pre-order, self before children, prunes
+     * inactive subtrees) — see Component::late_update() for why a second pass
+     * exists at all.
+     *
+     * @param delta_time Frame delta time in seconds.
+     */
+    void late_update(float delta_time) {
+        if (!active_) return;
+        for (auto& comp : components_) comp->late_update(delta_time);
+        for (auto& child : children_) child->late_update(delta_time);
+    }
+
 private:
     std::string                              name_;       /**< Object name. */
     bool                                     active_;     /**< Whether updates/rendering are active. */
