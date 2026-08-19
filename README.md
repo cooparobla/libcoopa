@@ -6,7 +6,7 @@ It is designed to be highly thread-safe and suitable for building multithreaded 
 
 ## Modules Overview
 
-`libcoopa` is organized into four main modules:
+`libcoopa` is organized into seven main modules:
 
 ### 1. [Utilities (`coopa/util/`)](file:///home/coopa/git/libcoopa/coopa/util/)
 Cross-platform helper utilities for math, file paths, strings, and unique IDs:
@@ -37,6 +37,22 @@ Thread-safe logs and diagnostics capturing tools:
 - **[Logger](file:///home/coopa/git/libcoopa/coopa/debug/logger.h)**: Thread-safe synchronous console log printer formatting severity level, module tag, and timestamp with microsecond resolution.
 - **[DebugManager](file:///home/coopa/git/libcoopa/coopa/debug/manager.h)** & **[DebugBucket](file:///home/coopa/git/libcoopa/coopa/debug/bucket.h)**: Thread-safe queue buffers collecting parallel logs, sorting them chronologically, and flushing.
 
+### 5. [Events (`coopa/event/`)](file:///home/coopa/git/libcoopa/coopa/event/)
+Header-only multicast dispatch:
+- **[Signal](file:///home/coopa/git/libcoopa/coopa/event/signal.h)**: `Signal<Args...>` with RAII `Connection`/`ScopedConnection` tokens, safe re-entrant connect/disconnect during `emit()`.
+- **[EventBus](file:///home/coopa/git/libcoopa/coopa/event/event_bus.h)**: Named pub/sub over a dynamic `EventArgs` bag, with wildcard listeners.
+
+### 6. [Scene (`coopa/scene/`)](file:///home/coopa/git/libcoopa/coopa/scene/)
+Scene graph, component model, and YAML scene loading — see the [module README](file:///home/coopa/git/libcoopa/coopa/scene/README.md):
+- **[SceneManager](file:///home/coopa/git/libcoopa/coopa/scene/scene_manager.h)**, **[Scene](file:///home/coopa/git/libcoopa/coopa/scene/scene.h)**, **[SceneObject](file:///home/coopa/git/libcoopa/coopa/scene/scene_object.h)**, **[Component](file:///home/coopa/git/libcoopa/coopa/scene/component.h)**.
+- **[SceneLoader](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)**: Parses YAML scenes, dispatching every non-Transform/Animation component to a parser registered from outside libcoopa (gfxcoopa, uicoopa, ...).
+
+### 7. [Asset (`coopa/asset/`)](file:///home/coopa/git/libcoopa/coopa/asset/)
+Generic, extensible asset system — see the [module README](file:///home/coopa/git/libcoopa/coopa/asset/README.md):
+- **[AssetManager](file:///home/coopa/git/libcoopa/coopa/asset/asset_manager.h)**: Loader registration, refcounted caching, synchronous and async loading (via a dedicated `coopa::job::JobEngine`), mtime-polled hot reload, and shutdown.
+- **[AssetHandle](file:///home/coopa/git/libcoopa/coopa/asset/asset_handle.h)** & **[AssetSlot](file:///home/coopa/git/libcoopa/coopa/asset/asset_slot.h)**: Typed refcounted references into address-stable slots, so a hot reload never invalidates a handle already handed out.
+- **[IAssetLoader / TypedAssetLoader](file:///home/coopa/git/libcoopa/coopa/asset/asset_loader.h)**: The extension point downstream packages (gfxcoopa: mesh/texture/shader; uicoopa: sprite/font) register against, exactly as they already register scene components.
+
 ---
 
 ## Building and Running Tests
@@ -54,4 +70,4 @@ Run the test runner to execute the test suite (verifying all core modules) using
 ```bash
 cplay
 ```
-The test suite source is located in [coopa/test.cpp](file:///home/coopa/git/libcoopa/coopa/test.cpp).
+The test suite source is located in [test.cpp](file:///home/coopa/git/libcoopa/test.cpp).

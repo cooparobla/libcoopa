@@ -81,7 +81,7 @@ public:
      */
     static std::tuple<std::string, bool> get_asset_path(const std::string& path) {
         size_t pos = path.find(ASSETS_PREFIX);
-        std::string clean_path = (pos != std::string::npos) ? path.substr(pos + 10) : path;
+        std::string clean_path = (pos != std::string::npos) ? path.substr(pos + ASSETS_PREFIX.length()) : path;
         std::string asset_path = get_root_path(ASSETS_PREFIX + clean_path);
         std::string asset_path_alt = get_project_path(ASSETS_PREFIX + clean_path);
         if (does_path_exist(asset_path)) {
@@ -100,7 +100,7 @@ public:
      */
     static std::tuple<std::string, bool> get_resource_path(const std::string& path) {
         size_t pos = path.find(RESOURCES_PREFIX);
-        std::string clean_path = (pos != std::string::npos) ? path.substr(pos + 10) : path;
+        std::string clean_path = (pos != std::string::npos) ? path.substr(pos + RESOURCES_PREFIX.length()) : path;
         std::string resource_path = get_root_path(RESOURCES_PREFIX + clean_path);
         std::string resource_path_alt = get_project_path(RESOURCES_PREFIX + clean_path);
         if (does_path_exist(resource_path)) {

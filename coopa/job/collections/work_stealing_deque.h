@@ -121,20 +121,29 @@ public:
 
         int64_t t = top_.load(std::memory_order_relaxed);
 
-        if (t <= b) {
-            // Non-empty.
+        if (t < b) {
+            // Non-empty, and not the last element. A concurrent steal() only
+            // ever targets buffer_[top_ & mask_], which is a different slot
+            // than buffer_[b & mask_] here, so moving out immediately is safe.
             out_item = std::move(buffer_[b & mask_].data);
-
-            if (t == b) {
-                // Last element — race with steal(). Use CAS.
-                if (!top_.compare_exchange_strong(t, t + 1,
-                        std::memory_order_seq_cst, std::memory_order_relaxed)) {
-                    // Lost the race — thief took it.
-                    bottom_.store(t + 1, std::memory_order_relaxed);
-                    return false;
-                }
-                bottom_.store(t + 1, std::memory_order_relaxed);
+            return true;
+        } else if (t == b) {
+            // Exactly one element left — a concurrent steal() may be racing
+            // for this same slot. Resolve ownership via CAS BEFORE touching
+            // buffer_[b & mask_]: moving out first (as this used to do) races
+            // a thief's own move-out of the identical slot whenever the CAS
+            // was going to lose anyway — for a non-trivial T (e.g. Job, whose
+            // TaskWrapper move nulls out the source's callable) that is a
+            // genuine data race that can silently leave one side holding a
+            // corrupted, no-op value while still reporting success.
+            bool won = top_.compare_exchange_strong(t, t + 1,
+                    std::memory_order_seq_cst, std::memory_order_relaxed);
+            bottom_.store(t + 1, std::memory_order_relaxed);
+            if (!won) {
+                // Lost the race — thief took it. Do not touch the slot.
+                return false;
             }
+            out_item = std::move(buffer_[b & mask_].data);
             return true;
         } else {
             // Empty.
@@ -158,15 +167,22 @@ public:
         int64_t b = bottom_.load(std::memory_order_acquire);
 
         if (t < b) {
-            // Non-empty.
-            out_item = std::move(buffer_[t & mask_].data);
-
-            // Try to advance top_.
+            // Non-empty. Resolve ownership of this slot via CAS BEFORE
+            // touching buffer_[t & mask_]: another thief racing for the same
+            // slot (or the owner's pop(), see its own doc) is doing the
+            // identical check. Moving the data out first — as this used to —
+            // means every loser has already performed an unsynchronized
+            // move-read of the same slot the winner is also reading, which
+            // is a genuine data race for a non-trivial T (Job's TaskWrapper
+            // move nulls out the source, so a losing thief could silently
+            // hand back a corrupted, no-op job while still reporting the
+            // winner's slot as claimed).
             if (!top_.compare_exchange_strong(t, t + 1,
                     std::memory_order_seq_cst, std::memory_order_relaxed)) {
-                // Lost the race to another thief or to pop().
+                // Lost the race to another thief or to pop() — do not touch the slot.
                 return false;
             }
+            out_item = std::move(buffer_[t & mask_].data);
             return true;
         }
 

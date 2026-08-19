@@ -8,6 +8,8 @@
 #include <atomic>
 #include <stdexcept>
 #include <cstdio> // For std::remove
+#include <fstream>
+#include <filesystem>
 
 #include <coopa/util/id.h>
 #include <coopa/util/string.h>
@@ -30,6 +32,7 @@
 #include <coopa/job/engine.h>
 #include <coopa/job/scheduler.h>
 #include <coopa/event/signal.h>
+#include <coopa/asset/asset_manager.h>
 
 // ANSI Colors for nice UI
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -443,6 +446,43 @@ void test_job_engine_fan_in_dependencies() {
     engine.end_frame();
 }
 
+void test_job_engine_repeated_engines_no_lost_or_phantom_jobs() {
+    // Regression test for two bugs found while building coopa::asset (which
+    // constructs a fresh, short-lived JobEngine per AssetManager and calls
+    // wait_for() from the main thread immediately after submit()):
+    //
+    // 1. submit()'s no-dependency path used wake_one_worker() (notify_one())
+    //    for a job deposited into one SPECIFIC thread's inbox. notify_one()
+    //    can wake an unrelated idle thread instead of that inbox's owner; if
+    //    every other worker was already asleep, the real owner never woke
+    //    and wait_for() on that job's handle hung forever.
+    // 2. WorkStealingDeque::pop() and steal() both used to move their output
+    //    item out of the shared buffer slot BEFORE confirming their CAS on
+    //    top_ actually won ownership of that slot. On the well-known
+    //    contended "last element" path, the loser had already performed an
+    //    unsynchronized move-read of the same slot the winner was also
+    //    moving from. For a plain scalar this is harmless in practice; for
+    //    Job (whose TaskWrapper move nulls out the source's callable) it can
+    //    silently hand back a corrupted, no-op job while the counter still
+    //    gets decremented as if it ran — wait_for() returns having believed
+    //    the job completed, but its body never executed.
+    //
+    // A tight repeated construct/submit/wait_for loop reproduced both within
+    // a few hundred iterations before the fix; this keeps a permanent,
+    // bounded-runtime tripwire for a regression.
+    const int k_iterations = 400;
+    for (int i = 0; i < k_iterations; ++i) {
+        coopa::job::JobEngine engine(2);
+        std::atomic<bool> ran{false};
+        coopa::job::JobHandle handle = engine.create_handle();
+        engine.submit([&ran]() {
+            ran.store(true, std::memory_order_release);
+        }, 1, handle);
+        engine.wait_for(handle);
+        ASSERT_TRUE(ran.load(std::memory_order_acquire));
+    }
+}
+
 void test_work_stealing_deque() {
     coopa::job::WorkStealingDeque<int> deque(16);
 
@@ -478,6 +518,70 @@ void test_work_stealing_deque() {
     deque.push(99);
     deque.clear();
     ASSERT_TRUE(deque.empty_approx());
+}
+
+void test_work_stealing_deque_no_torn_moves_under_contention() {
+    // Regression test: pop() and steal() both used to move their output item
+    // out of buffer_[idx] BEFORE their CAS on top_ confirmed they actually
+    // won that slot. On the contended "exactly one item left" path, the
+    // loser (owner pop() vs. a thief, or two racing thieves) had already
+    // done an unsynchronized move-read of the same slot the winner was also
+    // moving from. A plain int can't reveal this (a racy read of a scalar
+    // just yields a value, not corruption); a type whose move leaves the
+    // source in a detectably-different state can.
+    using coopa::job::WorkStealingDeque;
+
+    struct NullingMovable {
+        int  value = -1;
+        bool alive = false;
+        NullingMovable() = default;
+        explicit NullingMovable(int v) : value(v), alive(true) {}
+        NullingMovable(NullingMovable&& other) noexcept : value(other.value), alive(other.alive) {
+            other.alive = false;
+            other.value = -1;
+        }
+        NullingMovable& operator=(NullingMovable&& other) noexcept {
+            value = other.value;
+            alive = other.alive;
+            other.alive = false;
+            other.value = -1;
+            return *this;
+        }
+        NullingMovable(const NullingMovable&) = delete;
+        NullingMovable& operator=(const NullingMovable&) = delete;
+    };
+
+    const int k_trials = 3000;
+    for (int trial = 0; trial < k_trials; ++trial) {
+        WorkStealingDeque<NullingMovable> deque(64);
+        deque.push(NullingMovable(42));
+
+        std::atomic<int> success_count{0};
+        std::atomic<int> phantom_count{0};
+
+        auto thief = [&]() {
+            NullingMovable val;
+            if (deque.steal(val)) {
+                success_count.fetch_add(1);
+                if (!val.alive) phantom_count.fetch_add(1);
+            }
+        };
+        auto owner_pop = [&]() {
+            NullingMovable val;
+            if (deque.pop(val)) {
+                success_count.fetch_add(1);
+                if (!val.alive) phantom_count.fetch_add(1);
+            }
+        };
+
+        std::thread t1(thief);
+        std::thread t2(owner_pop);
+        t1.join();
+        t2.join();
+
+        ASSERT_EQ(success_count.load(), 1);
+        ASSERT_EQ(phantom_count.load(), 0);
+    }
 }
 
 void test_debug_logging() {
@@ -695,6 +799,331 @@ void test_signal_reference_args_no_copy() {
     ASSERT_TRUE(seen_copies == 0);  // emit() forwards the reference, never copies the argument
 }
 
+// ---------------------------------------------------------
+// coopa::asset tests
+// ---------------------------------------------------------
+
+namespace asset_test {
+
+/** @brief Trivial test asset: an in-memory string, decoded from a file's raw bytes. */
+struct TextAsset {
+    std::string contents;
+};
+
+/** @brief Loader for TextAsset: decode() reads bytes off-thread, finalize() just wraps them (no GPU step). */
+class TextAssetLoader : public coopa::asset::TypedAssetLoader<TextAsset, std::vector<std::byte>> {
+public:
+    std::shared_ptr<std::vector<std::byte>> decode_typed(const coopa::asset::AssetId&, const coopa::asset::LoadContext& ctx) override {
+        return std::make_shared<std::vector<std::byte>>(coopa::asset::AssetSource::read_bytes(ctx.resolved_path));
+    }
+    std::shared_ptr<TextAsset> finalize_typed(std::shared_ptr<std::vector<std::byte>> decoded, const coopa::asset::AssetId&, const coopa::asset::LoadContext&) override {
+        auto asset = std::make_shared<TextAsset>();
+        asset->contents.assign(reinterpret_cast<const char*>(decoded->data()), decoded->size());
+        return asset;
+    }
+    const char* type_name() const override { return "TextAsset"; }
+};
+
+} // namespace asset_test
+
+void test_asset_id() {
+    using coopa::asset::AssetId;
+
+    AssetId a = AssetId::from_path("widgets/foo.txt");
+    AssetId b = AssetId::from_path("./widgets/foo.txt");
+    AssetId c = AssetId::from_path("widgets\\foo.txt");
+    AssetId d = AssetId::from_path("widgets/bar.txt");
+
+    ASSERT_TRUE(a.is_valid());
+    ASSERT_TRUE(a == b);
+    ASSERT_TRUE(a == c);
+    ASSERT_TRUE(a.hash() == b.hash());
+    ASSERT_TRUE(a != d);
+    ASSERT_EQ(a.path(), std::string("widgets/foo.txt"));
+    ASSERT_TRUE(!AssetId().is_valid());
+}
+
+void test_asset_source() {
+    using coopa::asset::AssetSource;
+
+    std::string test_file = "test_temp_asset_source.txt";
+    {
+        std::ofstream ofs(test_file);
+        ofs << "source contents";
+    }
+
+    AssetSource source;
+    source.add_search_root(".");
+    ASSERT_TRUE(source.exists(test_file));
+    ASSERT_TRUE(!source.exists("definitely_missing_asset.txt"));
+
+    std::string resolved = source.resolve(test_file);
+    auto bytes = AssetSource::read_bytes(resolved);
+    std::string contents(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    ASSERT_EQ(contents, "source contents");
+
+    // Not asserted > 0: this is an opaque ordering tick, not a real
+    // timestamp (see AssetSource::last_write_time_ns's doc) -- only that it
+    // isn't the "file not queryable" sentinel.
+    ASSERT_TRUE(AssetSource::last_write_time_ns(resolved) != 0);
+
+    std::remove(test_file.c_str());
+}
+
+void test_asset_manager_sync_load_and_cache() {
+    using namespace asset_test;
+    coopa::asset::AssetManager assets;
+    assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
+
+    std::string test_file = "test_temp_asset_sync.txt";
+    {
+        std::ofstream ofs(test_file);
+        ofs << "sync contents";
+    }
+
+    auto h1 = assets.load<TextAsset>(test_file);
+    ASSERT_TRUE(h1.is_loaded());
+    ASSERT_EQ(h1->contents, "sync contents");
+    ASSERT_EQ(h1.revision(), 1u);
+
+    // Second load of the same path must hit the cached slot, not re-decode.
+    auto h2 = assets.load<TextAsset>(test_file);
+    ASSERT_TRUE(h2.get() == h1.get());
+    ASSERT_EQ(h2.revision(), h1.revision());
+
+    // A type with no registered loader must fail cleanly, never throw out of
+    // load() -- use a distinct path so this hits the "no loader" branch
+    // rather than the type-mismatch guard exercised below.
+    struct Unregistered {};
+    std::string other_file = "test_temp_asset_sync_unregistered.txt";
+    { std::ofstream ofs(other_file); ofs << "x"; }
+    auto h3 = assets.load<Unregistered>(other_file);
+    ASSERT_TRUE(h3.is_failed());
+    ASSERT_TRUE(!h3.error().empty());
+    std::remove(other_file.c_str());
+
+    assets.shutdown();
+    std::remove(test_file.c_str());
+}
+
+void test_asset_manager_rejects_type_mismatch() {
+    // AssetId is purely path-based -- loading the same path as two
+    // different C++ types must never let the second load reinterpret the
+    // first type's payload. It must fail loudly instead.
+    using namespace asset_test;
+    struct OtherAsset { int x = 0; };
+
+    coopa::asset::AssetManager assets;
+    assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
+
+    std::string test_file = "test_temp_asset_type_mismatch.txt";
+    { std::ofstream ofs(test_file); ofs << "shared path"; }
+
+    auto text_handle = assets.load<TextAsset>(test_file);
+    ASSERT_TRUE(text_handle.is_loaded());
+
+    // No loader is even registered for OtherAsset -- if the type-mismatch
+    // guard were missing, this would still "succeed" by handing back a
+    // handle whose get() reinterprets TextAsset's payload as OtherAsset.
+    auto other_handle = assets.load<OtherAsset>(test_file);
+    ASSERT_TRUE(!other_handle.is_valid());
+    ASSERT_TRUE(!other_handle.is_loaded());
+
+    // The original handle must be completely unaffected.
+    ASSERT_TRUE(text_handle.is_loaded());
+    ASSERT_EQ(text_handle->contents, "shared path");
+
+    assets.shutdown();
+    std::remove(test_file.c_str());
+}
+
+void test_asset_manager_base_dir_prevents_collision() {
+    // Regression test: identity used to be built from the raw virtual_path
+    // alone, before it was resolved against base_dir. Two different scene
+    // directories that both reference the same relative filename (e.g.
+    // "meshes/cube.000.yaml" in gfxcoopa's real usage) would silently share
+    // one cached slot and one would serve the other's asset. AssetId must
+    // be built from the RESOLVED path instead, so distinct files with the
+    // same relative name never collide.
+    using namespace asset_test;
+    coopa::asset::AssetManager assets;
+    assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
+
+    std::string dir_a = "test_temp_asset_dir_a";
+    std::string dir_b = "test_temp_asset_dir_b";
+    std::filesystem::create_directory(dir_a);
+    std::filesystem::create_directory(dir_b);
+    { std::ofstream ofs(dir_a + "/shared.txt"); ofs << "from A"; }
+    { std::ofstream ofs(dir_b + "/shared.txt"); ofs << "from B"; }
+
+    auto handle_a = assets.load<TextAsset>("shared.txt", dir_a);
+    auto handle_b = assets.load<TextAsset>("shared.txt", dir_b);
+
+    ASSERT_TRUE(handle_a.is_loaded());
+    ASSERT_TRUE(handle_b.is_loaded());
+    ASSERT_TRUE(handle_a.get() != handle_b.get());  // distinct slots, not aliased
+    ASSERT_EQ(handle_a->contents, "from A");
+    ASSERT_EQ(handle_b->contents, "from B");
+
+    // get() with the matching base_dir must find each one back.
+    ASSERT_TRUE(assets.get<TextAsset>("shared.txt", dir_a).get() == handle_a.get());
+    ASSERT_TRUE(assets.get<TextAsset>("shared.txt", dir_b).get() == handle_b.get());
+
+    assets.shutdown();
+    std::filesystem::remove_all(dir_a);
+    std::filesystem::remove_all(dir_b);
+}
+
+void test_asset_manager_async_load() {
+    using namespace asset_test;
+    coopa::asset::AssetManager assets;
+    assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
+
+    std::string test_file = "test_temp_asset_async.txt";
+    {
+        std::ofstream ofs(test_file);
+        ofs << "async contents";
+    }
+
+    auto handle = assets.load_async<TextAsset>(test_file);
+    ASSERT_TRUE(handle.state() == coopa::asset::AssetState::Loading || handle.is_loaded());
+
+    int guard = 0;
+    while (!handle.is_loaded() && !handle.is_failed() && guard++ < 1000) {
+        assets.update(0.001f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    ASSERT_TRUE(handle.is_loaded());
+    ASSERT_EQ(handle->contents, "async contents");
+
+    // A second load_async() for the same id while the first is already
+    // resolved must reuse the slot rather than kicking off another job.
+    auto handle2 = assets.load_async<TextAsset>(test_file);
+    ASSERT_TRUE(handle2.is_loaded());
+    ASSERT_TRUE(handle2.get() == handle.get());
+
+    assets.shutdown();
+    std::remove(test_file.c_str());
+}
+
+void test_asset_manager_hot_reload() {
+    using namespace asset_test;
+    coopa::asset::AssetManager assets;
+    assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
+    assets.set_hot_reload(true);
+    assets.set_poll_interval(0.0f);
+
+    std::string test_file = "test_temp_asset_reload.txt";
+    {
+        std::ofstream ofs(test_file);
+        ofs << "original";
+    }
+
+    auto handle = assets.load<TextAsset>(test_file);
+    ASSERT_TRUE(handle.is_loaded());
+    ASSERT_EQ(handle.revision(), 1u);
+
+    bool reload_fired = false;
+    coopa::asset::AssetId reloaded_id;
+    coopa::event::ScopedConnection conn = assets.on_reloaded.connect_scoped(
+        [&](const coopa::asset::AssetId& id) {
+            reload_fired = true;
+            reloaded_id = id;
+        });
+
+    // Give the filesystem clock room to register a distinct mtime.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    {
+        std::ofstream ofs(test_file);
+        ofs << "reloaded contents";
+    }
+
+    assets.update(0.0f);
+
+    ASSERT_TRUE(reload_fired);
+    ASSERT_TRUE(reloaded_id == handle.id());
+    ASSERT_EQ(handle.revision(), 2u);
+    ASSERT_EQ(handle->contents, "reloaded contents");  // same handle, new payload
+
+    assets.shutdown();
+    std::remove(test_file.c_str());
+}
+
+void test_asset_manager_unload_and_gc() {
+    using namespace asset_test;
+    coopa::asset::AssetManager assets;
+    assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
+
+    std::string test_file = "test_temp_asset_unload.txt";
+    {
+        std::ofstream ofs(test_file);
+        ofs << "unload me";
+    }
+
+    coopa::asset::AssetId id = coopa::asset::AssetId::from_path(test_file);
+    auto handle = assets.load<TextAsset>(test_file);
+    ASSERT_TRUE(handle.is_loaded());
+
+    // unload() is a no-op while a handle still references the slot.
+    assets.unload(id);
+    ASSERT_TRUE(assets.get<TextAsset>(test_file).is_valid());
+
+    handle = coopa::asset::AssetHandle<TextAsset>();  // drop the last handle
+    assets.garbage_collect();
+    ASSERT_TRUE(!assets.get<TextAsset>(test_file).is_valid());
+
+    assets.shutdown();
+    std::remove(test_file.c_str());
+}
+
+void test_asset_manager_shutdown_drains_pending() {
+    using namespace asset_test;
+
+    // A loader that reports whether finalize() actually ran, via a flag
+    // outside the AssetManager -- the handle itself must not be dereferenced
+    // after shutdown() (it clears slots_, exactly like every other
+    // manual-teardown contract in this workspace: SceneLoader::
+    // clear_component_parsers(), UIResourceCache::clear()), so this is the
+    // only safe way to observe that the drain happened.
+    struct TrackingLoader : public coopa::asset::TypedAssetLoader<TextAsset, std::vector<std::byte>> {
+        std::shared_ptr<bool> finalized;
+        std::shared_ptr<std::vector<std::byte>> decode_typed(const coopa::asset::AssetId&, const coopa::asset::LoadContext& ctx) override {
+            return std::make_shared<std::vector<std::byte>>(coopa::asset::AssetSource::read_bytes(ctx.resolved_path));
+        }
+        std::shared_ptr<TextAsset> finalize_typed(std::shared_ptr<std::vector<std::byte>>, const coopa::asset::AssetId&, const coopa::asset::LoadContext&) override {
+            *finalized = true;
+            return std::make_shared<TextAsset>();
+        }
+        const char* type_name() const override { return "TextAsset"; }
+    };
+
+    auto finalized = std::make_shared<bool>(false);
+    coopa::asset::AssetManager assets;
+    auto loader = std::make_unique<TrackingLoader>();
+    loader->finalized = finalized;
+    assets.register_loader<TextAsset>(std::move(loader));
+
+    std::string test_file = "test_temp_asset_shutdown.txt";
+    {
+        std::ofstream ofs(test_file);
+        ofs << "in flight";
+    }
+
+    auto handle = assets.load_async<TextAsset>(test_file);
+    ASSERT_TRUE(handle.is_valid());
+
+    // Deliberately do not call update() first -- shutdown() itself must
+    // wait for the in-flight decode() job and run finalize() before tearing
+    // down pending_, rather than destroying that job's state out from under
+    // a still-running worker thread.
+    assets.shutdown();
+
+    ASSERT_TRUE(*finalized);
+
+    std::remove(test_file.c_str());
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -714,7 +1143,9 @@ int main() {
     RUN_TEST(test_job_engine_dependencies);
     RUN_TEST(test_job_engine_chained_dependencies);
     RUN_TEST(test_job_engine_fan_in_dependencies);
+    RUN_TEST(test_job_engine_repeated_engines_no_lost_or_phantom_jobs);
     RUN_TEST(test_work_stealing_deque);
+    RUN_TEST(test_work_stealing_deque_no_torn_moves_under_contention);
     RUN_TEST(test_debug_logging);
     RUN_TEST(test_signal_basic_emit);
     RUN_TEST(test_signal_disconnect);
@@ -725,6 +1156,15 @@ int main() {
     RUN_TEST(test_signal_connection_outlives_signal);
     RUN_TEST(test_signal_destroyed_from_slot);
     RUN_TEST(test_signal_reference_args_no_copy);
+    RUN_TEST(test_asset_id);
+    RUN_TEST(test_asset_source);
+    RUN_TEST(test_asset_manager_sync_load_and_cache);
+    RUN_TEST(test_asset_manager_rejects_type_mismatch);
+    RUN_TEST(test_asset_manager_base_dir_prevents_collision);
+    RUN_TEST(test_asset_manager_async_load);
+    RUN_TEST(test_asset_manager_hot_reload);
+    RUN_TEST(test_asset_manager_unload_and_gc);
+    RUN_TEST(test_asset_manager_shutdown_drains_pending);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

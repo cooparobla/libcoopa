@@ -264,8 +264,16 @@ public:
             inbox.jobs.push_back(std::move(new_job));
         }
 
-        // Wake a worker.
-        wake_one_worker();
+        // Wake every worker, not just one: the job sits in a specific
+        // thread's inbox (queue_index) until that thread itself drains it
+        // into its own deque, and worker_cv_ is shared across every worker
+        // rather than per-thread. notify_one() can wake an unrelated idle
+        // thread whose own inbox is empty instead of the one that actually
+        // owns this job — if every other worker is already asleep at that
+        // moment, the job's real owner never wakes and wait_for() on it
+        // hangs forever. submit_jobs()'s equivalent no-dependency path
+        // already uses wake_all_workers() for the same reason.
+        wake_all_workers();
     }
 
     /**
@@ -568,13 +576,20 @@ private:
             if (per_thread_deques_[thread_id]->pop(job_to_execute)) {
                 job_found = true;
             }
-        } else {
-            // Guest worker (main thread): drain all inboxes into worker deques
-            // since workers may be sleeping with jobs queued in their inboxes.
-            for (unsigned int i = 0; i < num_threads_; ++i) {
-                drain_inbox(i);
-            }
         }
+        // A guest caller (thread_id < 0, e.g. wait_for() on the submitting
+        // thread) must NOT drain another worker's inbox itself: drain_inbox()
+        // ends by calling per_thread_deques_[thread_id]->push(), and Chase-Lev
+        // deques require push() to be called only by that deque's owning
+        // thread (see coopa/job/collections/work_stealing_deque.h). A guest
+        // "helping" by draining worker i's inbox can race worker i draining
+        // its own inbox at the same moment — two threads concurrently
+        // move-assigning the same buffer slot is a data race on the Job
+        // itself (UB: corrupted state, occasionally observed as two
+        // concurrent steal() calls both appearing to claim the same item, or
+        // an outright crash). The real owner reliably wakes on its own via
+        // wake_all_workers() and drains its own inbox; a guest only ever
+        // steals below, which is safe for any number of concurrent callers.
 
         // 2. Try stealing from others.
         if (!job_found) {
@@ -634,13 +649,34 @@ private:
 
     // --- Worker Wake Helpers ---
 
-    /// @brief Wakes one sleeping worker thread.
+    /**
+     * @brief Wakes one sleeping worker thread.
+     *
+     * Acquires worker_mutex_ around the notify even though nothing else
+     * needs protecting here: submit()/wake callers mutate shared submission
+     * state (total_pending_jobs_count_, a per-thread inbox, ...) without
+     * holding worker_mutex_ at all, so without this lock a worker could
+     * evaluate its wait(lock, pred) predicate as false and then block
+     * *after* this notify already fired -- a classic lost wakeup, since
+     * notify_one()/notify_all() only wake threads already parked in wait().
+     * Taking the lock here forces this notify to happen either strictly
+     * before a racing worker acquires the lock to check its predicate (so
+     * it observes the new state directly and never blocks) or strictly
+     * after that worker has fully, atomically completed unlock-and-block
+     * inside wait() (so the notify reaches it) -- std::mutex's
+     * release-then-acquire also makes every write sequenced before this
+     * call visible to whichever worker acquires worker_mutex_ next, so the
+     * relaxed increment of total_pending_jobs_count_ in submit() doesn't
+     * need its own memory-order upgrade.
+     */
     void wake_one_worker() {
+        std::lock_guard<std::mutex> lock(worker_mutex_);
         worker_cv_.notify_one();
     }
 
-    /// @brief Wakes all sleeping worker threads.
+    /// @brief Wakes all sleeping worker threads. See wake_one_worker() for why this locks worker_mutex_ first.
     void wake_all_workers() {
+        std::lock_guard<std::mutex> lock(worker_mutex_);
         worker_cv_.notify_all();
     }
 
