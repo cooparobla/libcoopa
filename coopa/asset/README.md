@@ -145,11 +145,15 @@ building on it.
 ### [`asset_manager.h`](file:///home/coopa/git/libcoopa/coopa/asset/asset_manager.h)
 
 `AssetManager` — the facade: `register_loader<T>`, `load<T>` (synchronous),
-`load_async<T>`, `get<T>` (lookup without loading), `unload`/`garbage_collect`,
+`load_async<T>`, `get<T>` (lookup without loading), `create<T>` (publish an
+already-built payload for a procedurally-generated asset, bypassing
+`AssetSource`/loaders entirely), `unload`/`garbage_collect` (immediate,
+explicit), `set_idle_eviction`/`set_max_idle_frames` (automatic, opt-in —
+evicts anything unreferenced for a configurable number of `update()` calls),
 `set_hot_reload`/`set_poll_interval`, `on_reloaded` (a `coopa::event::Signal`),
 `update(delta_time)` (call once per frame), and `shutdown()`.
 
-Two design points worth knowing before extending this class:
+Three design points worth knowing before extending this class:
 
 - **Its `JobEngine` is dedicated, never the application's own per-frame one.**
   `coopa::job::CounterPool::reset()` is a bare bump-pointer reset with no
@@ -163,6 +167,15 @@ Two design points worth knowing before extending this class:
   guards against this — a mismatched `load<T>`/`load_async<T>`/`get<T>`
   fails loudly (logged, empty handle returned) rather than risking undefined
   behavior.
+- **Every eviction path shares one grace period.** `unload()`,
+  `garbage_collect()`, idle eviction, `create()` re-publishing, and hot
+  reload all funnel through the same private `retire_payload_()` — a
+  superseded payload is held on a retire list for `k_payload_grace_frames`
+  frames before actual destruction, never destroyed synchronously inside the
+  call that dropped it. This matters even for the "immediate" calls
+  (`unload`/`garbage_collect`): a payload's last reference can be dropped
+  the same frame a command buffer that still reads it was submitted, so
+  destroying it inline would be a use-after-free on the GPU.
 
 ---
 

@@ -49,6 +49,7 @@ struct AssetSlot {
     std::string     error;                         /**< Populated when state == Failed. */
     std::string     resolved_path;                 /**< Filesystem path last read from; used for hot-reload polling. */
     long long       last_write_time_ns = 0;        /**< mtime snapshot (ns since epoch) at last (re)load. */
+    uint32_t        idle_frames = 0;                /**< Consecutive AssetManager::update() calls with ref_count == 0 and no load in flight; reset to 0 otherwise. Only consulted when idle eviction is enabled. */
 
     /**
      * @brief Constructs a slot for the given identity and asset type.

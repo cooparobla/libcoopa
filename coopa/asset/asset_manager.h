@@ -248,6 +248,82 @@ public:
     }
 
     /**
+     * @brief Publishes an already-constructed payload into a slot, bypassing
+     * AssetSource and the loader entirely.
+     *
+     * For procedurally-generated runtime assets (a mesh built on the fly, a
+     * texture rendered into at startup) that have no file behind them: no
+     * resolve(), no decode(), no finalize(), and no loader needs to be
+     * registered for T. Because the slot's resolved_path is left empty,
+     * hot-reload polling skips it by construction (poll_for_reloads_()
+     * already bails on an empty resolved_path).
+     *
+     * Calling this again with the same synthetic_id ALWAYS re-publishes: the
+     * previous payload is retired with the same grace period a hot reload
+     * uses, revision is bumped, and on_reloaded fires. This differs
+     * deliberately from load(), whose second call is a convenience cache
+     * hit — handing in a freshly constructed payload is an explicit
+     * statement of intent to replace, and silently dropping it on the floor
+     * would leak the caller's work.
+     *
+     * Calling create() repeatedly on the same id every frame retires one
+     * payload per frame, each held for k_payload_grace_frames — fine
+     * occasionally, not something to do in a hot loop with large GPU payloads.
+     *
+     * @tparam T Asset payload type.
+     * @param synthetic_id Logical identity, normalized exactly like a path
+     *   (see AssetId). Prefix these (e.g. "runtime/terrain_chunk_0") to keep
+     *   them from colliding with a real asset's resolved path.
+     * @param payload Fully constructed payload; must not be null.
+     * @return A handle to the slot. Empty on a type mismatch; a Failed slot
+     *   on a null payload or on an id already backed by a file-loaded asset.
+     */
+    template <typename T>
+    AssetHandle<T> create(const std::string& synthetic_id, std::shared_ptr<T> payload) {
+        AssetId id = AssetId::from_path(synthetic_id);  // no source_.resolve() -- not a real file
+        detail::AssetSlot* slot = find_or_create_slot_(id, std::type_index(typeid(T)));
+        if (!check_type_(*slot, std::type_index(typeid(T)), id)) {
+            return AssetHandle<T>();
+        }
+
+        if (!payload) {
+            fail_slot_(*slot, "create() called with a null payload");
+            return AssetHandle<T>(slot);
+        }
+
+        if (pending_.find(slot) != pending_.end()) {
+            // An async load is already in flight for this id -- publishing
+            // now would be clobbered by complete_pending_() later anyway,
+            // and would itself get silently overwritten. Refuse rather than
+            // race it.
+            if (logger_) {
+                logger_->error("[" + id.path() + "] create() called while a load_async() is still in flight for this id");
+            }
+            return AssetHandle<T>(slot);
+        }
+
+        if (!slot->resolved_path.empty()) {
+            // This id was previously created by load()/load_async() from a
+            // real file. Publishing here would clear resolved_path's
+            // association with that file only in appearance -- publish_()
+            // would still stamp last_write_time_ns from ctx.resolved_path
+            // (empty), so the next hot-reload poll would see the *real*
+            // file's mtime as newer than 0 and silently reload over this
+            // procedural payload. Refuse instead of fighting that.
+            if (logger_) {
+                logger_->error("[" + id.path() + "] create() called on an id already backed by a loaded file ('" +
+                                slot->resolved_path + "'); refusing to overwrite it");
+            }
+            return AssetHandle<T>(slot);
+        }
+
+        LoadContext ctx;  // resolved_path deliberately left empty
+        ctx.source = &source_;
+        publish_(*slot, std::move(payload), ctx);
+        return AssetHandle<T>(slot);
+    }
+
+    /**
      * @brief Requests eviction of an asset's slot.
      *
      * If any AssetHandle still references the slot (or a load for it is in
@@ -260,6 +336,7 @@ public:
         if (it == slots_.end()) return;
         if (it->second->ref_count > 0) return;
         if (pending_.find(it->second.get()) != pending_.end()) return;
+        retire_payload_(*it->second);
         slots_.erase(it);
     }
 
@@ -267,12 +344,39 @@ public:
     void garbage_collect() {
         for (auto it = slots_.begin(); it != slots_.end();) {
             if (it->second->ref_count == 0 && pending_.find(it->second.get()) == pending_.end()) {
+                retire_payload_(*it->second);
                 it = slots_.erase(it);
             } else {
                 ++it;
             }
         }
     }
+
+    // --- Idle eviction ---
+
+    /**
+     * @brief Enables/disables automatic eviction of slots unreferenced for max_idle_frames() (checked inside update()). Off by default.
+     *
+     * Complements, not replaces, garbage_collect(): garbage_collect() is for
+     * a caller that knows eviction is safe *right now* (e.g. immediately
+     * after a vkQueueWaitIdle at a level transition); idle eviction is for
+     * unattended, steady-state background reclamation. Both retire a slot's
+     * payload with the same grace period (see retire_payload_()).
+     *
+     * A Failed slot (payload already null) is evicted like any other once
+     * idle — meaning a later load() of the same path retries instead of
+     * serving a cached error forever. A create()d slot has no file to
+     * reload from once evicted; the existing refcount is what pins it —
+     * hold a handle to any procedural asset you want to keep.
+     */
+    void set_idle_eviction(bool enabled) { idle_eviction_enabled_ = enabled; }
+
+    /** @brief Consecutive idle update() calls before a slot is evicted. Default 300 (~5s at 60fps). 0 evicts on the first idle update(). */
+    void set_max_idle_frames(uint32_t frames) { max_idle_frames_ = frames; }
+
+    bool idle_eviction_enabled() const { return idle_eviction_enabled_; }
+
+    uint32_t max_idle_frames() const { return max_idle_frames_; }
 
     // --- Hot reload ---
 
@@ -287,7 +391,7 @@ public:
     // --- Per-frame pump ---
 
     /**
-     * @brief Drains completed async loads, ages out retired payloads, and (if enabled) polls for hot reload.
+     * @brief Drains completed async loads, ages out retired payloads, sweeps idle slots, and (if enabled) polls for hot reload.
      *
      * Call once per frame from the main thread, after any GPU work that
      * might reference a previous frame's assets has been submitted.
@@ -323,6 +427,15 @@ public:
             } else {
                 ++it;
             }
+        }
+
+        // Must run after the retired_ aging loop above (and before the
+        // hot-reload poll below, which is the same position
+        // poll_for_reloads_() already occupies) so a payload evicted this
+        // call gets the full k_payload_grace_frames of update() calls, not
+        // one frame less.
+        if (idle_eviction_enabled_) {
+            sweep_idle_();
         }
 
         if (hot_reload_enabled_) {
@@ -377,8 +490,8 @@ private:
     /// @brief Distinct JobType tag for asset IO jobs on this manager's dedicated engine (never shared with an app's own JobEngine job types).
     static constexpr JobType k_asset_io_job_type = 0xA55E7000u;
 
-    /// @brief Grace period (frames) a superseded payload is kept alive after a hot reload, so in-flight GPU work isn't yanked out from under it.
-    static constexpr int k_reload_grace_frames = 3;
+    /// @brief Grace period (frames) a superseded payload is kept alive before actual destruction, so in-flight GPU work isn't yanked out from under it. Applies to every eviction path — hot reload, create() re-publish, unload(), garbage_collect(), and idle eviction — not just reload, despite the name's origin.
+    static constexpr int k_payload_grace_frames = 3;
 
     detail::AssetSlot* find_or_create_slot_(const AssetId& id, std::type_index type) {
         auto it = slots_.find(id.hash());
@@ -424,12 +537,26 @@ private:
         if (logger_) logger_->error("[" + slot.id.path() + "] " + message);
     }
 
+    /**
+     * @brief Moves a slot's payload onto the retire list rather than destroying it now.
+     *
+     * A payload whose last reference is dropped THIS frame may still be
+     * referenced by a command buffer already recorded (or submitted) this
+     * frame, so destroying it immediately is a use-after-free on the GPU.
+     * Every eviction path — hot reload (via publish_()), create() re-publish,
+     * unload(), garbage_collect(), and idle eviction — goes through here so
+     * none of them can reintroduce that bug.
+     */
+    void retire_payload_(detail::AssetSlot& slot) {
+        if (slot.payload) {
+            retired_.emplace_back(std::move(slot.payload), k_payload_grace_frames);
+        }
+    }
+
     /** @brief Publishes a finalized payload into a slot, retiring any payload it replaces and firing on_reloaded for anything past the first load. */
     void publish_(detail::AssetSlot& slot, std::shared_ptr<void> payload, const LoadContext& ctx) {
         bool is_reload = static_cast<bool>(slot.payload);
-        if (is_reload) {
-            retired_.emplace_back(std::move(slot.payload), k_reload_grace_frames);
-        }
+        retire_payload_(slot);
         slot.payload = std::move(payload);
         slot.state = AssetState::Loaded;
         slot.error.clear();
@@ -449,6 +576,34 @@ private:
             publish_(*pending.slot, std::move(payload), pending.ctx);
         } catch (const std::exception& e) {
             fail_slot_(*pending.slot, e.what());
+        }
+    }
+
+    /**
+     * @brief Ages unreferenced slots out and evicts the ones past max_idle_frames_.
+     *
+     * The AssetSlot struct itself is erased immediately: once ref_count==0 no
+     * handle holds its address, and once it's absent from pending_ no
+     * PendingLoad holds it either, so nothing left in this system has a raw
+     * AssetSlot* into it. The PAYLOAD is what needs the grace period, so it
+     * is moved into retired_ (via retire_payload_()) BEFORE the slot is
+     * erased — erasing first would run the payload's destructor inline,
+     * defeating the whole point.
+     */
+    void sweep_idle_() {
+        for (auto it = slots_.begin(); it != slots_.end();) {
+            detail::AssetSlot& slot = *it->second;
+            if (slot.ref_count > 0 || pending_.find(it->second.get()) != pending_.end()) {
+                slot.idle_frames = 0;
+                ++it;
+                continue;
+            }
+            if (++slot.idle_frames < max_idle_frames_) {
+                ++it;
+                continue;
+            }
+            retire_payload_(slot);  // MUST precede the erase below
+            it = slots_.erase(it);
         }
     }
 
@@ -492,6 +647,9 @@ private:
     bool  hot_reload_enabled_ = false;
     float poll_interval_ = 1.0f;
     float poll_accum_ = 0.0f;
+
+    bool     idle_eviction_enabled_ = false;
+    uint32_t max_idle_frames_ = 300;
 
     coopa::debug::Logger* logger_ = nullptr;
 };

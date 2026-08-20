@@ -824,6 +824,13 @@ public:
     const char* type_name() const override { return "TextAsset"; }
 };
 
+/** @brief Test asset that reports its own destruction through a flag the test still owns. */
+struct TrackedAsset {
+    std::shared_ptr<bool> destroyed;
+    int                   tag = 0;
+    ~TrackedAsset() { if (destroyed) *destroyed = true; }
+};
+
 } // namespace asset_test
 
 void test_asset_id() {
@@ -1124,6 +1131,148 @@ void test_asset_manager_shutdown_drains_pending() {
     std::remove(test_file.c_str());
 }
 
+void test_asset_manager_create_publishes_runtime_payload() {
+    using namespace asset_test;
+
+    // No loader registered for TrackedAsset at all -- create() must never
+    // touch loaders_.
+    coopa::asset::AssetManager assets;
+    assets.set_hot_reload(true);
+    assets.set_poll_interval(0.0f);
+
+    auto destroyed = std::make_shared<bool>(false);
+    auto payload = std::make_shared<TrackedAsset>();
+    payload->destroyed = destroyed;
+    payload->tag = 42;
+
+    auto handle = assets.create<TrackedAsset>("runtime/generated", payload);
+    ASSERT_TRUE(handle.is_loaded());
+    ASSERT_EQ(handle.revision(), 1u);
+    ASSERT_EQ(handle->tag, 42);
+    ASSERT_TRUE(assets.get<TrackedAsset>("runtime/generated").get() == handle.get());
+
+    // resolved_path is empty for a create()d slot, so poll_for_reloads_()
+    // must skip it entirely -- revision must never move on its own.
+    for (int i = 0; i < 5; ++i) {
+        assets.update(0.0f);
+    }
+    ASSERT_EQ(handle.revision(), 1u);
+
+    // Type mismatch: create()-ing the same id as a different type must fail
+    // loudly and leave the existing slot completely alone.
+    auto mismatched = assets.create<TextAsset>("runtime/generated", std::make_shared<TextAsset>());
+    ASSERT_TRUE(!mismatched.is_valid());
+    ASSERT_EQ(handle.revision(), 1u);
+    ASSERT_TRUE(handle.is_loaded());
+
+    payload.reset();
+    handle = coopa::asset::AssetHandle<TrackedAsset>();
+    assets.garbage_collect();
+    ASSERT_TRUE(!assets.get<TrackedAsset>("runtime/generated").is_valid());
+    // garbage_collect() retires the payload with the same grace period as
+    // every other eviction path now (see retire_payload_()) -- it is not
+    // destroyed synchronously just because the slot is gone.
+    ASSERT_TRUE(!*destroyed);
+    for (int i = 0; i < 3; ++i) {
+        assets.update(0.0f);
+    }
+    ASSERT_TRUE(*destroyed);
+
+    assets.shutdown();
+}
+
+void test_asset_manager_create_republishes_with_grace_period() {
+    using namespace asset_test;
+
+    coopa::asset::AssetManager assets;
+
+    auto a_gone = std::make_shared<bool>(false);
+    auto payload_a = std::make_shared<TrackedAsset>();
+    payload_a->destroyed = a_gone;
+    payload_a->tag = 1;
+
+    auto handle = assets.create<TrackedAsset>("runtime/replaceable", payload_a);
+    ASSERT_TRUE(handle.is_loaded());
+    ASSERT_EQ(handle.revision(), 1u);
+
+    bool reload_fired = false;
+    coopa::asset::AssetId reloaded_id;
+    coopa::event::ScopedConnection conn = assets.on_reloaded.connect_scoped(
+        [&](const coopa::asset::AssetId& id) {
+            reload_fired = true;
+            reloaded_id = id;
+        });
+
+    // Drop the test's own reference to A -- only the slot's payload (plus,
+    // shortly, the retire list) should be keeping it alive.
+    payload_a.reset();
+
+    auto payload_b = std::make_shared<TrackedAsset>();
+    payload_b->tag = 2;
+    assets.create<TrackedAsset>("runtime/replaceable", payload_b);
+    payload_b.reset();
+
+    ASSERT_TRUE(reload_fired);
+    ASSERT_TRUE(reloaded_id == handle.id());
+    ASSERT_EQ(handle.revision(), 2u);
+    ASSERT_EQ(handle->tag, 2);           // same handle, new payload (address-stable slot)
+    ASSERT_TRUE(!*a_gone);               // still within the grace period
+
+    for (int i = 0; i < 3; ++i) {
+        assets.update(0.0f);
+    }
+    ASSERT_TRUE(*a_gone);
+
+    assets.shutdown();
+}
+
+void test_asset_manager_idle_eviction_defers_payload_destruction() {
+    using namespace asset_test;
+
+    coopa::asset::AssetManager assets;
+    assets.set_idle_eviction(true);
+    assets.set_max_idle_frames(2);
+    ASSERT_TRUE(assets.idle_eviction_enabled());
+    ASSERT_EQ(assets.max_idle_frames(), 2u);
+
+    auto destroyed = std::make_shared<bool>(false);
+
+    // Hold a handle for the first stretch, so we can prove a referenced
+    // slot never ages regardless of how long update() keeps running.
+    auto tracked = std::make_shared<TrackedAsset>();
+    tracked->destroyed = destroyed;
+    auto handle = assets.create<TrackedAsset>("runtime/evictable", tracked);
+    tracked.reset();
+    ASSERT_TRUE(handle.is_loaded());
+
+    for (int i = 0; i < 10; ++i) {
+        assets.update(0.0f);
+    }
+    ASSERT_TRUE(assets.get<TrackedAsset>("runtime/evictable").is_valid());
+    ASSERT_TRUE(!*destroyed);
+
+    // Drop the last handle -- the slot is now idle and should age out within
+    // max_idle_frames() updates, but the payload must survive the grace
+    // period after that.
+    handle = coopa::asset::AssetHandle<TrackedAsset>();
+
+    int updates_to_evict = 0;
+    while (assets.get<TrackedAsset>("runtime/evictable").is_valid() && updates_to_evict < 10) {
+        assets.update(0.0f);
+        ++updates_to_evict;
+    }
+    ASSERT_TRUE(!assets.get<TrackedAsset>("runtime/evictable").is_valid());
+    ASSERT_TRUE(updates_to_evict <= assets.max_idle_frames());
+    ASSERT_TRUE(!*destroyed);  // evicted from the slot, but still in the grace-period retire list
+
+    for (int i = 0; i < 3; ++i) {
+        assets.update(0.0f);
+    }
+    ASSERT_TRUE(*destroyed);
+
+    assets.shutdown();
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -1165,6 +1314,9 @@ int main() {
     RUN_TEST(test_asset_manager_hot_reload);
     RUN_TEST(test_asset_manager_unload_and_gc);
     RUN_TEST(test_asset_manager_shutdown_drains_pending);
+    RUN_TEST(test_asset_manager_create_publishes_runtime_payload);
+    RUN_TEST(test_asset_manager_create_republishes_with_grace_period);
+    RUN_TEST(test_asset_manager_idle_eviction_defers_payload_destruction);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

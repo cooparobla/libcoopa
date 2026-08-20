@@ -471,3 +471,65 @@ on the cube/cornell scenes with zero new content; the new instancing scene shows
 `instance_count>1` on G-buffer *and* transparent batches, with the negative-control run
 confirming the merge itself changes nothing visually; clean Vulkan validation output
 throughout.
+
+---
+
+## Progress (2026-08-19) — Implemented and verified in full
+
+**Feature A** — `coopa/asset/asset_manager.h` / `asset_slot.h`:
+- `retire_payload_()` extracted; `unload()`/`garbage_collect()` now route through it — this
+  fixed a real pre-existing bug (found while implementing, not just theorized): both used to
+  destroy a payload with **zero** GPU-safety grace period, unlike hot reload.
+- `AssetManager::create<T>()` implemented with the null-payload / in-flight / file-backed
+  guards from the design above.
+- `set_idle_eviction`/`set_max_idle_frames`/`sweep_idle_()` implemented exactly as designed.
+- 3 new tests added to `test.cpp` (`test_asset_manager_create_publishes_runtime_payload`,
+  `test_asset_manager_create_republishes_with_grace_period`,
+  `test_asset_manager_idle_eviction_defers_payload_destruction`). One bug caught and fixed
+  in my own first draft of the idle-eviction test (dead leftover code that destroyed the
+  test's tracked payload before the real test logic ran — worth noting since it shows the
+  test itself was doing its job). **39/39 libcoopa tests passing**, confirmed clean across
+  repeated `cbuild`/`cplay` runs.
+
+**Feature B** — fully implemented across all 5 phases (B0-B4) plus the B5 verification scene:
+- `InstanceData`/`Mesh::draw(cmd, instance_count, first_instance)` in
+  `gfxcoopa/engine/data/mesh.h`; `first_instance` param added to `CommandBuffer::draw_indexed`;
+  `InstanceBatcher` in new `gfxcoopa/engine/util/instance_batcher.h` — built exactly as
+  designed (`firstInstance`-based batch addressing, single non-double-buffered instance
+  buffer, caller-computed exact `continue_batch` predicate rather than a hashed key).
+- Shadow (directional + cube), G-buffer, transparent, and probe-capture passes all
+  converted. `GBufferPipeline`'s hand-rolled pipeline creation edited directly (the one
+  pipeline not using the shared `Pipeline` class, exactly as flagged). `pbr.vert`/`pbr.frag`
+  (shared by `TransparentPass` and `ProbeCapturePass`) converted together in one change, as
+  required. One shader missed on the first pass — `transparent.frag` (a separate file from
+  `pbr.frag`, easy to overlook) still declared the old 160-byte block — caught immediately
+  by a Vulkan validation error (`pStages[1]... range [0,160] outside... [0,32]`) on the very
+  next run and fixed before proceeding.
+- `same_material_`/`same_capture_material_` predicates implemented as designed (bit-exact
+  comparison, `alpha_mode`/`alpha`/`alpha_cutoff` excluded where the design said to).
+- `INSTANCE_BATCHING=off` negative-control switch and `INSTANCE_STATS=1` batch-count logging
+  added, matching the house `MAX_FRAMES`/`ONESHOT` env-var convention.
+- New verification scene `assets/scenes/instancing/scene.yaml` (deliberately no
+  `GiProbeVolume`/`ReflectionProbe` — keeps it fully deterministic, unlike the other two test
+  scenes) with a 5-cube row (one deliberately off-key mid-row), a 3-sphere row, and 3 BLEND
+  glass panes at staggered depth.
+
+**Verification results, concretely:**
+- `assets/scenes/instancing/scene.yaml`, batching **on**: shadow 4 batches/12 instances
+  (largest 5), opaque 5 batches/9 instances (largest 3 — the off-key cube correctly split
+  its batch and correctly rejoined afterward), transparent 1 batch/3 instances. Batching
+  **off** (`INSTANCE_BATCHING=off`): 12/9/3 batches respectively, every one size 1. The two
+  renders are **pixel-identical** (diff bbox: None, extrema all zero) — the strongest
+  available proof that batching changes GPU submission count only, never the image.
+- `gi_cornell_box` scene: **bit-identical** to its pre-instancing baseline at every phase
+  (0 through B4) — including the non-uniform-scale walls, which specifically exercises the
+  CPU→GPU normal-matrix relocation.
+- `cube` scene (which has real GI-probe/reflection-probe bake nondeterminism, independently
+  re-confirmed via same-code-rerun diffing at each phase): every phase's diff against the
+  previous phase stayed within the same noise-floor magnitude as re-running *identical* code
+  twice — no phase introduced a detectable regression beyond that pre-existing noise.
+- Zero Vulkan validation errors across every run once the `transparent.frag` miss was fixed.
+
+Nothing was descoped from the plan — all of Feature A, all 5 sub-phases of Feature B
+(including the optional/lowest-priority probe-capture conversion), and the full B5
+verification scene were completed.
