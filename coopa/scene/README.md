@@ -59,21 +59,25 @@ and uicoopa's `register_ui_components()` are the two current registrants.
 │                                 SCENE LOADING LIFECYCLE                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 
-  Application            SceneManager             SceneLoader              fkYAML
-      │                       │                        │                     │
+  Application       SceneManager      SceneLoader      SceneInheritance      fkYAML
+      │                   │                │                   │               │
       │── register_component_parser(...) for every non-Transform/Animation component
-      │                       │                        │                     │
-      │── load_scene(path) ──►│                        │                     │
-      │                       │── load(path) ─────────►│                     │
-      │                       │                        │── deserialize() ───►│
-      │                       │                        │◄─ fkyaml::node ─────│
-      │                       │                        │
-      │                       │                        │── Build Scene Tree
-      │                       │                        │── Dispatch each component
-      │                       │                        │   node to its registered
-      │                       │                        │   parser by tag/type name
-      │                       │◄── Scene Instance ─────│
-      │◄── Scene Ready ───────│
+      │                   │                │                   │               │
+      │── load_scene(path) ──►│            │                   │               │
+      │                   │── load(path) ─►│                   │               │
+      │                   │                │── resolve(path) ─►│               │
+      │                   │                │                   │── deserialize()/inherit_from ──►│
+      │                   │                │                   │◄─ fkyaml::node ──────────────────│
+      │                   │                │                   │── expand every inherit_from
+      │                   │                │                   │   (object-level, then scene-level)
+      │                   │                │◄── merged node ───│
+      │                   │                │
+      │                   │                │── Build Scene Tree
+      │                   │                │── Dispatch each component
+      │                   │                │   node to its registered
+      │                   │                │   parser by tag/type name
+      │                   │◄── Scene Instance ─│
+      │◄── Scene Ready ───│
 ```
 
 ---
@@ -87,6 +91,7 @@ and uicoopa's `register_ui_components()` are the two current registrants.
 | `SceneObject` | `Scene` or parent `SceneObject` | `std::vector<std::unique_ptr<Component>>`, `children` | Entity node holding component instances and recursive child hierarchy |
 | `Component` | `SceneObject` | Non-owning raw `owner` pointer | Abstract base class for all component behaviors |
 | `SceneLoader` | Static/stateless | Registry of external `ComponentParser`s | Parses `.yaml` scene descriptions, dispatching non-built-in components externally |
+| `SceneInheritance` | Static/stateless | None (pure node transform) | Expands every `inherit_from` into one merged `fkyaml::node` before `SceneLoader` parses it |
 
 ---
 
@@ -143,8 +148,74 @@ Parser for YAML scene files:
 - `set_document_loader(fn)` lets an application route parsing through
   something other than a plain file on disk — e.g. an encrypted/compressed
   container — without this module depending on whatever that requires.
-- `ParseContext{scene_path, scene_dir}` is passed to every parser so it can
-  resolve asset paths relative to the scene file.
+- `ParseContext{scene_path, scene_dir, search_dirs, resolve()}` is passed to
+  every parser so it can resolve asset paths against the file that actually
+  declared them — see Scene Inheritance below.
+- Before any of this runs, `SceneInheritance::resolve()` expands every
+  `inherit_from` in the raw document into one merged node (see below).
+
+### [`scene_inherit.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_inherit.h)
+
+Resolves `inherit_from` — a pure YAML-node merge pass with no knowledge of
+`Scene`/`SceneObject`/`Component`, run once by `SceneLoader::load()` before
+anything is parsed into live objects.
+
+**Where it's allowed:**
+
+| Level | Key location | Effect |
+|---|---|---|
+| Object | any object node (`root_objects` entry or `children` entry) | merges in another file's object as this object's base |
+| Scene  | the top-level `scene:` block | merges in another file's `scene:` block (name, `auto_transform`, `root_objects`) as this scene's base |
+
+A base reference is a string or list of strings: `inherit_from: path.yaml` or
+`inherit_from: [a.yaml, b.yaml]` (later entries override earlier ones), and
+may include an anchor for object-level references: `path.yaml#ObjectName`.
+The referenced document supplies its base object via, in order: a top-level
+`object:` key (the canonical shape for a reusable prefab file), a `#ObjectName`
+lookup (depth-first) or first entry of a `scene: root_objects:` list, or
+otherwise its bare top-level mapping.
+
+**Merge rules:**
+
+| Node | Match key | Behavior |
+|---|---|---|
+| Plain fields | — | override wins; two mappings merge recursively (`color: { a: 0.5 }` touches only alpha); everything else replaces wholesale |
+| `components:` | normalized `type`/`!Tag`, plus optional `id:` to disambiguate repeats | matched entries deep-merge in place; unmatched append; an ambiguous match (repeated type, no `id`) appends with a warning instead of guessing |
+| `children:` | `name` | matched entries merge in place, preserving the base's position (draw/traversal order matters); unmatched append |
+
+Any component or child entry carrying `remove: true` deletes the matching
+base entry instead of merging.
+
+**Reserved keys** (read by the merge pass, otherwise inert to component
+parsers): `inherit_from`, `id`, `remove`, and `__source_dirs` — a per-node
+stamped list of declaring directories (nearest first), consumed by
+`ParseContext::resolve()` so a component merged in from a prefab in another
+directory keeps resolving its own relative asset paths (`font:`,
+`animation_file:`, ...) against the file that actually wrote them.
+
+Errors: a missing base file, an inheritance cycle, or a chain deeper than 32
+files all throw `std::runtime_error`.
+
+```yaml
+# assets/prefabs/corner_panel.yaml — a reusable prefab
+object:
+  name: CornerPanel
+  components:
+    - type: RectTransform
+      size_delta: { x: 220.0, y: 90.0 }
+    - type: Text
+      font: ../fonts/DejaVuSans.ttf   # resolves against assets/prefabs/, not the including scene
+      font_size: 16
+
+# assets/scenes/hud/scene.yaml — uses it, overriding just what differs
+scene:
+  root_objects:
+    - name: TopLeft
+      inherit_from: ../prefabs/corner_panel.yaml
+      components:
+        - type: Text
+          text: "Top Left"   # only `text` changes; font/font_size/... survive
+```
 
 ---
 

@@ -11,11 +11,13 @@
  * Scene format:
  *   format: <free-form string, informational only>
  *   scene:
+ *     inherit_from: <path.yaml>              # optional; whole-file inheritance, see below
  *     scene_name: <name>
  *     auto_transform: <bool, default true>   # add a TransformComponent to every object
  *     root_objects:
  *       - name: <str>
  *         active: <bool>
+ *         inherit_from: <path.yaml[#Object]> # optional; this object's base, merged in first
  *         components:
  *           - !Transform  { position, rotation, scale }   # or "type: Transform"
  *           - !SomeTag    { ... }                          # dispatched via the registry
@@ -38,6 +40,15 @@
  * document loader (set_document_loader()) to route through something else —
  * e.g. an application that wants encrypted/compressed .caml scene files can
  * plug in a caml-backed loader without SceneLoader depending on caml itself.
+ *
+ * Before any of the above is parsed, every `inherit_from` reachable from the
+ * document is expanded by SceneInheritance (see scene_inherit.h) into one
+ * fully-merged node — this happens unconditionally, even for documents routed
+ * through a custom document loader, so `inherit_from` works the same way
+ * regardless of where the raw YAML came from. See scene_inherit.h for the
+ * object-level/scene-level inheritance and merge rules; ParseContext::resolve()
+ * below is the seam that keeps a merged-in file's relative asset paths
+ * resolving against the directory that actually declared them.
  */
 
 #ifndef COOPA_SCENE_SCENE_LOADER_H
@@ -45,6 +56,7 @@
 
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_object.h>
+#include <coopa/scene/scene_inherit.h>
 #include <coopa/scene/components/transform_component.h>
 #include <coopa/scene/components/animation_component.h>
 
@@ -57,6 +69,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <functional>
+#include <vector>
 
 namespace coopa {
 namespace scene {
@@ -71,7 +84,7 @@ namespace scene {
  * // Once at startup, from whichever module defines each component:
  * SceneLoader::register_component_parser("MeshRenderer", [&](const auto& node, auto& obj, const auto& ctx) {
  *     auto* mr = obj.template add_component<MeshRenderer>();
- *     // ... populate mr from node, resolving relative asset paths against ctx.scene_dir ...
+ *     // ... populate mr from node, resolving relative asset paths via ctx.resolve(path) ...
  * });
  *
  * Scene scene = SceneLoader::load("assets/scenes/cube/scene.yaml");
@@ -83,8 +96,44 @@ public:
      * @brief Context passed to every component parser alongside its YAML node.
      */
     struct ParseContext {
-        std::string scene_path; /**< Full path of the scene file being loaded. */
+        std::string scene_path; /**< Full path of the root scene file being loaded. */
         std::string scene_dir;  /**< Its directory; resolve relative asset paths against this. */
+
+        /**
+         * @brief Directories to try first when resolving a relative asset
+         *        path, nearest declaring file first.
+         *
+         * Populated per-component from that component's SceneInheritance
+         * `__source_dirs` provenance, so a component merged in from a prefab
+         * in a different directory (e.g. assets/prefabs/) still resolves its
+         * own relative paths (e.g. `font: ../fonts/x.ttf`) against the file
+         * that actually wrote them, not against the including scene's
+         * directory. Empty when a node carries no provenance (e.g. an
+         * object built without ever going through SceneLoader::load()).
+         */
+        std::vector<std::string> search_dirs;
+
+        /**
+         * @brief Resolves a relative asset path against this context's provenance.
+         *
+         * Tries search_dirs in order, then scene_dir, returning the first
+         * candidate that exists on disk. Falls through to the path
+         * unchanged if none exist, so callers with their own asset search
+         * roots (e.g. coopa::asset::AssetSource) can still make sense of it.
+         *
+         * @param relative Path as written in the scene file.
+         * @return The resolved path, or `relative` unchanged if no candidate exists.
+         */
+        std::string resolve(const std::string& relative) const {
+            if (std::filesystem::path(relative).is_absolute()) return relative;
+            for (const auto& dir : search_dirs) {
+                std::filesystem::path candidate = std::filesystem::path(dir) / relative;
+                if (std::filesystem::exists(candidate)) return candidate.string();
+            }
+            std::filesystem::path candidate = std::filesystem::path(scene_dir) / relative;
+            if (std::filesystem::exists(candidate)) return candidate.string();
+            return relative;
+        }
     };
 
     /**
@@ -121,9 +170,10 @@ public:
     static Scene load(const std::string& path) {
         std::filesystem::path scene_path(path);
         std::filesystem::path scene_dir = scene_path.parent_path();
-        ParseContext ctx{ path, scene_dir.string() };
+        ParseContext ctx{ path, scene_dir.string(), { scene_dir.string() } };
 
-        fkyaml::node root = load_node_(path);
+        fkyaml::node root = SceneInheritance::resolve(
+            path, [](const std::string& p) { return load_node_(p); });
 
         std::string scene_name = "Scene";
         bool auto_transform = true;
@@ -247,7 +297,14 @@ private:
 
         if (node.contains("components")) {
             for (const auto& comp_node : node.at("components")) {
-                parse_component_(comp_node, *obj, ctx);
+                ParseContext comp_ctx = ctx;
+                if (comp_node.contains(SceneInheritance::kSourceDirsKey)) {
+                    comp_ctx.search_dirs.clear();
+                    for (const auto& d : comp_node.at(SceneInheritance::kSourceDirsKey)) {
+                        comp_ctx.search_dirs.push_back(d.get_value<std::string>());
+                    }
+                }
+                parse_component_(comp_node, *obj, comp_ctx);
             }
         }
 
@@ -293,17 +350,7 @@ private:
             }
 
             if (!anim_file.empty()) {
-                std::filesystem::path p(anim_file);
-                if (p.is_relative()) {
-                    std::string scene_relative = ctx.scene_dir + "/" + anim_file;
-                    if (std::filesystem::exists(scene_relative)) {
-                        anim->load_from_yaml(scene_relative);
-                    } else {
-                        anim->load_from_yaml(anim_file);
-                    }
-                } else {
-                    anim->load_from_yaml(anim_file);
-                }
+                anim->load_from_yaml(ctx.resolve(anim_file));
             }
             anim->parse_node(node);
         } else {

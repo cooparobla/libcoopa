@@ -3,6 +3,7 @@
 #include <vector>
 #include <functional>
 #include <cassert>
+#include <cmath>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -33,6 +34,10 @@
 #include <coopa/job/scheduler.h>
 #include <coopa/event/signal.h>
 #include <coopa/asset/asset_manager.h>
+#include <coopa/scene/component.h>
+#include <coopa/scene/scene_object.h>
+#include <coopa/scene/scene.h>
+#include <coopa/scene/scene_loader.h>
 
 // ANSI Colors for nice UI
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -1273,10 +1278,393 @@ void test_asset_manager_idle_eviction_defers_payload_destruction() {
     assets.shutdown();
 }
 
+// ---------------------------------------------------------
+// Scene inheritance (inherit_from) tests
+// ---------------------------------------------------------
+
+namespace scene_inherit_test {
+
+// A minimal test-only component so merges can be verified against real
+// attached component instances rather than by re-inspecting YAML (which
+// SceneLoader never exposes back out -- the pipeline is load-only).
+class TestTagComponent : public coopa::scene::Component {
+public:
+    std::string type_name() const override { return "TestTag"; }
+    std::string id;
+    std::string label;
+    std::string extra;
+};
+
+// A second test-only component whose sole job is to prove ctx.resolve()
+// finds a relative path against the file that actually declared it -- the
+// provenance a prefab merged in from another directory needs to keep working.
+class TestAssetComponent : public coopa::scene::Component {
+public:
+    std::string type_name() const override { return "TestAsset"; }
+    std::string resolved_path;
+};
+
+void register_components() {
+    coopa::scene::SceneLoader::register_component_parser(
+        "TestTag",
+        [](const fkyaml::node& node, coopa::scene::SceneObject& obj, const coopa::scene::SceneLoader::ParseContext&) {
+            auto* c = obj.add_component<TestTagComponent>();
+            if (node.contains("id"))    c->id    = node.at("id").get_value<std::string>();
+            if (node.contains("label")) c->label = node.at("label").get_value<std::string>();
+            if (node.contains("extra")) c->extra = node.at("extra").get_value<std::string>();
+        });
+    coopa::scene::SceneLoader::register_component_parser(
+        "TestAsset",
+        [](const fkyaml::node& node, coopa::scene::SceneObject& obj, const coopa::scene::SceneLoader::ParseContext& ctx) {
+            auto* c = obj.add_component<TestAssetComponent>();
+            if (node.contains("file")) {
+                c->resolved_path = ctx.resolve(node.at("file").get_value<std::string>());
+            }
+        });
+}
+
+std::vector<TestTagComponent*> find_tags(const coopa::scene::SceneObject& obj) {
+    std::vector<TestTagComponent*> result;
+    for (const auto& c : obj.components()) {
+        if (auto* t = dynamic_cast<TestTagComponent*>(c.get())) result.push_back(t);
+    }
+    return result;
+}
+
+TestTagComponent* find_tag_by_id(const coopa::scene::SceneObject& obj, const std::string& id) {
+    for (auto* t : find_tags(obj)) {
+        if (t->id == id) return t;
+    }
+    return nullptr;
+}
+
+// Fixtures live under a fresh per-test subdirectory of the system temp dir so
+// relative inherit_from paths (and relative asset paths inside inherited
+// files) behave exactly like real files on disk, including across
+// directories -- string-substitution fixtures can't exercise that.
+std::string write_file(const std::string& test_name, const std::string& relative_path, const std::string& content) {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "libcoopa_scene_inherit_tests" / test_name / relative_path;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path);
+    out << content;
+    out.close();
+    return path.string();
+}
+
+} // namespace scene_inherit_test
+
+void test_scene_inherit_object_from_file() {
+    using namespace scene_inherit_test;
+    write_file("object_from_file", "prefab.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components:\n"
+        "    - type: Transform\n"
+        "      position: { x: 1.0, y: 2.0, z: 3.0 }\n"
+        "    - type: TestTag\n"
+        "      label: base-label\n"
+        "  children:\n"
+        "    - name: Child1\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          label: child-label\n");
+    std::string scene_path = write_file("object_from_file", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: prefab.yaml\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          label: override-label\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    coopa::scene::SceneObject* obj = scene.find_object("Derived");
+    ASSERT_TRUE(obj != nullptr);
+    ASSERT_TRUE(obj->get_transform() != nullptr);
+    ASSERT_TRUE(std::abs(obj->get_transform()->transform().position().x - 1.0f) < 1e-5f);
+    ASSERT_EQ(find_tags(*obj).size(), static_cast<size_t>(1));
+    ASSERT_EQ(find_tags(*obj)[0]->label, std::string("override-label"));
+
+    coopa::scene::SceneObject* child = obj->find_descendant("Child1");
+    ASSERT_TRUE(child != nullptr);
+    ASSERT_EQ(find_tags(*child)[0]->label, std::string("child-label"));
+}
+
+void test_scene_inherit_component_merge_by_type() {
+    using namespace scene_inherit_test;
+    write_file("merge_by_type", "prefab.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components:\n"
+        "    - type: TestTag\n"
+        "      label: base-label\n"
+        "      extra: base-extra\n");
+    std::string scene_path = write_file("merge_by_type", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: prefab.yaml\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          label: new-label\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    auto* tag = find_tags(*scene.find_object("Derived"))[0];
+    ASSERT_EQ(tag->label, std::string("new-label"));
+    ASSERT_EQ(tag->extra, std::string("base-extra"));
+}
+
+void test_scene_inherit_component_id_disambiguation() {
+    using namespace scene_inherit_test;
+    write_file("id_disambiguation", "prefab.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components:\n"
+        "    - type: TestTag\n"
+        "      id: A\n"
+        "      label: A-base\n"
+        "    - type: TestTag\n"
+        "      id: B\n"
+        "      label: B-base\n");
+    std::string scene_path = write_file("id_disambiguation", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: prefab.yaml\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          id: B\n"
+        "          label: B-override\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    coopa::scene::SceneObject* obj = scene.find_object("Derived");
+    ASSERT_EQ(find_tags(*obj).size(), static_cast<size_t>(2));
+    ASSERT_EQ(find_tag_by_id(*obj, "A")->label, std::string("A-base"));
+    ASSERT_EQ(find_tag_by_id(*obj, "B")->label, std::string("B-override"));
+}
+
+void test_scene_inherit_children_merge_and_append() {
+    using namespace scene_inherit_test;
+    write_file("children_merge", "prefab.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  children:\n"
+        "    - name: A\n"
+        "      components: [ { type: TestTag, label: A-base } ]\n"
+        "    - name: B\n"
+        "      components: [ { type: TestTag, label: B-base } ]\n");
+    std::string scene_path = write_file("children_merge", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: prefab.yaml\n"
+        "      children:\n"
+        "        - name: B\n"
+        "          components: [ { type: TestTag, label: B-override } ]\n"
+        "        - name: C\n"
+        "          components: [ { type: TestTag, label: C-new } ]\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    coopa::scene::SceneObject* obj = scene.find_object("Derived");
+    ASSERT_EQ(obj->children().size(), static_cast<size_t>(3));
+    ASSERT_EQ(obj->children()[0]->name(), std::string("A"));
+    ASSERT_EQ(obj->children()[1]->name(), std::string("B"));
+    ASSERT_EQ(obj->children()[2]->name(), std::string("C"));
+    ASSERT_EQ(find_tags(*obj->children()[0])[0]->label, std::string("A-base"));
+    ASSERT_EQ(find_tags(*obj->children()[1])[0]->label, std::string("B-override"));
+    ASSERT_EQ(find_tags(*obj->children()[2])[0]->label, std::string("C-new"));
+}
+
+void test_scene_inherit_remove() {
+    using namespace scene_inherit_test;
+    write_file("remove", "prefab.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components:\n"
+        "    - type: TestTag\n"
+        "      label: keep\n"
+        "    - type: TestTag\n"
+        "      id: doomed\n"
+        "      label: remove-me\n"
+        "  children:\n"
+        "    - name: KeepChild\n"
+        "    - name: RemoveChild\n");
+    std::string scene_path = write_file("remove", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: prefab.yaml\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          id: doomed\n"
+        "          remove: true\n"
+        "      children:\n"
+        "        - name: RemoveChild\n"
+        "          remove: true\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    coopa::scene::SceneObject* obj = scene.find_object("Derived");
+    ASSERT_EQ(find_tags(*obj).size(), static_cast<size_t>(1));
+    ASSERT_EQ(find_tags(*obj)[0]->label, std::string("keep"));
+    ASSERT_EQ(obj->children().size(), static_cast<size_t>(1));
+    ASSERT_EQ(obj->children()[0]->name(), std::string("KeepChild"));
+}
+
+void test_scene_inherit_scene_level() {
+    using namespace scene_inherit_test;
+    write_file("scene_level", "base_scene.yaml",
+        "scene:\n"
+        "  scene_name: BaseScene\n"
+        "  root_objects:\n"
+        "    - name: Canvas\n"
+        "      components: [ { type: TestTag, label: canvas-base } ]\n"
+        "    - name: Extra\n");
+    std::string scene_path = write_file("scene_level", "derived_scene.yaml",
+        "scene:\n"
+        "  inherit_from: base_scene.yaml\n"
+        "  scene_name: DerivedScene\n"
+        "  root_objects:\n"
+        "    - name: Canvas\n"
+        "      components: [ { type: TestTag, label: canvas-override } ]\n"
+        "    - name: New\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    ASSERT_EQ(scene.name(), std::string("DerivedScene"));
+    ASSERT_EQ(find_tags(*scene.find_object("Canvas"))[0]->label, std::string("canvas-override"));
+    ASSERT_TRUE(scene.find_object("Extra") != nullptr);
+    ASSERT_TRUE(scene.find_object("New") != nullptr);
+}
+
+void test_scene_inherit_chain() {
+    using namespace scene_inherit_test;
+    write_file("chain", "a.yaml",
+        "object:\n"
+        "  name: A\n"
+        "  components: [ { type: TestTag, label: A-label, extra: A-extra } ]\n");
+    write_file("chain", "b.yaml",
+        "object:\n"
+        "  name: B\n"
+        "  inherit_from: a.yaml\n"
+        "  components: [ { type: TestTag, label: B-label } ]\n");
+    std::string scene_path = write_file("chain", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Final\n"
+        "      inherit_from: b.yaml\n"
+        "      components: [ { type: TestTag, label: C-label } ]\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    auto* tag = find_tags(*scene.find_object("Final"))[0];
+    ASSERT_EQ(tag->label, std::string("C-label"));
+    ASSERT_EQ(tag->extra, std::string("A-extra"));
+}
+
+void test_scene_inherit_multiple_bases() {
+    using namespace scene_inherit_test;
+    write_file("multiple_bases", "base1.yaml",
+        "object:\n"
+        "  name: Base1\n"
+        "  components: [ { type: TestTag, label: from-base1, extra: e1 } ]\n");
+    write_file("multiple_bases", "base2.yaml",
+        "object:\n"
+        "  name: Base2\n"
+        "  components: [ { type: TestTag, label: from-base2 } ]\n");
+    std::string scene_path = write_file("multiple_bases", "scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: [ base1.yaml, base2.yaml ]\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    auto* tag = find_tags(*scene.find_object("Derived"))[0];
+    ASSERT_EQ(tag->label, std::string("from-base2"));
+    ASSERT_EQ(tag->extra, std::string("e1"));
+}
+
+void test_scene_inherit_cycle_throws() {
+    using namespace scene_inherit_test;
+    write_file("cycle", "a.yaml", "object:\n  name: A\n  inherit_from: b.yaml\n");
+    write_file("cycle", "b.yaml", "object:\n  name: B\n  inherit_from: a.yaml\n");
+    std::string scene_path = write_file("cycle", "scene.yaml",
+        "scene:\n  root_objects:\n    - name: X\n      inherit_from: a.yaml\n");
+
+    bool threw = false;
+    try {
+        coopa::scene::SceneLoader::load(scene_path);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    ASSERT_TRUE(threw);
+}
+
+void test_scene_inherit_missing_file_throws() {
+    using namespace scene_inherit_test;
+    std::string scene_path = write_file("missing_file", "scene.yaml",
+        "scene:\n  root_objects:\n    - name: X\n      inherit_from: does_not_exist.yaml\n");
+
+    bool threw = false;
+    try {
+        coopa::scene::SceneLoader::load(scene_path);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    ASSERT_TRUE(threw);
+}
+
+void test_scene_inherit_asset_path_resolution() {
+    using namespace scene_inherit_test;
+    write_file("asset_path", "prefabs/note.txt", "hi");
+    std::string note_path = (std::filesystem::temp_directory_path() /
+        "libcoopa_scene_inherit_tests" / "asset_path" / "prefabs" / "note.txt").string();
+    write_file("asset_path", "prefabs/labeled.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components: [ { type: TestAsset, file: note.txt } ]\n");
+    std::string scene_path = write_file("asset_path", "scenes/scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Widget\n"
+        "      inherit_from: ../prefabs/labeled.yaml\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    coopa::scene::SceneObject* obj = scene.find_object("Widget");
+    auto* asset = obj->get_component<TestAssetComponent>();
+    ASSERT_TRUE(asset != nullptr);
+    // Must resolve against prefabs/ (where note.txt actually lives), not
+    // scenes/ (the including scene's own directory, which has no note.txt).
+    ASSERT_EQ(std::filesystem::path(asset->resolved_path).filename().string(), std::string("note.txt"));
+    ASSERT_TRUE(std::filesystem::exists(asset->resolved_path));
+    ASSERT_EQ(std::filesystem::canonical(asset->resolved_path).string(), std::filesystem::canonical(note_path).string());
+}
+
+void test_scene_inherit_no_inherit_unchanged() {
+    using namespace scene_inherit_test;
+    std::string scene_path = write_file("no_inherit", "scene.yaml",
+        "scene:\n"
+        "  scene_name: Plain\n"
+        "  root_objects:\n"
+        "    - name: Solo\n"
+        "      components:\n"
+        "        - type: Transform\n"
+        "          position: { x: 5.0, y: 6.0, z: 7.0 }\n"
+        "        - type: TestTag\n"
+        "          label: solo-label\n");
+
+    coopa::scene::Scene scene = coopa::scene::SceneLoader::load(scene_path);
+    ASSERT_EQ(scene.name(), std::string("Plain"));
+    coopa::scene::SceneObject* obj = scene.find_object("Solo");
+    ASSERT_TRUE(obj != nullptr);
+    ASSERT_TRUE(std::abs(obj->get_transform()->transform().position().x - 5.0f) < 1e-5f);
+    ASSERT_EQ(find_tags(*obj)[0]->label, std::string("solo-label"));
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
     std::cout << "===========================================" << std::endl;
+
+    scene_inherit_test::register_components();
 
     RUN_TEST(test_id_util);
     RUN_TEST(test_string_util);
@@ -1317,6 +1705,19 @@ int main() {
     RUN_TEST(test_asset_manager_create_publishes_runtime_payload);
     RUN_TEST(test_asset_manager_create_republishes_with_grace_period);
     RUN_TEST(test_asset_manager_idle_eviction_defers_payload_destruction);
+
+    RUN_TEST(test_scene_inherit_object_from_file);
+    RUN_TEST(test_scene_inherit_component_merge_by_type);
+    RUN_TEST(test_scene_inherit_component_id_disambiguation);
+    RUN_TEST(test_scene_inherit_children_merge_and_append);
+    RUN_TEST(test_scene_inherit_remove);
+    RUN_TEST(test_scene_inherit_scene_level);
+    RUN_TEST(test_scene_inherit_chain);
+    RUN_TEST(test_scene_inherit_multiple_bases);
+    RUN_TEST(test_scene_inherit_cycle_throws);
+    RUN_TEST(test_scene_inherit_missing_file_throws);
+    RUN_TEST(test_scene_inherit_asset_path_resolution);
+    RUN_TEST(test_scene_inherit_no_inherit_unchanged);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;
