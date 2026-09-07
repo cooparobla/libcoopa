@@ -6,7 +6,7 @@ It is designed to be highly thread-safe and suitable for building multithreaded 
 
 ## Modules Overview
 
-`libcoopa` is organized into seven main modules:
+`libcoopa` is organized into nine main modules:
 
 ### 1. [Utilities (`coopa/util/`)](file:///home/coopa/git/libcoopa/coopa/util/)
 Cross-platform helper utilities for math, file paths, strings, and unique IDs:
@@ -60,6 +60,13 @@ Unity-style scene animator — see the [module README](file:///home/coopa/git/li
 - **[AnimationClip](file:///home/coopa/git/libcoopa/coopa/animation/animation_clip.h)**: Immutable, YAML-loadable animation data — keyframed tracks (linear + eased interpolation) and procedural tracks (formula-driven, e.g. `orbit`/`sine`/`spin`), both sharing one binding/blend path.
 - **[AnimatedPropertyRegistry](file:///home/coopa/git/libcoopa/coopa/animation/animated_property.h)**: The extension point that lets any component type register animatable fields, mirroring `SceneLoader::register_component_parser()`.
 - **[AnimationSystem](file:///home/coopa/git/libcoopa/coopa/animation/animation_system.h)**: The `ISceneSystem` that drives every `Animator` in a scene, batching evaluation across a `JobEngine` once the workload is large enough to be worth it.
+
+### 9. [Input (`coopa/input/`)](file:///home/coopa/git/libcoopa/coopa/input/)
+The complete keyboard/mouse vocabulary and state model, backend-agnostic — see the [module README](file:///home/coopa/git/libcoopa/coopa/input/README.md):
+- **[Input](file:///home/coopa/git/libcoopa/coopa/input/input.h)**: Owns all key/button level state, edges, held time, deltas, and discrete events; fed by a backend's `push_*()` calls (e.g. gfxcoopa's GLFW-backed `presentation::Window`) and queried directly by application code.
+- **[InputMap](file:///home/coopa/git/libcoopa/coopa/input/input_map.h)**: Named action/axis/vector bindings over keys and mouse buttons, with optional modifier chords, resolved against an `Input`.
+- **[IInputBackend](file:///home/coopa/git/libcoopa/coopa/input/input_backend.h)**: The interface a concrete windowing library implements so `Input`'s cursor/clipboard control calls have somewhere to go.
+- **[Key / MouseButton / Mods / ...](file:///home/coopa/git/libcoopa/coopa/input/keys.h)**: The dense, 0-based, backend-independent key/button vocabulary.
 
 ---
 

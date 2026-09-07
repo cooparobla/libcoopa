@@ -49,6 +49,9 @@
 #include <coopa/animation/animation_system.h>
 #include <coopa/animation/animation_clip_loader.h>
 #include <coopa/animation/animation_yaml.h>
+#include <coopa/input/keys.h>
+#include <coopa/input/input.h>
+#include <coopa/input/input_map.h>
 #include <glm/glm.hpp>
 
 // ANSI Colors for nice UI
@@ -2628,6 +2631,194 @@ void test_procedural_crossfade_against_keyframed() {
     ASSERT_TRUE(std::abs(pos.x - 10.0f) < 1e-3f);
 }
 
+// ---------------------------------------------------------
+// coopa::input tests
+// ---------------------------------------------------------
+namespace input_test {
+
+// --- input_map.h --- (ported from gfxcoopa/pixengine, KeyState-predicate form)
+
+static void test_input_map_action_down_with_any_bound_key() {
+    using namespace coopa::input;
+    InputMap map;
+    map.bind("jump", Key::Space);
+    map.bind("jump", Key::W);
+
+    // A magic keycode (e.g. a raw backend int) would have silently misbehaved
+    // here under the sealed dense Key enum -- this test exists specifically
+    // to keep that class of bug (see pixengine's original migration notes)
+    // impossible.
+    auto only_w_down = [](Key k) { return k == Key::W; };
+    ASSERT_TRUE(map.is_down("jump", only_w_down));
+
+    auto nothing_down = [](Key) { return false; };
+    ASSERT_TRUE(!map.is_down("jump", nothing_down));
+}
+
+static void test_input_map_unbound_action_never_down() {
+    using namespace coopa::input;
+    InputMap map;
+    auto always_true = [](Key) { return true; };
+    ASSERT_TRUE(!map.is_down("nonexistent", always_true));
+    ASSERT_TRUE(map.bindings("nonexistent").empty());
+}
+
+static void test_input_map_unbind_clears_bindings() {
+    using namespace coopa::input;
+    InputMap map;
+    map.bind("fire", Key::F1);
+    ASSERT_EQ(map.bindings("fire").size(), 1u);
+    map.unbind("fire");
+    ASSERT_TRUE(map.bindings("fire").empty());
+    auto always_true = [](Key) { return true; };
+    ASSERT_TRUE(!map.is_down("fire", always_true));
+}
+
+// --- input_map.h --- (new: mouse buttons, chords, axis/vector, against a real Input)
+
+static void test_input_map_chord_requires_modifier() {
+    using namespace coopa::input;
+    InputMap map;
+    map.bind("save", Key::S, Mods::Control);
+
+    Input input;
+    input.begin_frame(0.016f);
+    input.push_key(Key::S, 0, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(!map.is_down("save", input)); // S alone, no Control -- must not fire
+
+    input.begin_frame(0.016f);
+    input.push_key(Key::S, 0, KeyAction::Press, Mods::Control);
+    ASSERT_TRUE(map.is_down("save", input)); // S + Control -- fires
+}
+
+static void test_input_map_mouse_button_binding() {
+    using namespace coopa::input;
+    InputMap map;
+    map.bind("attack", MouseButton::Left);
+
+    Input input;
+    input.begin_frame(0.016f);
+    ASSERT_TRUE(!map.is_down("attack", input));
+    input.push_mouse_button(MouseButton::Left, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(map.is_down("attack", input));
+    ASSERT_TRUE(map.is_pressed("attack", input));
+}
+
+static void test_input_map_axis_and_vector() {
+    using namespace coopa::input;
+    InputMap map;
+    map.bind_axis("move_x", Key::D, Key::A);
+    map.bind_vector("move", Key::D, Key::A, Key::W, Key::S);
+
+    Input input;
+    input.begin_frame(0.016f);
+    input.push_key(Key::D, 0, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(std::abs(map.axis("move_x", input) - 1.0f) < 1e-6f);
+    glm::vec2 v = map.vector("move", input);
+    ASSERT_TRUE(std::abs(v.x - 1.0f) < 1e-6f && std::abs(v.y - 0.0f) < 1e-6f);
+
+    input.push_key(Key::W, 0, KeyAction::Press, Mods::None);
+    v = map.vector("move", input);
+    ASSERT_TRUE(std::abs(v.x - 1.0f) < 1e-6f && std::abs(v.y - 1.0f) < 1e-6f);
+
+    // Both keys of an axis held -- they cancel to 0, not undefined behavior.
+    input.push_key(Key::A, 0, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(std::abs(map.axis("move_x", input) - 0.0f) < 1e-6f);
+}
+
+// --- input.h ---
+
+static void test_input_press_release_edges_clear_on_begin_frame() {
+    using namespace coopa::input;
+    Input input;
+    input.begin_frame(0.016f);
+    input.push_key(Key::A, 0, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(input.key_pressed(Key::A));
+    ASSERT_TRUE(input.key_down(Key::A));
+
+    // Next frame, no new events -- the press edge is gone, but "down" persists.
+    input.begin_frame(0.016f);
+    ASSERT_TRUE(!input.key_pressed(Key::A));
+    ASSERT_TRUE(input.key_down(Key::A));
+
+    input.push_key(Key::A, 0, KeyAction::Release, Mods::None);
+    ASSERT_TRUE(input.key_released(Key::A));
+    ASSERT_TRUE(!input.key_down(Key::A));
+}
+
+static void test_input_held_time_accumulates() {
+    using namespace coopa::input;
+    Input input;
+    input.begin_frame(0.0f);
+    input.push_key(Key::W, 0, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(std::abs(input.key_held_time(Key::W) - 0.0f) < 1e-6f);
+
+    input.begin_frame(0.5f); // W still down -- accumulates the elapsed 0.5s
+    ASSERT_TRUE(std::abs(input.key_held_time(Key::W) - 0.5f) < 1e-6f);
+
+    input.begin_frame(0.25f);
+    ASSERT_TRUE(std::abs(input.key_held_time(Key::W) - 0.75f) < 1e-6f);
+
+    input.push_key(Key::W, 0, KeyAction::Release, Mods::None);
+    ASSERT_TRUE(std::abs(input.key_held_time(Key::W) - 0.0f) < 1e-6f);
+}
+
+static void test_input_press_and_release_within_one_frame_sets_both_edges() {
+    using namespace coopa::input;
+    Input input;
+    input.begin_frame(0.016f);
+    // Event-driven (unlike level-triggered polling), so a click-and-release
+    // faster than one frame still registers both edges -- polling would miss it.
+    input.push_mouse_button(MouseButton::Left, KeyAction::Press, Mods::None);
+    input.push_mouse_button(MouseButton::Left, KeyAction::Release, Mods::None);
+    ASSERT_TRUE(input.button_pressed(MouseButton::Left));
+    ASSERT_TRUE(input.button_released(MouseButton::Left));
+    ASSERT_TRUE(!input.button_down(MouseButton::Left));
+}
+
+static void test_input_cursor_delta_first_frame_and_after_mode_change() {
+    using namespace coopa::input;
+    Input input;
+    input.begin_frame(0.016f);
+    input.push_cursor_position(100.0, 100.0); // first ever -- suppressed to zero delta
+    ASSERT_TRUE(input.cursor_delta() == glm::vec2(0.0f));
+
+    input.begin_frame(0.016f);
+    input.push_cursor_position(110.0, 105.0);
+    ASSERT_TRUE(std::abs(input.cursor_delta().x - 10.0f) < 1e-6f);
+    ASSERT_TRUE(std::abs(input.cursor_delta().y - 5.0f) < 1e-6f);
+
+    // A mode change re-arms suppression -- the backend's next reported
+    // position may jump arbitrarily (e.g. entering CursorMode::Disabled).
+    input.set_cursor_mode(CursorMode::Disabled);
+    input.begin_frame(0.016f);
+    input.push_cursor_position(500.0, 500.0);
+    ASSERT_TRUE(input.cursor_delta() == glm::vec2(0.0f));
+
+    input.begin_frame(0.016f);
+    input.push_cursor_position(505.0, 502.0);
+    ASSERT_TRUE(std::abs(input.cursor_delta().x - 5.0f) < 1e-6f);
+    ASSERT_TRUE(std::abs(input.cursor_delta().y - 2.0f) < 1e-6f);
+}
+
+static void test_input_release_all_on_focus_loss() {
+    using namespace coopa::input;
+    Input input;
+    input.begin_frame(0.016f);
+    input.push_key(Key::W, 0, KeyAction::Press, Mods::None);
+    ASSERT_TRUE(input.key_down(Key::W));
+
+    // The OS is not guaranteed to deliver W's release once focus is lost
+    // (e.g. alt-tabbing away while holding it) -- push_focus(false) must
+    // release it anyway, or it would read as stuck down indefinitely.
+    input.push_focus(false);
+    ASSERT_TRUE(!input.key_down(Key::W));
+    ASSERT_TRUE(input.key_released(Key::W));
+    ASSERT_TRUE(!input.focused());
+}
+
+} // namespace input_test
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -2714,6 +2905,18 @@ int main() {
     // Run last: registers the "Animator" SceneLoader parser with a closure
     // capturing a local AssetManager, and tears both down at the end.
     RUN_TEST(test_animator_scene_yaml_registration);
+
+    RUN_TEST(input_test::test_input_map_action_down_with_any_bound_key);
+    RUN_TEST(input_test::test_input_map_unbound_action_never_down);
+    RUN_TEST(input_test::test_input_map_unbind_clears_bindings);
+    RUN_TEST(input_test::test_input_map_chord_requires_modifier);
+    RUN_TEST(input_test::test_input_map_mouse_button_binding);
+    RUN_TEST(input_test::test_input_map_axis_and_vector);
+    RUN_TEST(input_test::test_input_press_release_edges_clear_on_begin_frame);
+    RUN_TEST(input_test::test_input_held_time_accumulates);
+    RUN_TEST(input_test::test_input_press_and_release_within_one_frame_sets_both_edges);
+    RUN_TEST(input_test::test_input_cursor_delta_first_frame_and_after_mode_change);
+    RUN_TEST(input_test::test_input_release_all_on_focus_loss);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;
