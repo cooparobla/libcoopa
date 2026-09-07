@@ -96,3 +96,19 @@ void direct_submit() {
     engine.end_frame();
 }
 ```
+
+### Frame-boundary ownership when shared with `coopa::scene`
+
+`begin_frame()`/`end_frame()` must have exactly one caller per `JobEngine`
+instance — `CounterPool::reset()` is an untagged bump-pointer reset, so a
+second `begin_frame()` from an unrelated caller silently invalidates every
+other subsystem's outstanding `JobHandle`s. When a `JobEngine` is installed
+on a `coopa::scene::Scene` via `Scene::set_job_engine()`, **`Scene` becomes
+that engine's sole frame-boundary owner** — every `coopa::scene::ISceneSystem`
+(e.g. `coopa::anim::AnimationSystem`) may call `create_handle()`/`submit()`/
+`submit_jobs()`/`wait_for()` on it, but must never call `begin_frame()`/
+`end_frame()` itself. See `coopa/scene/README.md`'s "Update Phases" section
+for how `Scene::update()`/`late_update()` drive that boundary. This is
+unrelated to `coopa::asset::AssetManager`'s own dedicated `JobEngine`, which
+is a separate instance with its own frame lifecycle — the two are never the
+same engine.

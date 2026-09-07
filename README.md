@@ -43,15 +43,23 @@ Header-only multicast dispatch:
 - **[EventBus](file:///home/coopa/git/libcoopa/coopa/event/event_bus.h)**: Named pub/sub over a dynamic `EventArgs` bag, with wildcard listeners.
 
 ### 6. [Scene (`coopa/scene/`)](file:///home/coopa/git/libcoopa/coopa/scene/)
-Scene graph, component model, and YAML scene loading — see the [module README](file:///home/coopa/git/libcoopa/coopa/scene/README.md):
+Scene graph, component model, an ordered per-frame system pipeline, and YAML scene loading — see the [module README](file:///home/coopa/git/libcoopa/coopa/scene/README.md):
 - **[SceneManager](file:///home/coopa/git/libcoopa/coopa/scene/scene_manager.h)**, **[Scene](file:///home/coopa/git/libcoopa/coopa/scene/scene.h)**, **[SceneObject](file:///home/coopa/git/libcoopa/coopa/scene/scene_object.h)**, **[Component](file:///home/coopa/git/libcoopa/coopa/scene/component.h)**.
-- **[SceneLoader](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)**: Parses YAML scenes, dispatching every non-Transform/Animation component to a parser registered from outside libcoopa (gfxcoopa, uicoopa, ...).
+- **[ISceneSystem / UpdatePhase](file:///home/coopa/git/libcoopa/coopa/scene/scene_system.h)**: `Scene::update()`/`late_update()` run an ordered list of systems (the recursive `Component::update()`/`late_update()` walks are just the two built-ins) — the seam `coopa::anim::AnimationSystem` registers into, and where a future physics system would too. `Scene::set_job_engine()` lets a system dispatch its work as jobs, with `Scene` alone owning the frame boundary.
+- **[SceneLoader](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)**: Parses YAML scenes, dispatching every non-Transform component to a parser registered from outside libcoopa (gfxcoopa, uicoopa, coopa::anim, ...).
 
 ### 7. [Asset (`coopa/asset/`)](file:///home/coopa/git/libcoopa/coopa/asset/)
 Generic, extensible asset system — see the [module README](file:///home/coopa/git/libcoopa/coopa/asset/README.md):
 - **[AssetManager](file:///home/coopa/git/libcoopa/coopa/asset/asset_manager.h)**: Loader registration, refcounted caching, synchronous and async loading (via a dedicated `coopa::job::JobEngine`), mtime-polled hot reload, and shutdown.
 - **[AssetHandle](file:///home/coopa/git/libcoopa/coopa/asset/asset_handle.h)** & **[AssetSlot](file:///home/coopa/git/libcoopa/coopa/asset/asset_slot.h)**: Typed refcounted references into address-stable slots, so a hot reload never invalidates a handle already handed out.
-- **[IAssetLoader / TypedAssetLoader](file:///home/coopa/git/libcoopa/coopa/asset/asset_loader.h)**: The extension point downstream packages (gfxcoopa: mesh/texture/shader; uicoopa: sprite/font) register against, exactly as they already register scene components.
+- **[IAssetLoader / TypedAssetLoader](file:///home/coopa/git/libcoopa/coopa/asset/asset_loader.h)**: The extension point downstream packages (gfxcoopa: mesh/texture/shader; uicoopa: sprite/font; coopa::anim: AnimationClip) register against, exactly as they already register scene components.
+
+### 8. [Animation (`coopa/animation/`)](file:///home/coopa/git/libcoopa/coopa/animation/)
+Unity-style scene animator — see the [module README](file:///home/coopa/git/libcoopa/coopa/animation/README.md):
+- **[Animator](file:///home/coopa/git/libcoopa/coopa/animation/animator.h)**: A component that plays named `AnimatorState`s (each an `AnimationClip`), crossfading between them, driving any number of `AnimatedProperty` bindings on any component type — including ones libcoopa never names (uicoopa's `RectTransform`, `Graphic::color`).
+- **[AnimationClip](file:///home/coopa/git/libcoopa/coopa/animation/animation_clip.h)**: Immutable, YAML-loadable animation data — keyframed tracks (linear + eased interpolation) and procedural tracks (formula-driven, e.g. `orbit`/`sine`/`spin`), both sharing one binding/blend path.
+- **[AnimatedPropertyRegistry](file:///home/coopa/git/libcoopa/coopa/animation/animated_property.h)**: The extension point that lets any component type register animatable fields, mirroring `SceneLoader::register_component_parser()`.
+- **[AnimationSystem](file:///home/coopa/git/libcoopa/coopa/animation/animation_system.h)**: The `ISceneSystem` that drives every `Animator` in a scene, batching evaluation across a `JobEngine` once the workload is large enough to be worth it.
 
 ---
 

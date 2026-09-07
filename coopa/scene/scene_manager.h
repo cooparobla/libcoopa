@@ -38,15 +38,49 @@ public:
     /**
      * @brief Loads a scene from the given path (replaces any previously active scene).
      *
-     * Any component types beyond Transform/Animation must already have their
-     * parsers registered (see SceneLoader::register_component_parser) — this
-     * class holds no rendering-specific resources of its own.
+     * Any component type beyond Transform must already have its parser
+     * registered (see SceneLoader::register_component_parser) — this class
+     * holds no rendering-specific resources of its own.
+     *
+     * Re-applies whatever JobEngine was installed via set_job_engine() to the
+     * newly loaded Scene, since this replaces active_scene_ wholesale.
+     * Registered systems are NOT carried across — add_system() calls made on
+     * a previous scene do not apply here; re-register systems after each
+     * load_scene() call.
      *
      * @param path Path to the scene file.
      * @throws std::runtime_error on load failure.
      */
     void load_scene(const std::string& path) {
         active_scene_ = std::make_unique<Scene>(SceneLoader::load(path));
+        active_scene_->set_job_engine(jobs_);
+    }
+
+    /**
+     * @brief Installs the JobEngine to hand to every scene loaded from now on.
+     *
+     * Re-applied automatically inside load_scene(); call it again after a
+     * later load_scene() only if the engine itself changes. See
+     * Scene::set_job_engine() for the frame-boundary-ownership contract.
+     */
+    void set_job_engine(coopa::job::JobEngine* engine) {
+        jobs_ = engine;
+        if (active_scene_) active_scene_->set_job_engine(jobs_);
+    }
+
+    /** @brief Forwards to the active scene's add_system(). @throws std::runtime_error if no scene is loaded. */
+    ISceneSystem* add_system(std::unique_ptr<ISceneSystem> system, UpdatePhase phase) {
+        return get_active_scene().add_system(std::move(system), phase);
+    }
+
+    /** @brief Forwards to the active scene's remove_system(). @throws std::runtime_error if no scene is loaded. */
+    bool remove_system(const std::string& system_name) {
+        return get_active_scene().remove_system(system_name);
+    }
+
+    /** @brief Forwards to the active scene's find_system(). @throws std::runtime_error if no scene is loaded. */
+    ISceneSystem* find_system(const std::string& system_name) const {
+        return get_active_scene().find_system(system_name);
     }
 
     /**
@@ -91,7 +125,8 @@ public:
     }
 
 private:
-    std::unique_ptr<Scene> active_scene_; /**< Owned active scene. */
+    std::unique_ptr<Scene> active_scene_;       /**< Owned active scene. */
+    coopa::job::JobEngine* jobs_ = nullptr;     /**< Non-owning; re-applied to each newly loaded scene. */
 };
 
 } // namespace scene

@@ -172,6 +172,33 @@ public:
 
     /** @brief Returns all components (read-only). */
     const std::vector<std::unique_ptr<Component>>& components() const { return components_; }
+    /** @brief Returns all components (mutable). */
+    std::vector<std::unique_ptr<Component>>& components() { return components_; }
+
+    /**
+     * @brief Returns the index-th component whose type_name() matches, or nullptr.
+     *
+     * The string-keyed counterpart to get_component<T>(), for callers that
+     * only know a type by the name it was registered under (SceneLoader's
+     * component tags, an AnimationClip track's `component:` field) and
+     * cannot name the C++ type at the call site.
+     *
+     * @param type_name Value that would be returned by the target's type_name().
+     * @param index Which match to return, in component list order, if more
+     *              than one component on this object shares the same
+     *              type_name() (e.g. two Image components).
+     * @return Pointer to the component, or nullptr if not found.
+     */
+    Component* get_component_by_type_name(const std::string& type_name, size_t index = 0) const {
+        size_t seen = 0;
+        for (const auto& comp : components_) {
+            if (comp->type_name() == type_name) {
+                if (seen == index) return comp.get();
+                ++seen;
+            }
+        }
+        return nullptr;
+    }
 
     // --- Hierarchy ---
 

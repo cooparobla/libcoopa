@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <chrono>
@@ -37,7 +38,18 @@
 #include <coopa/scene/component.h>
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/scene.h>
+#include <coopa/scene/scene_system.h>
 #include <coopa/scene/scene_loader.h>
+#include <coopa/animation/keyframe.h>
+#include <coopa/animation/animation_curve.h>
+#include <coopa/animation/animation_clip.h>
+#include <coopa/animation/animated_property.h>
+#include <coopa/animation/procedural_track.h>
+#include <coopa/animation/animator.h>
+#include <coopa/animation/animation_system.h>
+#include <coopa/animation/animation_clip_loader.h>
+#include <coopa/animation/animation_yaml.h>
+#include <glm/glm.hpp>
 
 // ANSI Colors for nice UI
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -1659,12 +1671,970 @@ void test_scene_inherit_no_inherit_unchanged() {
     ASSERT_EQ(find_tags(*obj)[0]->label, std::string("solo-label"));
 }
 
+// ---------------------------------------------------------
+// Scene phase pipeline tests
+// ---------------------------------------------------------
+//
+// These guard the entire compatibility risk of the coopa::scene::ISceneSystem
+// pipeline: Scene::update()/late_update() used to be two hardcoded Component
+// tree walks; they are now an ordered list of systems, of which the walks are
+// just the two built-ins. Every existing consumer (blendy/toyengine call
+// update() only; several uicoopa tests call late_update() standalone; two
+// callers call both) must see byte-identical behavior.
+
+namespace scene_pipeline_test {
+
+/** @brief Appends its name to a shared log every time it executes — for asserting call order. */
+class RecordingSystem : public coopa::scene::ISceneSystem {
+public:
+    RecordingSystem(std::string name, std::vector<std::string>* log)
+        : name_(std::move(name)), log_(log) {}
+    void execute(coopa::scene::Scene&, const coopa::scene::FrameContext&) override {
+        log_->push_back(name_);
+    }
+    const char* system_name() const override { return name_.c_str(); }
+private:
+    std::string name_;
+    std::vector<std::string>* log_;
+};
+
+/** @brief Records whether FrameContext::jobs was null the last time it executed. */
+class JobsNullCheckSystem : public coopa::scene::ISceneSystem {
+public:
+    explicit JobsNullCheckSystem(bool* jobs_was_null) : jobs_was_null_(jobs_was_null) {}
+    void execute(coopa::scene::Scene&, const coopa::scene::FrameContext& ctx) override {
+        *jobs_was_null_ = (ctx.jobs == nullptr);
+    }
+    const char* system_name() const override { return "JobsNullCheck"; }
+private:
+    bool* jobs_was_null_;
+};
+
+/**
+ * @brief Every execute() call creates a handle, submits one trivial job onto
+ *        it, and waits for it — exercising the exact JobEngine usage pattern
+ *        AnimationSystem follows, without ever calling begin_frame()/
+ *        end_frame() itself (Scene alone does that).
+ */
+class JobUsingSystem : public coopa::scene::ISceneSystem {
+public:
+    explicit JobUsingSystem(bool* all_valid) : all_valid_(all_valid) {}
+    void execute(coopa::scene::Scene&, const coopa::scene::FrameContext& ctx) override {
+        if (!ctx.jobs) { *all_valid_ = false; return; }
+        coopa::job::JobHandle h = ctx.jobs->create_handle();
+        if (!h.is_valid()) { *all_valid_ = false; return; }
+        ctx.jobs->submit([] {}, 0, h);
+        ctx.jobs->wait_for(h);
+    }
+    const char* system_name() const override { return "JobUsing"; }
+private:
+    bool* all_valid_;
+};
+
+/** @brief Increments on_attach()/on_detach() counters, for verifying add_system()/remove_system(). */
+class AttachDetachSystem : public coopa::scene::ISceneSystem {
+public:
+    AttachDetachSystem(int* attach_count, int* detach_count)
+        : attach_count_(attach_count), detach_count_(detach_count) {}
+    void on_attach(coopa::scene::Scene&) override { ++(*attach_count_); }
+    void on_detach(coopa::scene::Scene&) override { ++(*detach_count_); }
+    void execute(coopa::scene::Scene&, const coopa::scene::FrameContext&) override {}
+    const char* system_name() const override { return "AttachDetach"; }
+private:
+    int* attach_count_;
+    int* detach_count_;
+};
+
+/** @brief A test-only Component whose update() counts how many times it ran. */
+class CountingComponent : public coopa::scene::Component {
+public:
+    std::string type_name() const override { return "Counting"; }
+    int update_count = 0;
+    void update(float) override { ++update_count; }
+};
+
+} // namespace scene_pipeline_test
+
+void test_scene_phase_order() {
+    using namespace scene_pipeline_test;
+
+    coopa::scene::Scene scene("PhaseOrder");
+    std::vector<std::string> log;
+    scene.add_system(std::make_unique<RecordingSystem>("mid", &log), 250);
+    scene.add_system(std::make_unique<RecordingSystem>("early", &log), 150);
+    scene.add_system(std::make_unique<RecordingSystem>("late", &log), 350);
+    scene.update(0.016f); // all three are < LateBehaviour(400), so all run here, in ascending order.
+    ASSERT_EQ(log.size(), static_cast<size_t>(3));
+    ASSERT_EQ(log[0], std::string("early"));
+    ASSERT_EQ(log[1], std::string("mid"));
+    ASSERT_EQ(log[2], std::string("late"));
+
+    coopa::scene::Scene scene2("EqualOrder");
+    std::vector<std::string> log2;
+    scene2.add_system(std::make_unique<RecordingSystem>("first", &log2), 250);
+    scene2.add_system(std::make_unique<RecordingSystem>("second", &log2), 250);
+    scene2.update(0.016f);
+    ASSERT_EQ(log2.size(), static_cast<size_t>(2));
+    ASSERT_EQ(log2[0], std::string("first"));
+    ASSERT_EQ(log2[1], std::string("second"));
+}
+
+void test_scene_update_late_update_split() {
+    using namespace scene_pipeline_test;
+
+    coopa::scene::Scene scene("Split");
+    std::vector<std::string> log;
+    scene.add_system(std::make_unique<RecordingSystem>("before_late", &log), 350); // < LateBehaviour(400)
+    scene.add_system(std::make_unique<RecordingSystem>("after_late", &log), 450);  // >= LateBehaviour(400)
+
+    scene.update(0.016f);
+    ASSERT_EQ(log.size(), static_cast<size_t>(1));
+    ASSERT_EQ(log[0], std::string("before_late"));
+
+    scene.late_update(0.016f);
+    ASSERT_EQ(log.size(), static_cast<size_t>(2));
+    ASSERT_EQ(log[1], std::string("after_late"));
+}
+
+void test_scene_late_update_standalone() {
+    using namespace scene_pipeline_test;
+
+    coopa::scene::Scene scene("StandaloneLate");
+    std::vector<std::string> log;
+    scene.add_system(std::make_unique<RecordingSystem>("late_only", &log), 450);
+
+    scene.late_update(0.016f); // no preceding update() this frame
+    ASSERT_EQ(log.size(), static_cast<size_t>(1));
+    ASSERT_EQ(log[0], std::string("late_only"));
+    ASSERT_TRUE(scene.job_engine() == nullptr); // never touched, since none was ever installed
+}
+
+void test_scene_frame_boundary_update_only() {
+    using namespace scene_pipeline_test;
+
+    // Tiny pool capacity (8): if Scene::update() failed to reset the frame
+    // boundary every call (the blendy/toyengine shape — update() only, never
+    // late_update()), create_handle() would start returning invalid handles
+    // well before 50 frames.
+    coopa::job::JobEngine engine(2, 8);
+    coopa::scene::Scene scene("FrameBoundaryUpdateOnly");
+    scene.set_job_engine(&engine);
+    bool all_valid = true;
+    scene.add_system(std::make_unique<JobUsingSystem>(&all_valid), 250);
+
+    for (int i = 0; i < 50; ++i) {
+        scene.update(0.016f);
+    }
+    ASSERT_TRUE(all_valid);
+    engine.shutdown();
+}
+
+void test_scene_null_job_engine_runs_inline() {
+    using namespace scene_pipeline_test;
+
+    coopa::scene::Scene scene("NoEngine");
+    bool jobs_was_null = false;
+    scene.add_system(std::make_unique<JobsNullCheckSystem>(&jobs_was_null), 250);
+    scene.update(0.016f);
+    ASSERT_TRUE(jobs_was_null);
+}
+
+void test_scene_add_remove_system() {
+    using namespace scene_pipeline_test;
+
+    coopa::scene::Scene scene("AddRemove");
+    int attach = 0, detach = 0;
+    scene.add_system(std::make_unique<AttachDetachSystem>(&attach, &detach), 250);
+    ASSERT_EQ(attach, 1);
+    ASSERT_EQ(detach, 0);
+    ASSERT_TRUE(scene.remove_system("AttachDetach"));
+    ASSERT_EQ(detach, 1);
+    ASSERT_TRUE(scene.find_system("AttachDetach") == nullptr);
+    ASSERT_TRUE(!scene.remove_system("AttachDetach")); // already removed
+
+    auto obj = std::make_unique<coopa::scene::SceneObject>("Obj");
+    auto* counter = obj->add_component<CountingComponent>();
+    scene.add_root_object(std::move(obj));
+    scene.update(0.016f);
+    ASSERT_EQ(counter->update_count, 1);
+
+    ASSERT_TRUE(scene.remove_system("Behaviour"));
+    scene.update(0.016f);
+    ASSERT_EQ(counter->update_count, 1); // unchanged: the built-in Component::update() walk no longer runs
+}
+
+void test_scene_move_preserves_systems() {
+    using namespace scene_pipeline_test;
+
+    coopa::job::JobEngine engine(2);
+    std::vector<std::string> log;
+    coopa::scene::Scene scene("MoveSrc");
+    scene.set_job_engine(&engine);
+    scene.add_system(std::make_unique<RecordingSystem>("sys", &log), 250);
+
+    coopa::scene::Scene moved(std::move(scene));
+    ASSERT_TRUE(moved.job_engine() == &engine);
+    moved.update(0.016f);
+    ASSERT_EQ(log.size(), static_cast<size_t>(1));
+    moved.late_update(0.016f);
+    engine.shutdown();
+}
+
+// ---------------------------------------------------------
+// Animation module tests (coopa::anim)
+// ---------------------------------------------------------
+
+namespace animation_test {
+
+/** @brief A minimal test-only component exposing one vec3 and one float property to animate. */
+class TestProbeComponent : public coopa::scene::Component {
+public:
+    std::string type_name() const override { return "TestProbe"; }
+    glm::vec3 pos{0.0f};
+    float alpha = 0.0f;
+
+    const glm::vec3& position() const { return pos; }
+    void set_position(const glm::vec3& p) { pos = p; }
+    float get_alpha() const { return alpha; }
+    void set_alpha(float a) { alpha = a; }
+};
+
+void register_properties() {
+    auto& reg = coopa::anim::AnimatedPropertyRegistry::instance();
+    reg.register_vec<TestProbeComponent, glm::vec3>(
+        "TestProbe", "pos", &TestProbeComponent::position, &TestProbeComponent::set_position);
+    reg.register_float<TestProbeComponent>(
+        "TestProbe", "alpha", &TestProbeComponent::get_alpha, &TestProbeComponent::set_alpha);
+}
+
+// Fixtures live under a fresh per-test subdirectory of the system temp dir,
+// mirroring scene_inherit_test::write_file()'s reasoning.
+std::string write_file(const std::string& test_name, const std::string& relative_path, const std::string& content) {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "libcoopa_animation_tests" / test_name / relative_path;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path);
+    out << content;
+    out.close();
+    return path.string();
+}
+
+} // namespace animation_test
+
+void test_animation_curve_sampling() {
+    using coopa::anim::AnimationCurve;
+    using coopa::anim::Interpolation;
+    using coopa::anim::Keyframe;
+
+    AnimationCurve curve;
+    curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    curve.sort_keys();
+
+    float out[1];
+    curve.sample(0.0f, 1, out);
+    ASSERT_TRUE(std::abs(out[0] - 0.0f) < 1e-5f);
+    curve.sample(1.0f, 1, out);
+    ASSERT_TRUE(std::abs(out[0] - 10.0f) < 1e-5f);
+    curve.sample(0.5f, 1, out);
+    ASSERT_TRUE(std::abs(out[0] - 5.0f) < 1e-5f);
+    curve.sample(-1.0f, 1, out); // clamps before the first key
+    ASSERT_TRUE(std::abs(out[0] - 0.0f) < 1e-5f);
+    curve.sample(5.0f, 1, out); // clamps after the last key
+    ASSERT_TRUE(std::abs(out[0] - 10.0f) < 1e-5f);
+
+    AnimationCurve empty;
+    empty.sample(0.5f, 1, out);
+    ASSERT_TRUE(std::abs(out[0]) < 1e-5f);
+
+    AnimationCurve step;
+    step.add_key(Keyframe{0.0f, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Step});
+    step.add_key(Keyframe{1.0f, {2.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    step.sort_keys();
+    step.sample(0.5f, 1, out); // Step holds the leaving key's value for the whole segment
+    ASSERT_TRUE(std::abs(out[0] - 1.0f) < 1e-5f);
+
+    AnimationCurve eio;
+    eio.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::EaseInOut});
+    eio.add_key(Keyframe{1.0f, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    eio.sort_keys();
+    eio.sample(0.5f, 1, out); // EaseInOut is symmetric: exactly 0.5 at the midpoint
+    ASSERT_TRUE(std::abs(out[0] - 0.5f) < 1e-5f);
+}
+
+void test_animation_property_registry() {
+    using namespace animation_test;
+
+    auto& reg = coopa::anim::AnimatedPropertyRegistry::instance();
+    uint8_t mask = 0;
+    const auto* pos = reg.find("TestProbe", "pos", &mask);
+    ASSERT_TRUE(pos != nullptr);
+    ASSERT_EQ(static_cast<int>(mask), 0x0F);
+    ASSERT_EQ(static_cast<int>(pos->component_count), 3);
+
+    const auto* pos_y = reg.find("TestProbe", "pos.y", &mask);
+    ASSERT_TRUE(pos_y == pos); // same underlying property, channel-suffixed
+    ASSERT_EQ(static_cast<int>(mask), 0x02);
+
+    ASSERT_TRUE(reg.find("TestProbe", "nonexistent") == nullptr);
+    ASSERT_TRUE(reg.find("NoSuchComponent", "pos") == nullptr);
+
+    auto names = reg.properties_for("TestProbe");
+    ASSERT_TRUE(std::find(names.begin(), names.end(), "pos") != names.end());
+    ASSERT_TRUE(std::find(names.begin(), names.end(), "alpha") != names.end());
+}
+
+void test_animator_plays_clip_on_transform() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("PlayClip");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Loop;
+    clip->set_explicit_length(1.0f);
+    AnimationTrack track;
+    track.property = "position";
+    track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.sort_keys();
+    clip->tracks.push_back(track);
+    animator->add_state("move", clip);
+    animator->auto_play = "move";
+
+    install_animation_system(scene);
+    scene.start();
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+
+    auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-4f);
+}
+
+void test_animator_channel_mask_preserves_other_channels() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("ChannelMask");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+    scene.find_object("Obj")->get_transform()->transform().set_position({1.0f, 2.0f, 3.0f});
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Loop;
+    clip->set_explicit_length(2.0f);
+    AnimationTrack track;
+    track.property = "position.y"; // narrows to a single channel
+    track.curve.add_key(Keyframe{0.0f, {99.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.add_key(Keyframe{2.0f, {99.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.sort_keys();
+    clip->tracks.push_back(track);
+    animator->add_state("s", clip);
+    animator->auto_play = "s";
+
+    install_animation_system(scene);
+    scene.start();
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+
+    auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 1.0f) < 1e-5f); // untouched
+    ASSERT_TRUE(std::abs(pos.y - 99.0f) < 1e-5f); // driven
+    ASSERT_TRUE(std::abs(pos.z - 3.0f) < 1e-5f); // untouched
+}
+
+void test_animator_dedups_bindings_no_clobber() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("Dedup");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Loop;
+    clip->set_explicit_length(2.0f);
+    AnimationTrack tx;
+    tx.property = "position.x";
+    tx.curve.add_key(Keyframe{0.0f, {5.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tx.curve.add_key(Keyframe{2.0f, {5.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tx.curve.sort_keys();
+    AnimationTrack tz;
+    tz.property = "position.z";
+    tz.curve.add_key(Keyframe{0.0f, {7.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tz.curve.add_key(Keyframe{2.0f, {7.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tz.curve.sort_keys();
+    clip->tracks.push_back(tx);
+    clip->tracks.push_back(tz);
+    animator->add_state("s", clip);
+    animator->auto_play = "s";
+
+    install_animation_system(scene);
+    scene.start();
+    ASSERT_EQ(animator->binding_count(), static_cast<size_t>(1)); // deduped into ONE binding
+
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+    auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-5f);
+    ASSERT_TRUE(std::abs(pos.z - 7.0f) < 1e-5f);
+}
+
+void test_animator_wrap_modes() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    // Once: clamps at length, fires on_state_finished exactly once.
+    {
+        Scene scene("WrapOnce");
+        auto obj = std::make_unique<SceneObject>("Obj");
+        obj->add_component<TransformComponent>();
+        auto* animator = obj->add_component<Animator>();
+        scene.add_root_object(std::move(obj));
+
+        auto clip = std::make_shared<AnimationClip>();
+        clip->wrap = WrapMode::Once;
+        clip->set_explicit_length(1.0f);
+        AnimationTrack track;
+        track.property = "position";
+        track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.sort_keys();
+        clip->tracks.push_back(track);
+        animator->add_state("once", clip);
+        animator->auto_play = "once";
+
+        install_animation_system(scene);
+        scene.start();
+
+        int finished_count = 0;
+        animator->on_state_finished.connect([&](const std::string&) { ++finished_count; });
+
+        scene.update(1.5f); // past length=1.0
+        scene.late_update(1.5f);
+        ASSERT_EQ(finished_count, 1);
+        auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+        ASSERT_TRUE(std::abs(pos.x - 10.0f) < 1e-4f); // holds the final pose
+
+        scene.update(0.2f); // still finished; must not re-fire
+        scene.late_update(0.2f);
+        ASSERT_EQ(finished_count, 1);
+    }
+
+    // Loop: wraps back to 0.
+    {
+        Scene scene("WrapLoop");
+        auto obj = std::make_unique<SceneObject>("Obj");
+        obj->add_component<TransformComponent>();
+        auto* animator = obj->add_component<Animator>();
+        scene.add_root_object(std::move(obj));
+
+        auto clip = std::make_shared<AnimationClip>();
+        clip->wrap = WrapMode::Loop;
+        clip->set_explicit_length(1.0f);
+        AnimationTrack track;
+        track.property = "position";
+        track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.sort_keys();
+        clip->tracks.push_back(track);
+        animator->add_state("loop", clip);
+        animator->auto_play = "loop";
+
+        install_animation_system(scene);
+        scene.start();
+        scene.update(1.25f); // wraps to 0.25 -> x == 2.5
+        scene.late_update(1.25f);
+        auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+        ASSERT_TRUE(std::abs(pos.x - 2.5f) < 1e-3f);
+    }
+
+    // PingPong: reflects back and forth between 0 and length.
+    {
+        Scene scene("WrapPingPong");
+        auto obj = std::make_unique<SceneObject>("Obj");
+        obj->add_component<TransformComponent>();
+        auto* animator = obj->add_component<Animator>();
+        scene.add_root_object(std::move(obj));
+
+        auto clip = std::make_shared<AnimationClip>();
+        clip->wrap = WrapMode::PingPong;
+        clip->set_explicit_length(1.0f);
+        AnimationTrack track;
+        track.property = "position";
+        track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.sort_keys();
+        clip->tracks.push_back(track);
+        animator->add_state("pp", clip);
+        animator->auto_play = "pp";
+
+        install_animation_system(scene);
+        scene.start();
+        scene.update(1.25f); // period=2.0; raw t=1.25 -> reflected sample_time=0.75 -> x==7.5
+        scene.late_update(1.25f);
+        auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+        ASSERT_TRUE(std::abs(pos.x - 7.5f) < 1e-3f);
+    }
+}
+
+void test_animator_crossfade_blends() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("Crossfade");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip_a = std::make_shared<AnimationClip>();
+    clip_a->wrap = WrapMode::Loop;
+    clip_a->set_explicit_length(10.0f);
+    AnimationTrack ta;
+    ta.property = "position";
+    ta.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    ta.curve.add_key(Keyframe{10.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    ta.curve.sort_keys();
+    clip_a->tracks.push_back(ta);
+
+    auto clip_b = std::make_shared<AnimationClip>();
+    clip_b->wrap = WrapMode::Loop;
+    clip_b->set_explicit_length(10.0f);
+    AnimationTrack tb;
+    tb.property = "position";
+    tb.curve.add_key(Keyframe{0.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tb.curve.add_key(Keyframe{10.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tb.curve.sort_keys();
+    clip_b->tracks.push_back(tb);
+
+    animator->add_state("A", clip_a);
+    animator->add_state("B", clip_b);
+    animator->auto_play = "A";
+
+    install_animation_system(scene);
+    scene.start();
+    animator->crossfade("B", 1.0f);
+
+    scene.update(0.5f);
+    scene.late_update(0.5f); // 50% faded
+    auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-3f);
+
+    scene.update(0.6f);
+    scene.late_update(0.6f); // past the full fade -> B only
+    pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 10.0f) < 1e-3f);
+}
+
+void test_animator_binds_by_name_and_path() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("BindByNameAndPath");
+    auto root = std::make_unique<SceneObject>("Root");
+    root->add_component<TransformComponent>();
+    auto* animator = root->add_component<Animator>();
+
+    auto child = std::make_unique<SceneObject>("Child");
+    child->add_component<TransformComponent>();
+    auto grandchild = std::make_unique<SceneObject>("Grandchild");
+    grandchild->add_component<TransformComponent>();
+    SceneObject* grandchild_raw = child->add_child(std::move(grandchild));
+    root->add_child(std::move(child));
+
+    auto sibling = std::make_unique<SceneObject>("Sibling");
+    sibling->add_component<TransformComponent>();
+
+    SceneObject* root_raw = scene.add_root_object(std::move(root));
+    (void)root_raw;
+    scene.add_root_object(std::move(sibling));
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Once;
+    clip->set_explicit_length(1.0f);
+
+    AnimationTrack path_track; // "Child/Grandchild" -- segment-walked descendant path
+    path_track.object_path = "Child/Grandchild";
+    path_track.property = "position";
+    path_track.curve.add_key(Keyframe{0.0f, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    path_track.curve.add_key(Keyframe{1.0f, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    path_track.curve.sort_keys();
+    clip->tracks.push_back(path_track);
+
+    AnimationTrack sibling_track; // "Sibling" -- not a descendant, resolved via Scene::find_object
+    sibling_track.object_path = "Sibling";
+    sibling_track.property = "position";
+    sibling_track.curve.add_key(Keyframe{0.0f, {2.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    sibling_track.curve.add_key(Keyframe{1.0f, {2.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    sibling_track.curve.sort_keys();
+    clip->tracks.push_back(sibling_track);
+
+    AnimationTrack missing_track; // unresolvable target -- must be dropped gracefully, not throw
+    missing_track.object_path = "DoesNotExist";
+    missing_track.property = "position";
+    missing_track.curve.add_key(Keyframe{0.0f, {3.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    missing_track.curve.sort_keys();
+    clip->tracks.push_back(missing_track);
+
+    animator->add_state("s", clip);
+    animator->auto_play = "s";
+
+    install_animation_system(scene);
+    scene.start();
+    scene.update(0.1f);
+    scene.late_update(0.1f);
+
+    ASSERT_TRUE(std::abs(grandchild_raw->get_transform()->transform().position().x - 1.0f) < 1e-4f);
+    ASSERT_TRUE(std::abs(scene.find_object("Sibling")->get_transform()->transform().position().x - 2.0f) < 1e-4f);
+    // Only 2 of the 3 tracks resolved to a binding; the unresolvable one was dropped, not thrown.
+    ASSERT_EQ(animator->binding_count(), static_cast<size_t>(2));
+}
+
+void test_animator_lazy_binds_when_initially_inactive() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    // SceneObject::start() returns early for inactive objects, so an Animator
+    // on an object inactive at Scene::start() time never receives its own
+    // start() -- advance_()'s "if (!bound_) rebind()" is the fallback that
+    // must catch this once the object is reactivated.
+    Scene scene("LazyBindInactive");
+    auto obj = std::make_unique<SceneObject>("Obj", /*active=*/false);
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Once;
+    clip->set_explicit_length(1.0f);
+    AnimationTrack track;
+    track.property = "position";
+    track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.sort_keys();
+    clip->tracks.push_back(track);
+    animator->add_state("s", clip);
+    animator->auto_play = "s";
+
+    install_animation_system(scene);
+    scene.start(); // Obj is inactive -> Animator::start() never runs.
+    ASSERT_EQ(animator->binding_count(), static_cast<size_t>(0));
+
+    scene.find_object("Obj")->set_active(true);
+    // Since start() never ran, auto_play never triggered play() either --
+    // AnimationSystem::execute() still calls advance_()/evaluate_()/apply_()
+    // for every Animator its cached list found (which does include this one,
+    // since get_components<T>() re-scans on the system's next execute() only
+    // if refresh()d -- here it's still fresh from before start() flipped
+    // active, so this exercises the lazy rebind path specifically).
+    animator->play("s");
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+
+    ASSERT_TRUE(animator->binding_count() > 0);
+    auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-3f);
+}
+
+void test_animation_rotation_does_not_wrap() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("RotationNoWrap");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Once;
+    clip->set_explicit_length(1.0f);
+    AnimationTrack track;
+    track.property = "rotation";
+    track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    track.curve.add_key(Keyframe{1.0f, {0.0f, 0.0f, 720.0f, 1.0f}, Interpolation::Linear}); // two full spins
+    track.curve.sort_keys();
+    clip->tracks.push_back(track);
+    animator->add_state("s", clip);
+    animator->auto_play = "s";
+
+    install_animation_system(scene);
+    scene.start();
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+
+    // At the midpoint, z must be 360 (halfway through two full spins), NOT 0
+    // (which a shortest-path wrap would incorrectly produce).
+    auto rot = scene.find_object("Obj")->get_transform()->transform().rotation_degrees();
+    ASSERT_TRUE(std::abs(rot.z - 360.0f) < 1e-2f);
+}
+
+void test_animation_clip_loader_yaml() {
+    using namespace animation_test;
+    using namespace coopa::anim;
+
+    coopa::asset::AssetManager assets;
+    assets.register_loader<AnimationClip>(std::make_unique<AnimationClipLoader>());
+
+    std::string good_path = write_file("clip_loader", "good.yaml",
+        "clip:\n"
+        "  name: test_clip\n"
+        "  wrap: once\n"
+        "  tracks:\n"
+        "    - object: \"\"\n"
+        "      component: Transform\n"
+        "      property: position\n"
+        "      keys:\n"
+        "        - { time: 0.0, value: { x: 0, y: 0, z: 0 } }\n"
+        "        - { time: 1.0, value: { x: 10, y: 0, z: 0 } }\n");
+    auto good = assets.load<AnimationClip>(good_path);
+    ASSERT_TRUE(good.is_loaded());
+    ASSERT_EQ(good->name, std::string("test_clip"));
+    ASSERT_EQ(good->tracks.size(), static_cast<size_t>(1));
+    ASSERT_TRUE(std::abs(good->tracks[0].curve.keys()[1].time - 1.0f) < 1e-5f);
+    ASSERT_TRUE(good->tracks[0].curve.keys()[1].easing == Interpolation::Linear);
+
+    std::string bad_path = write_file("clip_loader", "bad.yaml",
+        "not_a_clip: true\n");
+    auto bad = assets.load<AnimationClip>(bad_path);
+    ASSERT_TRUE(bad.is_failed());
+    ASSERT_TRUE(!bad.error().empty());
+
+    assets.shutdown();
+}
+
+void test_animator_scene_yaml_registration() {
+    using namespace animation_test;
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    coopa::asset::AssetManager assets;
+    std::string clip_path = write_file("scene_yaml", "clip.yaml",
+        "clip:\n"
+        "  name: yaml_clip\n"
+        "  wrap: once\n"
+        "  tracks:\n"
+        "    - object: \"\"\n"
+        "      component: Transform\n"
+        "      property: position\n"
+        "      keys:\n"
+        "        - { time: 0.0, value: { x: 0, y: 0, z: 0 } }\n"
+        "        - { time: 1.0, value: { x: 10, y: 0, z: 0 } }\n");
+    write_file("scene_yaml", "scene.yaml",
+        "scene:\n"
+        "  scene_name: YamlAnimatorScene\n"
+        "  root_objects:\n"
+        "    - name: Obj\n"
+        "      components:\n"
+        "        - type: Animator\n"
+        "          auto_play: move\n"
+        "          states:\n"
+        "            - name: move\n"
+        "              clip: clip.yaml\n");
+    std::string scene_path = std::filesystem::path(clip_path).parent_path() / "scene.yaml";
+
+    assets.add_search_root(std::filesystem::path(clip_path).parent_path().string());
+    register_animation_components(assets);
+
+    Scene scene = SceneLoader::load(scene_path);
+    install_animation_system(scene);
+
+    auto* obj = scene.find_object("Obj");
+    ASSERT_TRUE(obj != nullptr);
+    auto* animator = obj->get_component<Animator>();
+    ASSERT_TRUE(animator != nullptr);
+
+    // The clip loads synchronously fast enough in practice, but poll briefly
+    // to avoid a flaky race against the asset IO thread rather than assuming
+    // a fixed number of frames completes it.
+    for (int i = 0; i < 200 && animator->binding_count() == 0; ++i) {
+        assets.update(0.016f);
+        scene.update(0.0f);
+        scene.late_update(0.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(animator->current_state(), std::string("move"));
+    ASSERT_TRUE(animator->binding_count() > 0);
+
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+    auto pos = obj->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-2f);
+
+    // The registered parser's closure captures `assets` by reference --
+    // clear it before `assets` is destroyed, mirroring every other
+    // AssetManager-backed parser registration in this codebase.
+    SceneLoader::clear_component_parsers();
+    assets.shutdown();
+}
+
+void test_animation_system_parallel_matches_serial() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    constexpr int kAnimatorCount = 64;
+
+    auto build_scene = [](Scene& scene) {
+        for (int i = 0; i < kAnimatorCount; ++i) {
+            auto obj = std::make_unique<SceneObject>("Obj" + std::to_string(i));
+            obj->add_component<TransformComponent>();
+            auto* animator = obj->add_component<Animator>();
+            auto clip = std::make_shared<AnimationClip>();
+            clip->wrap = WrapMode::Loop;
+            clip->set_explicit_length(2.0f);
+            AnimationTrack t;
+            t.property = "position";
+            t.curve.add_key(Keyframe{0.0f, {static_cast<float>(i), 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+            t.curve.add_key(Keyframe{2.0f, {static_cast<float>(i) * 2.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+            t.curve.sort_keys();
+            clip->tracks.push_back(t);
+            animator->add_state("s", clip);
+            animator->auto_play = "s";
+            scene.add_root_object(std::move(obj));
+        }
+    };
+
+    Scene serial_scene("Serial");
+    build_scene(serial_scene);
+    AnimationSystem* serial_sys = install_animation_system(serial_scene);
+    serial_sys->set_parallel_threshold(SIZE_MAX); // force serial
+    serial_scene.start();
+    serial_scene.update(0.37f);
+    serial_scene.late_update(0.37f);
+
+    coopa::job::JobEngine engine(4);
+    Scene parallel_scene("Parallel");
+    build_scene(parallel_scene);
+    parallel_scene.set_job_engine(&engine);
+    AnimationSystem* parallel_sys = install_animation_system(parallel_scene);
+    parallel_sys->set_parallel_threshold(0); // force parallel
+    parallel_sys->set_chunk_size(3);
+    parallel_scene.start();
+    parallel_scene.update(0.37f);
+    parallel_scene.late_update(0.37f);
+
+    for (int i = 0; i < kAnimatorCount; ++i) {
+        std::string name = "Obj" + std::to_string(i);
+        float serial_x = serial_scene.find_object(name)->get_transform()->transform().position().x;
+        float parallel_x = parallel_scene.find_object(name)->get_transform()->transform().position().x;
+        ASSERT_TRUE(std::abs(serial_x - parallel_x) < 1e-6f);
+    }
+    engine.shutdown();
+}
+
+void test_procedural_orbit_matches_legacy_formula() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("ProceduralOrbit");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = WrapMode::Loop;
+    clip->set_explicit_length(6.283185307f);
+    AnimationTrack track;
+    track.property = "position";
+    track.kind = TrackKind::Procedural;
+    track.procedural.type = "orbit";
+    track.procedural.params.vectors["center"] = glm::vec4(-1.5f, 0.0f, 0.0f, 1.0f);
+    track.procedural.params.scalars["radius"] = 2.7f;
+    track.procedural.params.scalars["speed"] = 1.0f;
+    track.procedural.params.scalars["height"] = 1.0f;
+    track.procedural.params.scalars["initial_angle"] = 0.0f;
+    clip->tracks.push_back(track);
+    animator->add_state("orbit", clip);
+    animator->auto_play = "orbit";
+
+    install_animation_system(scene);
+    scene.start();
+
+    float times[] = {0.0f, 0.5f, 1.0f, 1.5707963f, 3.14159265f, 6.0f};
+    float accumulated = 0.0f;
+    for (float t : times) {
+        float dt = t - accumulated;
+        accumulated = t;
+        scene.update(dt);
+        scene.late_update(dt);
+        // The old AnimationComponent's formula, verbatim -- this test is the
+        // automated half of the blendy migration's correctness guarantee.
+        float ex = -1.5f + 2.7f * std::cos(1.0f * t + 0.0f);
+        float ey = 0.0f + 2.7f * std::sin(1.0f * t + 0.0f);
+        float ez = 0.0f + 1.0f;
+        auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+        ASSERT_TRUE(std::abs(pos.x - ex) < 1e-4f);
+        ASSERT_TRUE(std::abs(pos.y - ey) < 1e-4f);
+        ASSERT_TRUE(std::abs(pos.z - ez) < 1e-4f);
+    }
+}
+
+void test_procedural_crossfade_against_keyframed() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    Scene scene("ProceduralCrossfade");
+    auto obj = std::make_unique<SceneObject>("Obj");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+
+    auto clip_a = std::make_shared<AnimationClip>(); // procedural constant at x=0
+    clip_a->wrap = WrapMode::Loop;
+    clip_a->set_explicit_length(10.0f);
+    AnimationTrack ta;
+    ta.property = "position";
+    ta.kind = TrackKind::Procedural;
+    ta.procedural.type = "constant";
+    ta.procedural.params.vectors["value"] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    clip_a->tracks.push_back(ta);
+
+    auto clip_b = std::make_shared<AnimationClip>(); // keyframed constant at x=10
+    clip_b->wrap = WrapMode::Loop;
+    clip_b->set_explicit_length(10.0f);
+    AnimationTrack tb;
+    tb.property = "position";
+    tb.curve.add_key(Keyframe{0.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tb.curve.add_key(Keyframe{10.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tb.curve.sort_keys();
+    clip_b->tracks.push_back(tb);
+
+    animator->add_state("A", clip_a);
+    animator->add_state("B", clip_b);
+    animator->auto_play = "A";
+
+    install_animation_system(scene);
+    scene.start();
+    animator->crossfade("B", 1.0f);
+
+    scene.update(0.5f);
+    scene.late_update(0.5f); // 50% faded -- proves procedural and keyframed share the accumulator path
+    auto pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-3f);
+
+    scene.update(0.6f);
+    scene.late_update(0.6f);
+    pos = scene.find_object("Obj")->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(pos.x - 10.0f) < 1e-3f);
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
     std::cout << "===========================================" << std::endl;
 
     scene_inherit_test::register_components();
+    animation_test::register_properties();
 
     RUN_TEST(test_id_util);
     RUN_TEST(test_string_util);
@@ -1718,6 +2688,32 @@ int main() {
     RUN_TEST(test_scene_inherit_missing_file_throws);
     RUN_TEST(test_scene_inherit_asset_path_resolution);
     RUN_TEST(test_scene_inherit_no_inherit_unchanged);
+
+    RUN_TEST(test_scene_phase_order);
+    RUN_TEST(test_scene_update_late_update_split);
+    RUN_TEST(test_scene_late_update_standalone);
+    RUN_TEST(test_scene_frame_boundary_update_only);
+    RUN_TEST(test_scene_null_job_engine_runs_inline);
+    RUN_TEST(test_scene_add_remove_system);
+    RUN_TEST(test_scene_move_preserves_systems);
+
+    RUN_TEST(test_animation_curve_sampling);
+    RUN_TEST(test_animation_property_registry);
+    RUN_TEST(test_animator_plays_clip_on_transform);
+    RUN_TEST(test_animator_channel_mask_preserves_other_channels);
+    RUN_TEST(test_animator_dedups_bindings_no_clobber);
+    RUN_TEST(test_animator_wrap_modes);
+    RUN_TEST(test_animator_crossfade_blends);
+    RUN_TEST(test_animator_binds_by_name_and_path);
+    RUN_TEST(test_animator_lazy_binds_when_initially_inactive);
+    RUN_TEST(test_animation_rotation_does_not_wrap);
+    RUN_TEST(test_animation_clip_loader_yaml);
+    RUN_TEST(test_animation_system_parallel_matches_serial);
+    RUN_TEST(test_procedural_orbit_matches_legacy_formula);
+    RUN_TEST(test_procedural_crossfade_against_keyframed);
+    // Run last: registers the "Animator" SceneLoader parser with a closure
+    // capturing a local AssetManager, and tears both down at the end.
+    RUN_TEST(test_animator_scene_yaml_registration);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

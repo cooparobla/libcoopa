@@ -1,14 +1,54 @@
 # Scene Module (`coopa::scene`)
 
 The `scene` module provides the scene graph hierarchy, component-based entity
-model, scene lifecycle management, and YAML scene loading. It is
-**dependency-free**: nothing in this module includes gfxcoopa, caml, uicoopa,
-or any other sibling repo — only libcoopa's own vendored `fkYAML` and `glm`.
-Every renderer-specific or UI-specific component (mesh renderers, cameras,
-lights, GI/reflection probes, RectTransform, ...) lives outside libcoopa and
-is parsed via `SceneLoader::register_component_parser()`, never by this
-module directly. gfxcoopa's `engine::components::register_render_components()`
-and uicoopa's `register_ui_components()` are the two current registrants.
+model, scene lifecycle management, YAML scene loading, and an ordered
+per-frame system pipeline (see "Update Phases" below). It is
+**dependency-free with respect to other repos**: nothing in this module
+includes gfxcoopa, caml, uicoopa, or any other sibling repo — only libcoopa's
+own vendored `fkYAML` and `glm`, plus libcoopa's own `coopa/event` (the scene
+event bus) and `coopa/job` (`Scene::set_job_engine()`'s frame-boundary
+ownership; see below). Every renderer-specific or UI-specific component (mesh
+renderers, cameras, lights, GI/reflection probes, RectTransform, ...) lives
+outside libcoopa and is parsed via `SceneLoader::register_component_parser()`,
+never by this module directly. gfxcoopa's
+`engine::components::register_render_components()` and uicoopa's
+`register_ui_components()` are the two current registrants.
+
+## Update Phases
+
+`Scene::update(dt)` and `Scene::late_update(dt)` no longer walk the
+`Component` tree directly — they run an ordered list of `ISceneSystem`
+instances (`coopa/scene/scene_system.h`). With nothing registered beyond the
+two built-ins (`BehaviourSystem` at `UpdatePhase::Behaviour`,
+`LateBehaviourSystem` at `UpdatePhase::LateBehaviour`, auto-installed by every
+`Scene`), both entry points behave exactly as before this pipeline existed.
+
+```text
+UpdatePhase::Physics       = 100   // reserved; no implementation ships in libcoopa
+UpdatePhase::Behaviour     = 200   // built-in: the recursive Component::update() walk
+UpdatePhase::Animation     = 300   // coopa::anim::AnimationSystem (coopa/animation)
+UpdatePhase::LateBehaviour = 400   // built-in: the recursive Component::late_update() walk
+```
+
+`Scene::update(dt)` runs every system with `order < LateBehaviour`;
+`Scene::late_update(dt)` runs every system with `order >= LateBehaviour`. This
+split — not a split at `Behaviour` — is deliberate: it is the only cut
+consistent with every existing caller, including consumers that call only
+`update()` and never `late_update()` (so `Animation` still runs for them) and
+a contract test elsewhere in the tree asserting `update()` does not trigger
+`late_update()` work. Gaps of 100 let a consumer insert a system between
+built-ins (e.g. IK at 350) without renumbering anything.
+
+`Scene::set_job_engine(JobEngine*)` installs a non-owning `JobEngine` that
+`Scene` alone drives the frame boundary of — it calls `begin_frame()` at the
+top of `update()` (lazily closing the previous frame first, so a caller that
+only ever calls `update()` still gets exactly one open frame at a time) and
+`end_frame()` at the bottom of `late_update()`. A system must never call
+`begin_frame()`/`end_frame()` itself. With no engine installed (the default),
+every system runs inline and no threads are spawned. Never pass
+`coopa::asset::AssetManager`'s own internal `JobEngine` here — it is a
+separate instance with its own `CounterPool` and frame lifetime, driven by
+`AssetManager::update()`.
 
 ---
 
@@ -44,9 +84,10 @@ and uicoopa's `register_ui_components()` are the two current registrants.
                                 ┌───────────────────────┐
                                 │       Component       │
                                 ├───────────────────────┤
-                                │ Transform, Animation  │  (defined here)
+                                │ Transform              │  (defined here)
                                 │ MeshRenderer, Camera,  │  (defined by gfxcoopa)
                                 │ RectTransform, Canvas  │  (defined by uicoopa)
+                                │ Animator               │  (defined by coopa::anim)
                                 └───────────────────────┘
 ```
 
@@ -61,7 +102,7 @@ and uicoopa's `register_ui_components()` are the two current registrants.
 
   Application       SceneManager      SceneLoader      SceneInheritance      fkYAML
       │                   │                │                   │               │
-      │── register_component_parser(...) for every non-Transform/Animation component
+      │── register_component_parser(...) for every non-Transform component (incl. Animator)
       │                   │                │                   │               │
       │── load_scene(path) ──►│            │                   │               │
       │                   │── load(path) ─►│                   │               │
@@ -139,8 +180,8 @@ High-level manager for scene lifecycle:
 ### [`scene_loader.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)
 
 Parser for YAML scene files:
-- Understands hierarchy plus the two component types this module defines:
-  `!Transform` / `type: Transform` and `!Animation` / `type: Animation`.
+- Understands hierarchy plus the one component type this module defines:
+  `!Transform` / `type: Transform`.
 - Every other component name is dispatched to whatever parser was registered
   for it via `register_component_parser(name, fn)`; unregistered names are
   silently skipped. A leading `!` is stripped before matching, so a YAML tag
@@ -235,7 +276,7 @@ live in uicoopa's `uicoopa/`.
 #include <coopa/scene/scene_object.h>
 #include <gfxcoopa/engine/components/register.h>
 
-// 1. Register every non-Transform/Animation component this application needs.
+// 1. Register every non-Transform component this application needs.
 coopa::gfx::engine::components::register_render_components(device, allocator, cmd_pool);
 
 // 2. Initialize scene manager and load a scene.

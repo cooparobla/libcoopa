@@ -6,10 +6,16 @@ synchronous or asynchronous via a dedicated `coopa::job::JobEngine` — and
 mtime-polled hot reload. It is **dependency-free**: nothing in this module
 includes gfxcoopa, caml, uicoopa, or any other sibling repo — only libcoopa's
 own `coopa::job` and `coopa::event` modules. Every concrete asset type (mesh,
-texture, shader, sprite, font, audio clip, ...) lives outside libcoopa and is
-registered via `AssetManager::register_loader<T>()`, never by this module
-directly — the same extension pattern `coopa::scene::SceneLoader` already
-established for scene components.
+texture, shader, sprite, font, audio clip, `coopa::anim::AnimationClip`, ...)
+lives outside libcoopa and is registered via `AssetManager::register_loader<T>()`,
+never by this module directly — the same extension pattern
+`coopa::scene::SceneLoader` already established for scene components.
+
+`AssetManager`'s dedicated `JobEngine` (`io_engine_`) is a **separate
+instance** from any `JobEngine` an application installs via
+`coopa::scene::Scene::set_job_engine()` — different `CounterPool`, different
+frame lifetime, driven by `AssetManager::update()` rather than by `Scene`.
+Never pass one where the other is expected.
 
 ---
 

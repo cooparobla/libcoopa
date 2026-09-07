@@ -2,11 +2,13 @@
  * @file scene_loader.h
  * @brief Loads a Scene from a YAML document using fkYAML.
  *
- * SceneLoader itself understands only hierarchy and Transform/Animation —
- * the two component types libcoopa defines. Every other component (mesh
- * renderers, cameras, lights, UI widgets, ...) is parsed by callbacks
+ * SceneLoader itself understands only hierarchy and Transform — the one
+ * component type libcoopa defines. Every other component (mesh renderers,
+ * cameras, lights, UI widgets, an Animator, ...) is parsed by callbacks
  * registered from outside libcoopa via register_component_parser(), so the
- * scene system never depends on gfxcoopa, uicoopa, or any other consumer.
+ * scene system never depends on gfxcoopa, uicoopa, coopa::anim, or any other
+ * consumer. See coopa/animation/animation_yaml.h's
+ * register_animation_components() for the Animator/AnimationClip registrant.
  *
  * Scene format:
  *   format: <free-form string, informational only>
@@ -58,7 +60,6 @@
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/scene_inherit.h>
 #include <coopa/scene/components/transform_component.h>
-#include <coopa/scene/components/animation_component.h>
 
 #include <fkYAML/node.hpp>
 
@@ -159,9 +160,9 @@ public:
     /**
      * @brief Loads a scene from a YAML file (or whatever set_document_loader() routes to).
      *
-     * Constructs the full Scene hierarchy. Every non-Transform/Animation
-     * component is handed to whatever parser is registered for its tag; an
-     * unregistered tag is silently skipped for forward compatibility.
+     * Constructs the full Scene hierarchy. Every non-Transform component is
+     * handed to whatever parser is registered for its tag; an unregistered
+     * tag is silently skipped for forward compatibility.
      *
      * @param path Absolute or relative path to the scene file.
      * @return Fully constructed Scene.
@@ -210,8 +211,8 @@ public:
      * name twice replaces the previous parser. Names are matched after
      * normalization: a leading '!' is stripped, so registering "MeshRenderer"
      * matches both a "!MeshRenderer" YAML tag and a "type: MeshRenderer" key.
-     * Built-in names ("Transform", "Animation") cannot be overridden — they
-     * are handled before the registry is consulted.
+     * The built-in name ("Transform") cannot be overridden — it is handled
+     * before the registry is consulted.
      *
      * @param name Component name as it appears in the scene file, with or without a leading '!'.
      * @param fn   Parser invoked when a component node resolves to this name.
@@ -340,19 +341,6 @@ private:
             }
             // No TransformComponent to apply to (auto_transform: false) — silently skipped;
             // a scene that opts out of auto transforms should not carry !Transform nodes.
-        } else if (tag == "Animation" || tag == "AnimationComponent") {
-            auto* anim = obj.add_component<AnimationComponent>();
-            std::string anim_file;
-            if (node.contains("animation_file")) {
-                anim_file = node.at("animation_file").get_value<std::string>();
-            } else if (node.contains("file")) {
-                anim_file = node.at("file").get_value<std::string>();
-            }
-
-            if (!anim_file.empty()) {
-                anim->load_from_yaml(ctx.resolve(anim_file));
-            }
-            anim->parse_node(node);
         } else {
             auto& registry = parsers_();
             auto it = registry.find(tag);
