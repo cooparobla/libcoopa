@@ -9,6 +9,19 @@
  *
  * This implementation uses a fixed-capacity circular buffer (no dynamic
  * resizing) for deterministic memory behavior in realtime applications.
+ *
+ * @warning Capacity should stay reasonably large relative to how hard any
+ * single deque is hammered concurrently (defaults here are in the
+ * thousands). A thief's steal() reserves a slot via a CAS on top_ and only
+ * *then* reads out of it; the owner is free to wrap the ring buffer around
+ * and overwrite that same physical slot with a new push() the moment its own
+ * capacity check (based on top_) allows it. Classic Chase-Lev relies on that
+ * reuse only happening after the thief's read has had time to complete --
+ * true in essentially all real usage, but an artificially tiny capacity
+ * under sustained concurrent push()/steal() pressure (e.g. capacity 4 under
+ * a tight push loop) can shrink that window enough to observe the race. See
+ * test_job_engine_deque_overflow_falls_back_to_global_queue in test.cpp for
+ * the concrete tripwire this was found with.
  */
 
 #ifndef COOPA_JOB_WORK_STEALING_DEQUE_H
@@ -35,9 +48,15 @@ namespace job {
  * - steal() may be called by **any** thread concurrently.
  * - push/pop and steal operate on opposite ends of the deque, minimizing contention.
  *
- * Memory ordering follows the Chase-Lev paper:
- * - bottom_ is only written by the owner (relaxed loads/stores from owner, acquire from thieves).
- * - top_ is contended between owner pop() and thief steal() (CAS with acq_rel).
+ * Memory ordering follows the Chase-Lev paper, expressed entirely through
+ * ordered atomic operations rather than standalone atomic_thread_fence calls
+ * (ThreadSanitizer does not model bare fences -- ordering must live on the
+ * atomic operations themselves to be verifiable under TSan):
+ * - bottom_: relaxed load/relaxed-or-seq_cst store from the owner (release
+ *   on the common push() path; seq_cst on pop()'s contended path, matching
+ *   the seq_cst top_ read it must not be reordered against), seq_cst/acquire
+ *   load from thieves.
+ * - top_: contended between owner pop() and thief steal() (CAS with seq_cst).
  */
 template<typename T>
 class WorkStealingDeque {
@@ -97,10 +116,19 @@ public:
 
         buffer_[b & mask_].data = std::move(item);
 
-        // Ensure the item is written before bottom_ is incremented.
-        // Release fence ensures thieves see the data.
-        std::atomic_thread_fence(std::memory_order_release);
-        bottom_.store(b + 1, std::memory_order_relaxed);
+        // Release store (not a relaxed store behind a separate release
+        // fence): a thief's acquire load of bottom_ in steal() pairs
+        // directly with this, giving the item write above a real
+        // happens-before edge expressed entirely through atomic operations.
+        // ThreadSanitizer does not model standalone atomic_thread_fence
+        // calls (it warns "not supported with -fsanitize=thread" and
+        // ignores them for its happens-before tracking), so the earlier
+        // fence-based version of this function produced false-positive
+        // race reports on push()/steal() despite being correctly
+        // synchronized per the C++ memory model -- expressing the same
+        // ordering via the atomic operations themselves avoids that blind
+        // spot entirely, independent of any particular sanitizer's coverage.
+        bottom_.store(b + 1, std::memory_order_release);
 
         return true;
     }
@@ -113,13 +141,19 @@ public:
      */
     bool pop(T& out_item) {
         int64_t b = bottom_.load(std::memory_order_relaxed) - 1;
-        bottom_.store(b, std::memory_order_relaxed);
 
-        // Full fence to ensure the decrement of bottom_ is visible to thieves
-        // before we read top_.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-
-        int64_t t = top_.load(std::memory_order_relaxed);
+        // Both seq_cst (not a relaxed store behind a separate seq_cst
+        // fence): on weak memory models this store must not be reordered
+        // past the top_ load below, and vice versa for a concurrent steal()
+        // -- two seq_cst operations can never appear reordered relative to
+        // each other in the single total order seq_cst guarantees. Standalone
+        // atomic_thread_fence calls give the same guarantee per the C++
+        // memory model, but ThreadSanitizer does not model them (see push()'s
+        // doc), so expressing the ordering on the operations themselves
+        // keeps this verifiable under TSan instead of reporting a false
+        // positive.
+        bottom_.store(b, std::memory_order_seq_cst);
+        int64_t t = top_.load(std::memory_order_seq_cst);
 
         if (t < b) {
             // Non-empty, and not the last element. A concurrent steal() only
@@ -159,12 +193,14 @@ public:
      * @return True if an item was stolen, false if the deque was empty or contended.
      */
     bool steal(T& out_item) {
-        int64_t t = top_.load(std::memory_order_acquire);
-
-        // Acquire fence to ensure we see the data written by push().
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-
-        int64_t b = bottom_.load(std::memory_order_acquire);
+        // Both seq_cst, for the same reason as pop()'s bottom_/top_ pair:
+        // this thief's top_ and bottom_ reads must not be reordered relative
+        // to each other on weak memory models, and a standalone fence would
+        // give ThreadSanitizer no visibility into that ordering (see push()'s
+        // doc). The seq_cst load of bottom_ still pairs with push()'s
+        // release store to it for the item-write happens-before edge.
+        int64_t t = top_.load(std::memory_order_seq_cst);
+        int64_t b = bottom_.load(std::memory_order_seq_cst);
 
         if (t < b) {
             // Non-empty. Resolve ownership of this slot via CAS BEFORE

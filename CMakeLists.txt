@@ -34,6 +34,30 @@ target_include_directories(libcoopa_lib INTERFACE
     ${CMAKE_CURRENT_BINARY_DIR}/configuration)
 target_compile_definitions(libcoopa_lib INTERFACE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
 
+# The job system uses std::thread/std::mutex/std::condition_variable directly
+# (coopa/job/engine.h, thread.h); on some platforms/toolchains that requires
+# explicitly linking a threading library (e.g. pthreads on Linux), which this
+# target never did before -- it happened to work by accident of libstdc++
+# pulling it in transitively. Threads::Threads is a no-op on toolchains that
+# don't need it (e.g. most Windows configurations).
+find_package(Threads REQUIRED)
+target_link_libraries(libcoopa_lib INTERFACE Threads::Threads)
+
+# Off by default so a consumer that add_subdirectory()s this library (e.g.
+# gfxcoopa) pays nothing for either unless it opts in.
+option(COOPA_JOB_DIAGNOSTICS "Enable JobEngine per-type job counters and thread/queue-depth snapshots" OFF)
+option(COOPA_SCENE_THREAD_CHECKS "Enable Scene's runtime single-owner (no concurrent access) assertions" OFF)
+if(COOPA_JOB_DIAGNOSTICS)
+    target_compile_definitions(libcoopa_lib INTERFACE COOPA_JOB_DIAGNOSTICS)
+endif()
+if(COOPA_SCENE_THREAD_CHECKS)
+    target_compile_definitions(libcoopa_lib INTERFACE COOPA_SCENE_THREAD_CHECKS)
+endif()
+
 # Add executable
 add_executable(libcoopa test.cpp)
 target_link_libraries(libcoopa PRIVATE coopa::lib)
+# Always exercised in this repo's own test build, regardless of the option
+# above's default, so the test suite actually catches a Scene single-owner
+# contract violation if one is ever introduced.
+target_compile_definitions(libcoopa PRIVATE COOPA_SCENE_THREAD_CHECKS)

@@ -46,7 +46,8 @@ namespace asset {
  * must not touch the GPU (see IAssetLoader).
  *
  * @code
- * coopa::asset::AssetManager assets;
+ * coopa::job::JobEngine engine;
+ * coopa::asset::AssetManager assets(&engine);
  * assets.add_search_root(std::string(ROOT_DIR) + "/assets");
  * assets.register_loader<Mesh>(std::make_unique<MeshLoader>(device, allocator, cmd_pool));
  *
@@ -60,13 +61,26 @@ namespace asset {
 class AssetManager {
 public:
     /**
-     * @brief Constructs an AssetManager with its own dedicated IO job engine.
-     * @param io_threads Worker threads dedicated to async decode() calls. This
-     *   engine is never shared with the application's per-frame JobEngine —
-     *   see update()'s doc for why that separation matters.
+     * @brief Constructs an AssetManager, optionally sharing an existing JobEngine.
+     *
+     * Earlier revisions always spun up a private, dedicated IO JobEngine,
+     * because the counter pool's frame-boundary reset made sharing an engine
+     * across independent subsystems unsafe (see handle.h's class doc for why
+     * that constraint no longer applies). Now that handles are individually
+     * reclaimed rather than bulk-reset, decode() jobs can safely share the
+     * application's own JobEngine — pass it in, and this AssetManager will
+     * submit decode() work at Priority::Low so it never preempts frame work.
+     *
+     * @param engine Engine to submit decode() jobs on. If nullptr, this
+     *   AssetManager constructs and owns a private fallback engine instead
+     *   (matching every prior revision's default behavior).
+     * @param fallback_io_threads Worker threads for the private fallback
+     *   engine. Ignored if `engine` is non-null.
      */
-    explicit AssetManager(unsigned int io_threads = 2)
-        : io_engine_(io_threads), logger_(new coopa::debug::Logger("AssetManager")) {}
+    explicit AssetManager(coopa::job::JobEngine* engine = nullptr, unsigned int fallback_io_threads = 2)
+        : owned_engine_(engine ? nullptr : std::make_unique<coopa::job::JobEngine>(fallback_io_threads)),
+          engine_(engine ? engine : owned_engine_.get()),
+          logger_(new coopa::debug::Logger("AssetManager")) {}
 
     ~AssetManager() {
         shutdown();
@@ -135,7 +149,7 @@ public:
         if (slot->state == AssetState::Loading) {
             auto it = pending_.find(slot);
             if (it != pending_.end()) {
-                io_engine_.wait_for(it->second.handle);
+                engine_->wait_for(it->second.handle);
                 complete_pending_(it->second);
                 pending_.erase(it);
             }
@@ -162,14 +176,17 @@ public:
     }
 
     /**
-     * @brief Kicks off an asynchronous load on this manager's dedicated IO engine.
+     * @brief Kicks off an asynchronous load on this manager's JobEngine, at
+     *        Priority::Low so it never preempts ordinary frame work.
      *
      * decode() runs on a worker thread; finalize() runs on the main thread
      * inside a later update() call. If a load is already in flight or
      * complete for this id, this simply returns a handle to the existing
-     * slot without starting anything new. If the IO engine's counter pool
-     * is exhausted (many loads still in flight), this transparently falls
-     * back to a synchronous load() rather than dropping the request.
+     * slot without starting anything new. If the engine's handle pool is
+     * exhausted, the slot is marked Failed rather than blocking -- handle
+     * pool exhaustion recovers on its own as in-flight handles are closed
+     * (see handle.h), so a retried load_async() shortly after will typically
+     * succeed.
      *
      * @tparam T Asset payload type; must have a loader registered via register_loader<T>().
      * @param virtual_path Path as referenced from YAML/scene files.
@@ -198,12 +215,10 @@ public:
 
         LoadContext ctx = make_context_(resolved_path, *slot);
 
-        coopa::job::JobHandle handle = io_engine_.create_handle();
+        coopa::job::JobHandle handle = engine_->create_handle();
         if (!handle.is_valid()) {
-            // Counter pool exhausted while other loads are still in flight
-            // (and therefore un-resettable, see update()'s doc) — fall back
-            // to a synchronous load rather than dropping the request.
-            return load<T>(virtual_path, base_dir);
+            fail_slot_(*slot, "Asset IO job handle pool exhausted; retry load_async() shortly");
+            return AssetHandle<T>(slot);
         }
 
         slot->state = AssetState::Loading;
@@ -215,14 +230,14 @@ public:
         pending.ctx = ctx;
 
         PendingLoad* pending_ptr = &pending;
-        io_engine_.submit([pending_ptr, id, ctx]() {
+        engine_->submit([pending_ptr, id, ctx]() {
             try {
                 pending_ptr->decoded = pending_ptr->loader->decode(id, ctx);
             } catch (const std::exception& e) {
                 pending_ptr->decode_failed = true;
                 pending_ptr->error = e.what();
             }
-        }, k_asset_io_job_type, pending.handle);
+        }, k_asset_io_job_type, pending.handle, nullptr, 0u, coopa::job::Priority::Low);
 
         return AssetHandle<T>(slot);
     }
@@ -396,14 +411,6 @@ public:
      * Call once per frame from the main thread, after any GPU work that
      * might reference a previous frame's assets has been submitted.
      *
-     * The dedicated IO engine's counter pool (see coopa/job/handle.h) is
-     * only reset once `pending_` is empty. CounterPool::reset() is a bare
-     * bump-pointer reset with no generation tag, so resetting it while any
-     * JobHandle is still outstanding would let a later allocate() silently
-     * alias that handle's slot — this is why AssetManager owns its own
-     * JobEngine instead of sharing the application's per-frame one, and why
-     * it only resets when it is provably safe to.
-     *
      * @param delta_time Frame delta time in seconds; only used for hot-reload poll timing.
      */
     void update(float delta_time = 0.0f) {
@@ -414,11 +421,6 @@ public:
             } else {
                 ++it;
             }
-        }
-
-        if (pending_.empty()) {
-            io_engine_.begin_frame();
-            io_engine_.end_frame();
         }
 
         for (auto it = retired_.begin(); it != retired_.end();) {
@@ -466,7 +468,7 @@ public:
      */
     void shutdown() {
         for (auto& kv : pending_) {
-            io_engine_.wait_for(kv.second.handle);
+            engine_->wait_for(kv.second.handle);
             complete_pending_(kv.second);
         }
         pending_.clear();
@@ -487,8 +489,8 @@ private:
         LoadContext            ctx;
     };
 
-    /// @brief Distinct JobType tag for asset IO jobs on this manager's dedicated engine (never shared with an app's own JobEngine job types).
-    static constexpr JobType k_asset_io_job_type = 0xA55E7000u;
+    /// @brief Distinct JobType tag for asset IO jobs (never collides with an app's own JobEngine job types).
+    static constexpr coopa::job::JobType k_asset_io_job_type = 0xA55E7000u;
 
     /// @brief Grace period (frames) a superseded payload is kept alive before actual destruction, so in-flight GPU work isn't yanked out from under it. Applies to every eviction path — hot reload, create() re-publish, unload(), garbage_collect(), and idle eviction — not just reload, despite the name's origin.
     static constexpr int k_payload_grace_frames = 3;
@@ -565,18 +567,28 @@ private:
         if (is_reload) on_reloaded.emit(slot.id);
     }
 
-    /** @brief Runs finalize() for a load whose decode() has completed, publishing or failing the slot. */
+    /**
+     * @brief Runs finalize() for a load whose decode() has completed,
+     *        publishing or failing the slot, then closes its JobHandle.
+     *
+     * Closing here (rather than leaving it to the caller) means every path
+     * that drains a PendingLoad -- update()'s poll loop, load()'s
+     * synchronous-completion path, and shutdown()'s drain -- recycles the
+     * handle's slot exactly once, in the one place that actually knows the
+     * handle is done being examined.
+     */
     void complete_pending_(PendingLoad& pending) {
         if (pending.decode_failed) {
             fail_slot_(*pending.slot, pending.error);
-            return;
+        } else {
+            try {
+                std::shared_ptr<void> payload = pending.loader->finalize(std::move(pending.decoded), pending.slot->id, pending.ctx);
+                publish_(*pending.slot, std::move(payload), pending.ctx);
+            } catch (const std::exception& e) {
+                fail_slot_(*pending.slot, e.what());
+            }
         }
-        try {
-            std::shared_ptr<void> payload = pending.loader->finalize(std::move(pending.decoded), pending.slot->id, pending.ctx);
-            publish_(*pending.slot, std::move(payload), pending.ctx);
-        } catch (const std::exception& e) {
-            fail_slot_(*pending.slot, e.what());
-        }
+        pending.handle.close();
     }
 
     /**
@@ -642,7 +654,8 @@ private:
     std::vector<std::pair<std::shared_ptr<void>, int>>                 retired_; /**< {payload, frames_remaining}. */
 
     AssetSource            source_;
-    coopa::job::JobEngine   io_engine_; /**< Dedicated to asset IO; never driven by an application's own frame loop. */
+    std::unique_ptr<coopa::job::JobEngine> owned_engine_; /**< Only set when no external engine was supplied. */
+    coopa::job::JobEngine*  engine_ = nullptr;            /**< Non-owning; submits decode() jobs here at Priority::Low. */
 
     bool  hot_reload_enabled_ = false;
     float poll_interval_ = 1.0f;

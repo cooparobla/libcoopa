@@ -68,6 +68,7 @@
 #include <memory>
 #include <filesystem>
 #include <fstream>
+#include <shared_mutex>
 #include <stdexcept>
 #include <functional>
 #include <vector>
@@ -218,6 +219,7 @@ public:
      * @param fn   Parser invoked when a component node resolves to this name.
      */
     static void register_component_parser(const std::string& name, ComponentParser fn) {
+        std::unique_lock<std::shared_mutex> lock(parsers_mutex_());
         parsers_()[normalize_tag_(name)] = std::move(fn);
     }
 
@@ -230,6 +232,7 @@ public:
      * into a later SceneLoader::load() call.
      */
     static void clear_component_parsers() {
+        std::unique_lock<std::shared_mutex> lock(parsers_mutex_());
         parsers_().clear();
     }
 
@@ -241,20 +244,47 @@ public:
      * @param fn Loader callback, or an empty function to reset to the default.
      */
     static void set_document_loader(DocumentLoader fn) {
+        std::unique_lock<std::shared_mutex> lock(loader_mutex_());
         document_loader_() = std::move(fn);
     }
 
 private:
-    /** @brief Function-local static registry of registered component parsers. */
+    /**
+     * @brief Function-local static registry of registered component parsers,
+     *        and the shared_mutex guarding it.
+     *
+     * These are process-wide mutable statics (every SceneLoader::load() call,
+     * from any thread, reads them). register_component_parser()/
+     * clear_component_parsers() take the unique lock; parse_component_()
+     * takes the shared lock just long enough to copy out the one
+     * ComponentParser it needs, then calls it unlocked -- so a parser that
+     * itself calls back into register_component_parser() (or simply takes a
+     * while) never holds the lock re-entrantly or blocks unrelated readers.
+     * This makes the *registry* thread-safe; it does NOT make an individual
+     * registered parser thread-safe to run from a worker -- most existing
+     * parsers (e.g. gfxcoopa's, which capture an AssetManager& that is
+     * itself documented main-thread-only) are not, so scene loading should
+     * still be treated as main-thread work by default.
+     */
     static std::unordered_map<std::string, ComponentParser>& parsers_() {
         static std::unordered_map<std::string, ComponentParser> registry;
         return registry;
     }
 
-    /** @brief Function-local static holder for the optional custom document loader. */
+    static std::shared_mutex& parsers_mutex_() {
+        static std::shared_mutex mutex;
+        return mutex;
+    }
+
+    /** @brief Function-local static holder for the optional custom document loader, and its mutex. */
     static DocumentLoader& document_loader_() {
         static DocumentLoader loader;
         return loader;
+    }
+
+    static std::shared_mutex& loader_mutex_() {
+        static std::shared_mutex mutex;
+        return mutex;
     }
 
     /** @brief Strips a leading '!' so tag-form and type-form names compare equal. */
@@ -264,8 +294,13 @@ private:
 
     /** @brief Loads and parses the root node, via the custom loader if one is installed. */
     static fkyaml::node load_node_(const std::string& path) {
-        if (document_loader_()) {
-            return document_loader_()(path);
+        DocumentLoader loader_copy;
+        {
+            std::shared_lock<std::shared_mutex> lock(loader_mutex_());
+            loader_copy = document_loader_();
+        }
+        if (loader_copy) {
+            return loader_copy(path);
         }
         std::ifstream ifs(path);
         if (!ifs) {
@@ -342,10 +377,15 @@ private:
             // No TransformComponent to apply to (auto_transform: false) — silently skipped;
             // a scene that opts out of auto transforms should not carry !Transform nodes.
         } else {
-            auto& registry = parsers_();
-            auto it = registry.find(tag);
-            if (it != registry.end()) {
-                it->second(node, obj, ctx);
+            ComponentParser parser_copy;
+            {
+                std::shared_lock<std::shared_mutex> lock(parsers_mutex_());
+                auto& registry = parsers_();
+                auto it = registry.find(tag);
+                if (it != registry.end()) parser_copy = it->second;
+            }
+            if (parser_copy) {
+                parser_copy(node, obj, ctx);
             }
             // Unrecognized names fall through silently for forward compatibility.
         }

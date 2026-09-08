@@ -7,8 +7,8 @@
  * synchronization (CV/mutex) is managed externally by the JobEngine.
  */
 
-#ifndef NGIN_JOB_THREAD_H
-#define NGIN_JOB_THREAD_H
+#ifndef COOPA_JOB_THREAD_H
+#define COOPA_JOB_THREAD_H
 
 #include <thread>
 #include <atomic>
@@ -130,4 +130,4 @@ private:
 } // namespace job
 } // namespace coopa
 
-#endif // NGIN_JOB_THREAD_H
+#endif // COOPA_JOB_THREAD_H

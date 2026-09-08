@@ -15,6 +15,7 @@
 
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/scene_system.h>
+#include <coopa/scene/scene_commands.h>
 #include <coopa/event/event_bus.h>
 #include <coopa/job/engine.h>
 #include <string>
@@ -23,14 +24,69 @@
 #include <functional>
 #include <utility>
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cstdint>
+#include <thread>
+
+#ifdef COOPA_SCENE_THREAD_CHECKS
+/// @brief Declares a scoped ownership check at the top of a Scene method.
+/// Expands to nothing (zero cost) when COOPA_SCENE_THREAD_CHECKS is off.
+#define COOPA_SCENE_ACCESS_GUARD(scene_ref) \
+    ::coopa::scene::SceneAccessGuard coopa_scene_access_guard_(scene_ref)
+#else
+#define COOPA_SCENE_ACCESS_GUARD(scene_ref) ((void)0)
+#endif
 
 namespace coopa {
 namespace scene {
 
+class Scene; // Forward declaration, needed by SceneAccessGuard's `Scene&` member below.
+
+#ifdef COOPA_SCENE_THREAD_CHECKS
+/**
+ * @class SceneAccessGuard
+ * @brief RAII single-owner check: asserts no two threads are ever inside the
+ *        same Scene's methods concurrently. See COOPA_SCENE_ACCESS_GUARD and
+ *        Scene's class doc. Reentrant for the same thread (a system calling
+ *        back into another Scene method on the same call stack is fine).
+ *
+ * Declared here (a reference to Scene is enough for that -- Scene need only
+ * be forward-declared); constructor/destructor are defined out-of-line,
+ * after Scene is a complete type, alongside this file's other out-of-line
+ * definitions (BehaviourSystem::execute() etc.).
+ */
+class SceneAccessGuard {
+public:
+    explicit SceneAccessGuard(Scene& scene);
+    ~SceneAccessGuard();
+    SceneAccessGuard(const SceneAccessGuard&) = delete;
+    SceneAccessGuard& operator=(const SceneAccessGuard&) = delete;
+private:
+    Scene& scene_;
+};
+#endif
+
 /**
  * @class Scene
  * @brief Owns the root SceneObjects and provides generic hierarchy-wide queries.
+ *
+ * **Single-owner + deferred commands.** At any instant, at most one thread
+ * may call a non-const method on a given Scene -- this is what lets an
+ * engine process several independent Scenes concurrently (one job per
+ * Scene) without any locking inside Scene itself: distinct Scene instances
+ * share no state. Build with -DCOOPA_SCENE_THREAD_CHECKS=ON (see
+ * CMakeLists.txt) to get a runtime assertion if two threads ever call into
+ * the same Scene concurrently.
+ *
+ * Work fanned out *within* one Scene's update (e.g. a system's
+ * parallel_for() over its components) must only READ scene state from a
+ * worker job -- every write goes through that worker's SceneCommandBuffer
+ * (see FrameContext::commands / Scene::commands_for(), and scene_commands.h)
+ * instead of calling a mutating Scene/SceneObject method directly. The owner
+ * thread applies every buffer's recorded commands, in worker-index order,
+ * via flush_commands() -- call it once per frame, after every system has
+ * run (late_update() already does this for you).
  *
  * Constructed by SceneLoader (or built up manually via add_root_object()).
  * update()/late_update() run an ordered pipeline of ISceneSystem instances
@@ -66,8 +122,11 @@ public:
     // has run (e.g. SceneLoader::load()'s `return scene;`, then moved again
     // into SceneManager's unique_ptr<Scene>) would leave every component
     // pointing at a dangling, already-destroyed Scene. systems_/jobs_/
-    // frame_index_/frame_open_ move alongside root_objects_/events_ for the
-    // same reason: this Scene may be mid-frame the moment it is relocated.
+    // frame_index_/worker_commands_ move alongside root_objects_/events_ for
+    // the same reason: this Scene may be mid-frame the moment it is
+    // relocated. Per this class's single-owner contract, a move itself must
+    // not race a concurrent call into either Scene -- same precondition as
+    // any other move in this codebase.
     Scene(const Scene&) = delete;
     Scene& operator=(const Scene&) = delete;
 
@@ -77,25 +136,23 @@ public:
           events_(std::move(other.events_)),
           systems_(std::move(other.systems_)),
           jobs_(other.jobs_),
-          frame_index_(other.frame_index_),
-          frame_open_(other.frame_open_)
+          frame_index_(other.frame_index_.load(std::memory_order_relaxed)),
+          worker_commands_(std::move(other.worker_commands_))
     {
         other.jobs_ = nullptr;
-        other.frame_open_ = false;
         restamp_scene_pointers_();
     }
 
     Scene& operator=(Scene&& other) noexcept {
         if (this == &other) return *this;
-        name_         = std::move(other.name_);
-        root_objects_ = std::move(other.root_objects_);
-        events_       = std::move(other.events_);
-        systems_      = std::move(other.systems_);
-        jobs_         = other.jobs_;
-        frame_index_  = other.frame_index_;
-        frame_open_   = other.frame_open_;
+        name_             = std::move(other.name_);
+        root_objects_     = std::move(other.root_objects_);
+        events_           = std::move(other.events_);
+        systems_          = std::move(other.systems_);
+        jobs_             = other.jobs_;
+        frame_index_.store(other.frame_index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        worker_commands_  = std::move(other.worker_commands_);
         other.jobs_ = nullptr;
-        other.frame_open_ = false;
         restamp_scene_pointers_();
         return *this;
     }
@@ -111,9 +168,23 @@ public:
      * @return Raw pointer to the added object.
      */
     SceneObject* add_root_object(std::unique_ptr<SceneObject> obj) {
+        COOPA_SCENE_ACCESS_GUARD(*this);
         SceneObject* raw = obj.get();
         root_objects_.push_back(std::move(obj));
         return raw;
+    }
+
+    /**
+     * @brief Detaches and destroys a root object by pointer.
+     * @return True if `obj` was found among root_objects() and removed.
+     */
+    bool remove_root_object(SceneObject* obj) {
+        COOPA_SCENE_ACCESS_GUARD(*this);
+        auto it = std::find_if(root_objects_.begin(), root_objects_.end(),
+            [obj](const std::unique_ptr<SceneObject>& o) { return o.get() == obj; });
+        if (it == root_objects_.end()) return false;
+        root_objects_.erase(it);
+        return true;
     }
 
     /** @brief Returns the list of root SceneObjects (read-only). */
@@ -137,6 +208,7 @@ public:
      * late_update() can all reach scene->events() from within a component.
      */
     void start() {
+        COOPA_SCENE_ACCESS_GUARD(*this);
         restamp_scene_pointers_();
         for (auto& obj : root_objects_) obj->start();
     }
@@ -146,24 +218,28 @@ public:
      *
      * With nothing else registered this is just the built-in BehaviourSystem
      * (the recursive Component::update() walk), so existing callers see no
-     * change. If a JobEngine was installed via set_job_engine(), this also
-     * opens this frame's job boundary (calling begin_frame() on it) before
-     * running any system — see set_job_engine()'s doc for why Scene, and only
-     * Scene, is allowed to do that.
+     * change.
      *
-     * NOTE: unlike before this pipeline existed, this is no longer safe to
-     * call from a worker thread once a JobEngine is installed — it may act as
-     * a guest worker inside a system's wait_for() call. With no engine
-     * installed (the default), the old "safe from a worker thread as long as
-     * the render thread isn't reading" guidance still holds.
+     * A JobEngine installed via set_job_engine() is handed to every system
+     * via FrameContext::jobs, but this Scene no longer drives its frame
+     * boundary (begin_frame()/end_frame() are diagnostics-only now that
+     * JobHandle slots are individually reclaimed rather than bulk-reset per
+     * frame -- see coopa/job/handle.h) -- an engine may be freely shared
+     * across many concurrently-processing Scenes and other subsystems.
+     *
+     * Safe to call from any thread, but only ONE thread at a time for a
+     * given Scene -- see this class's single-owner doc. Multiple distinct
+     * Scenes may each have update() running concurrently on their own
+     * thread/job.
      *
      * @param delta_time Frame delta time in seconds.
      */
     void update(float delta_time) {
-        if (jobs_) {
-            open_frame_();
-        }
-        FrameContext ctx{delta_time, frame_index_, jobs_};
+        COOPA_SCENE_ACCESS_GUARD(*this);
+        ensure_command_buffers_();
+        uint32_t widx = coopa::job::k_main_thread_index;
+        FrameContext ctx{delta_time, frame_index_.load(std::memory_order_relaxed), jobs_,
+                         &commands_for(widx), widx};
         for (auto& entry : systems_) {
             if (entry.first < static_cast<int>(UpdatePhase::LateBehaviour)) {
                 entry.second->execute(*this, ctx);
@@ -172,29 +248,71 @@ public:
     }
 
     /**
-     * @brief Runs every registered system with order >= UpdatePhase::LateBehaviour.
+     * @brief Runs every registered system with order >= UpdatePhase::LateBehaviour,
+     *        then flushes every worker's deferred SceneCommandBuffer.
      *
-     * With nothing else registered this is just the built-in
-     * LateBehaviourSystem (the recursive Component::late_update() walk) —
-     * call once per frame, after update(dt), exactly as before. Still valid
-     * to call standalone with no preceding update() this frame (several
-     * existing tests do): the job frame is only closed here if update()
-     * actually opened one.
+     * With nothing else registered the system pipeline here is just the
+     * built-in LateBehaviourSystem (the recursive Component::late_update()
+     * walk) — call once per frame, after update(dt), exactly as before.
+     * Still valid to call standalone with no preceding update() this frame
+     * (several existing tests do).
+     *
+     * flush_commands() runs last, after every system (both phases) has had
+     * its chance to record commands this frame — see flush_commands()'s doc.
      *
      * @param delta_time Frame delta time in seconds.
      */
     void late_update(float delta_time) {
-        FrameContext ctx{delta_time, frame_index_, jobs_};
+        COOPA_SCENE_ACCESS_GUARD(*this);
+        ensure_command_buffers_();
+        uint32_t widx = coopa::job::k_main_thread_index;
+        FrameContext ctx{delta_time, frame_index_.load(std::memory_order_relaxed), jobs_,
+                         &commands_for(widx), widx};
         for (auto& entry : systems_) {
             if (entry.first >= static_cast<int>(UpdatePhase::LateBehaviour)) {
                 entry.second->execute(*this, ctx);
             }
         }
-        if (jobs_ && frame_open_) {
-            jobs_->end_frame();
-            frame_open_ = false;
+        flush_commands();
+        frame_index_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Applies every worker's recorded SceneCommandBuffer, in
+     *        worker-index order (deterministic), then clears them.
+     *
+     * Called automatically at the end of late_update() — call it directly
+     * only if commands were recorded after late_update() already ran this
+     * frame (uncommon). Must run on the owning thread, after every system
+     * that might still record a command has finished (a job must never
+     * still be running when this executes -- the caller is responsible for
+     * having already waited on any outstanding job handles).
+     */
+    void flush_commands() {
+        COOPA_SCENE_ACCESS_GUARD(*this);
+        for (auto& buffer : worker_commands_) {
+            if (!buffer.empty()) buffer.flush_(*this);
         }
-        ++frame_index_;
+    }
+
+    /**
+     * @brief Returns the SceneCommandBuffer a system should record deferred
+     *        edits into for the given worker index (see FrameContext::worker_index).
+     *
+     * Sized to jobs_->worker_count() + 1 slots: indices [0, worker_count())
+     * are the JobEngine's own worker indices, and the last slot is reserved
+     * for coopa::job::k_main_thread_index (the owner thread calling in
+     * directly, not from inside a job) -- update()/late_update() always pass
+     * k_main_thread_index for the outermost FrameContext they build; a
+     * system that internally fans out via parallel_for() should instead look
+     * up commands_for() using ITS OWN per-chunk JobContext::worker_index.
+     */
+    SceneCommandBuffer& commands_for(uint32_t worker_index) {
+        ensure_command_buffers_();
+        size_t last = worker_commands_.size() - 1;
+        size_t idx = (worker_index == coopa::job::k_main_thread_index || worker_index > last)
+                         ? last : static_cast<size_t>(worker_index);
+        return worker_commands_[idx];
     }
 
     /**
@@ -213,6 +331,7 @@ public:
      *            back-pointer, it does not change ownership.
      */
     void adopt(SceneObject& obj) {
+        COOPA_SCENE_ACCESS_GUARD(*this);
         obj.for_each_recursive([this](SceneObject& o) {
             for (auto& comp : o.components()) comp->scene = this;
         });
@@ -224,24 +343,30 @@ public:
     // --- System pipeline ---
 
     /**
-     * @brief Installs the frame JobEngine (non-owning; the caller keeps ownership).
+     * @brief Installs the JobEngine every system sees via FrameContext::jobs
+     *        (non-owning; the caller keeps ownership).
      *
-     * CONTRACT: this Scene becomes the sole owner of that engine's frame
-     * boundary — it calls begin_frame() at the top of update() (lazily
-     * closing the previous frame first, so a caller that only ever calls
-     * update() and never late_update() still gets exactly one open frame at
-     * a time) and end_frame() at the bottom of late_update(). Do not pass an
-     * engine whose begin_frame()/end_frame() the application also drives
-     * itself, and never pass coopa::asset::AssetManager's own internal
-     * engine — it is a separate instance with its own CounterPool and frame
-     * lifetime, driven by AssetManager::update().
+     * Unlike earlier revisions, this Scene does NOT need exclusive ownership
+     * of the engine's frame boundary -- JobHandle slots are individually
+     * reclaimed rather than bulk-reset (see coopa/job/handle.h), so the same
+     * engine may be freely shared across this Scene, other concurrently-
+     * processing Scenes, coopa::asset::AssetManager, and anything else, with
+     * no coordination required between them.
      *
      * Passing nullptr (the default state) makes every system run inline on
      * the calling thread — no threads are spawned unless this is called.
      *
      * @param engine Non-owning pointer to the JobEngine to drive, or nullptr.
      */
-    void set_job_engine(coopa::job::JobEngine* engine) { jobs_ = engine; }
+    void set_job_engine(coopa::job::JobEngine* engine) {
+        jobs_ = engine;
+        // Sized here (not just lazily in update()) so worker_commands_ never
+        // reallocates mid-frame -- a system that calls commands_for() while
+        // another system's FrameContext::commands (a raw pointer into this
+        // same vector) is still in scope must never see that pointer
+        // invalidated by a resize.
+        ensure_command_buffers_();
+    }
 
     /** @brief Returns the installed frame JobEngine, or nullptr if none. */
     coopa::job::JobEngine* job_engine() const { return jobs_; }
@@ -261,13 +386,14 @@ public:
     /**
      * @brief Registers a system at an arbitrary numeric order.
      *
-     * Lets a consumer insert between the built-in phases (e.g. 350 for IK,
-     * which runs after Animation(300) but still inside update() since it is
-     * below LateBehaviour(400)).
+     * Lets a consumer insert between the built-in phases (e.g. 375 for IK,
+     * which would run after coopa::scene::TransformSystem(350) but still
+     * inside update() since it is below LateBehaviour(400)).
      *
      * @return Non-owning pointer to the registered system.
      */
     ISceneSystem* add_system(std::unique_ptr<ISceneSystem> system, int order) {
+        COOPA_SCENE_ACCESS_GUARD(*this);
         ISceneSystem* raw = system.get();
         systems_.emplace_back(order, std::move(system));
         std::stable_sort(systems_.begin(), systems_.end(),
@@ -298,7 +424,7 @@ public:
     }
 
     /** @brief Monotonically increasing frame counter, incremented once per late_update(). */
-    uint64_t frame_index() const { return frame_index_; }
+    uint64_t frame_index() const { return frame_index_.load(std::memory_order_relaxed); }
 
     // --- Generic queries ---
 
@@ -397,19 +523,13 @@ private:
     }
 
     /**
-     * @brief Opens this frame's job boundary, closing the previous one first if needed.
-     *
-     * A caller that only ever calls update() and never late_update() (e.g.
-     * blendy, toyengine) never runs the end_frame() at the bottom of
-     * late_update(), so the previous frame's boundary is still "open" the
-     * next time update() runs — close it here before opening a new one, so
-     * exactly one frame is ever open at a time regardless of which entry
-     * points the caller uses.
+     * @brief Grows worker_commands_ to cover every JobEngine worker plus the
+     *        reserved main-thread slot. Cheap to call every update()/
+     *        late_update() -- a no-op once already sized correctly.
      */
-    void open_frame_() {
-        if (frame_open_) jobs_->end_frame();
-        jobs_->begin_frame();
-        frame_open_ = true;
+    void ensure_command_buffers_() {
+        size_t needed = static_cast<size_t>(jobs_ ? jobs_->worker_count() : 0) + 1;
+        if (worker_commands_.size() < needed) worker_commands_.resize(needed);
     }
 
     std::string                               name_;         /**< Scene name. */
@@ -418,10 +538,40 @@ private:
 
     /** @brief Registered systems, kept sorted ascending by order; equal orders keep insertion order. */
     std::vector<std::pair<int, std::unique_ptr<ISceneSystem>>> systems_;
-    coopa::job::JobEngine* jobs_        = nullptr; /**< Non-owning. See set_job_engine(). */
-    uint64_t                frame_index_ = 0;      /**< Bumped once per late_update(). */
-    bool                    frame_open_  = false;  /**< Whether jobs_->begin_frame() has an unmatched end_frame(). */
+    coopa::job::JobEngine* jobs_ = nullptr; /**< Non-owning. See set_job_engine(). */
+    std::atomic<uint64_t>  frame_index_{0}; /**< Bumped once per late_update(); atomic so a worker job may read it. */
+
+    /// @brief Per-worker deferred command buffers -- see commands_for()/flush_commands().
+    std::vector<SceneCommandBuffer> worker_commands_;
+
+#ifdef COOPA_SCENE_THREAD_CHECKS
+    friend class SceneAccessGuard;
+    std::atomic<std::thread::id> owner_thread_{};
+    int reentrancy_depth_ = 0; /**< Only ever touched by whichever thread currently owns owner_thread_. */
+#endif
 };
+
+#ifdef COOPA_SCENE_THREAD_CHECKS
+// SceneAccessGuard's constructor/destructor, defined out-of-line now that
+// Scene is a complete type (its class shell is declared earlier in this file).
+inline SceneAccessGuard::SceneAccessGuard(Scene& scene) : scene_(scene) {
+    std::thread::id this_id = std::this_thread::get_id();
+    std::thread::id expected{};
+    if (scene_.owner_thread_.compare_exchange_strong(expected, this_id, std::memory_order_acq_rel)) {
+        scene_.reentrancy_depth_ = 1;
+    } else {
+        assert(expected == this_id &&
+               "Scene accessed concurrently from more than one thread -- "
+               "see Scene's single-owner + deferred-commands contract");
+        ++scene_.reentrancy_depth_;
+    }
+}
+inline SceneAccessGuard::~SceneAccessGuard() {
+    if (--scene_.reentrancy_depth_ == 0) {
+        scene_.owner_thread_.store(std::thread::id{}, std::memory_order_release);
+    }
+}
+#endif // COOPA_SCENE_THREAD_CHECKS
 
 // Defined out-of-line, after Scene is a complete type — these are the two
 // built-in ISceneSystem bodies declared in scene_system.h.
@@ -432,6 +582,40 @@ inline void BehaviourSystem::execute(Scene& scene, const FrameContext& ctx) {
 
 inline void LateBehaviourSystem::execute(Scene& scene, const FrameContext& ctx) {
     for (auto& obj : scene.root_objects()) obj->late_update(ctx.delta_time);
+}
+
+// SceneCommandBuffer::flush_() is defined out-of-line here too, for the same
+// reason -- it needs Scene as a complete type.
+inline void SceneCommandBuffer::flush_(Scene& scene) {
+    for (auto& op : ops_) {
+        std::visit([&scene](auto& o) {
+            using T = std::decay_t<decltype(o)>;
+            if constexpr (std::is_same_v<T, detail::AddRootObjectOp>) {
+                SceneObject* raw = scene.add_root_object(std::move(o.obj));
+                scene.adopt(*raw);
+            } else if constexpr (std::is_same_v<T, detail::AddChildOp>) {
+                SceneObject* raw = o.parent->add_child(std::move(o.child));
+                scene.adopt(*raw);
+            } else if constexpr (std::is_same_v<T, detail::DestroyObjectOp>) {
+                if (SceneObject* parent = o.obj->parent()) {
+                    parent->detach_child(o.obj); // returned unique_ptr destroyed immediately
+                } else {
+                    scene.remove_root_object(o.obj);
+                }
+            } else if constexpr (std::is_same_v<T, detail::AttachComponentOp>) {
+                o.obj->attach_component(std::move(o.comp));
+            } else if constexpr (std::is_same_v<T, detail::RemoveComponentOp>) {
+                if (o.comp->owner) o.comp->owner->remove_component(o.comp);
+            } else if constexpr (std::is_same_v<T, detail::SetActiveOp>) {
+                o.obj->set_active(o.active);
+            } else if constexpr (std::is_same_v<T, detail::EmitOp>) {
+                scene.events().emit(o.object, o.signal, o.args);
+            } else if constexpr (std::is_same_v<T, detail::CustomOp>) {
+                o.fn(scene);
+            }
+        }, op);
+    }
+    ops_.clear();
 }
 
 } // namespace scene

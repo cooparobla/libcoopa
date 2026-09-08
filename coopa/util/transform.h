@@ -16,6 +16,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/euler_angles.hpp>
 #include <algorithm>
+#include <cassert>
 #include <vector>
 #include <atomic>
 
@@ -31,9 +32,19 @@ namespace util {
  * A dirty flag is set automatically when any local property changes, and propagated
  * to all registered children so their world matrices are recomputed on next access.
  *
- * Thread safety: dirty flag propagation uses std::atomic<bool>. Reading and writing
- * the matrix cache from separate threads requires external synchronization (e.g.
- * compute world matrices in a single serial pass before the render frame begins).
+ * Thread safety: get_world_matrix()/get_local_matrix() lazily mutate the
+ * matrix cache from a const method and are therefore NOT safe to call
+ * concurrently across threads on transforms that might share a parent chain
+ * -- two threads reading anywhere in the same subtree could both write the
+ * same cache. coopa::scene::TransformSystem (see
+ * coopa/scene/systems/transform_system.h) resolves every transform in a
+ * scene, top-down, exactly once per frame; after it has run, world_matrix()
+ * is a pure read, safe for any number of concurrent readers (e.g. every
+ * worker job in a render-list build, or multiple scenes' renderers running
+ * concurrently). Structural edits (set_parent()/add_child()/remove_child())
+ * and property setters (set_position() etc.) remain owner-thread-only, same
+ * as the rest of a Scene -- see Scene's class doc on single-owner + deferred
+ * commands.
  */
 class Transform {
 public:
@@ -173,6 +184,23 @@ public:
     }
 
     /**
+     * @brief Returns the cached world matrix WITHOUT recomputing it, even if dirty.
+     *
+     * Safe for unlimited concurrent readers, unlike get_world_matrix() (see
+     * this class's thread-safety doc) -- call this only after
+     * coopa::scene::TransformSystem's resolve pass has run this frame. In
+     * debug builds, asserts the cache is not dirty, to catch a caller using
+     * this before any resolve pass has run (e.g. on a freshly constructed
+     * Transform, which starts dirty) or before TransformSystem is installed.
+     */
+    const glm::mat4& world_matrix() const {
+        assert(!dirty_.load(std::memory_order_acquire) &&
+               "Transform::world_matrix() read before a resolve pass -- "
+               "call get_world_matrix() instead, or install coopa::scene::TransformSystem");
+        return world_matrix_;
+    }
+
+    /**
      * @brief Returns whether this transform needs recomputation.
      */
     bool is_dirty() const { return dirty_.load(std::memory_order_relaxed); }
@@ -185,11 +213,22 @@ public:
 private:
     /**
      * @brief Marks this transform dirty and propagates to all children.
+     *
+     * Iterative (not recursive) so a deep hierarchy cannot blow the stack.
+     * Uses a thread_local scratch buffer -- mark_dirty() is called on the
+     * owner thread only (see this class's thread-safety doc), but different
+     * scenes' owner threads may call it concurrently on unrelated Transform
+     * graphs, so the buffer must not be shared across threads.
      */
     void mark_dirty() {
-        dirty_.store(true, std::memory_order_relaxed);
-        for (Transform* child : children_) {
-            child->mark_dirty();
+        thread_local std::vector<Transform*> stack;
+        stack.clear();
+        stack.push_back(this);
+        while (!stack.empty()) {
+            Transform* t = stack.back();
+            stack.pop_back();
+            t->dirty_.store(true, std::memory_order_relaxed);
+            for (Transform* child : t->children_) stack.push_back(child);
         }
     }
 
@@ -214,7 +253,16 @@ private:
             world_matrix_ = local_matrix_;
         }
 
-        dirty_.store(false, std::memory_order_relaxed);
+        // Release, pairing with world_matrix()'s debug-only acquire load.
+        // Note this flag's ordering is NOT what makes it safe for another
+        // thread to read world_matrix() after this frame's resolve pass --
+        // that cross-thread happens-before edge comes from the job handle
+        // TransformSystem's resolve job contributes to (its counter's
+        // release-on-completion / acquire-on-is_complete() pair, per
+        // handle.h). This store only needs to be strong enough for the
+        // same-thread debug assert to catch a caller reading a genuinely
+        // stale cache after a real bug, not to establish visibility by itself.
+        dirty_.store(false, std::memory_order_release);
     }
 
     glm::vec3 position_;           /**< Local position. */

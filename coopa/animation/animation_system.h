@@ -9,6 +9,7 @@
 
 #include <coopa/animation/animator.h>
 #include <coopa/job/engine.h>
+#include <coopa/job/parallel_for.h>
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_system.h>
 
@@ -33,19 +34,18 @@ namespace anim {
  * split), and only ever in this fixed order:
  *
  *   1. advance_()  — serial, main thread: clocks, crossfade weights, signals, rebinds.
- *   2. evaluate_() — parallel (via the Scene's JobEngine) once the batch is
- *                    large enough to be worth it, else inline. WORKER-SAFE by
- *                    construction: touches no Component, only const clip data
- *                    and a caller-owned scratch buffer.
+ *   2. evaluate_() — parallel (via the Scene's JobEngine's parallel_for(), see
+ *                    coopa/job/parallel_for.h) once the batch is large enough
+ *                    to be worth it, else inline. WORKER-SAFE by construction:
+ *                    touches no Component, only const clip data and a
+ *                    caller-owned scratch buffer.
  *   3. apply_()    — serial, main thread: writes the accumulated result onto
  *                    every binding's target Component.
  *
- * NEVER calls JobEngine::begin_frame()/end_frame() — Scene alone owns that
- * boundary (see coopa::scene::FrameContext's doc). This system only ever
- * calls create_handle()/submit_jobs()/wait_for() on ctx.jobs, and only
- * within one execute() call — no JobHandle survives past a single frame's
- * begin_frame()/end_frame() pair, since CounterPool is an untagged bump
- * allocator.
+ * NEVER calls JobEngine::begin_frame()/end_frame() — Scene alone drives that
+ * (now diagnostics-only) boundary. This system only ever calls
+ * parallel_for_blocking() on ctx.jobs, which allocates and closes its own
+ * JobHandle within one execute() call.
  */
 class AnimationSystem : public coopa::scene::ISceneSystem {
 public:
@@ -128,25 +128,20 @@ public:
 
 private:
     void evaluate_parallel_(coopa::job::JobEngine& engine) {
-        std::vector<std::function<void()>> chunks;
-        for (size_t start = 0; start < animators_.size(); start += chunk_size_) {
-            size_t end = std::min(start + chunk_size_, animators_.size());
-            chunks.push_back([this, start, end]() {
+        engine.parallel_for_blocking(animators_.size(), chunk_size_,
+            [this](size_t start, size_t end) {
                 for (size_t i = start; i < end; ++i) {
                     animators_[i]->evaluate_(scratch_.data() + offsets_[i]);
                 }
-            });
-        }
-        coopa::job::JobHandle handle = engine.submit_jobs(chunks, k_animation_job_type);
-        engine.wait_for(handle);
+            },
+            k_animation_job_type);
     }
 
     // Follows AssetManager::k_asset_io_job_type's precedent: any value >=
     // k_max_job_types (64) simply opts this job type out of thread
     // dedication and COOPA_JOB_DIAGNOSTICS counters, which is fine here —
-    // this is a single fan-out-then-wait batch with zero inter-job
-    // dependencies, so k_max_inline_dependencies doesn't come into play either.
-    static constexpr JobType k_animation_job_type = 0x0A417000u;
+    // this is a single parallel_for() batch with zero inter-job dependencies.
+    static constexpr coopa::job::JobType k_animation_job_type = 0x0A417000u;
 
     std::vector<Animator*> animators_;
     std::vector<size_t>    offsets_;

@@ -32,6 +32,7 @@ namespace coopa {
 namespace scene {
 
 class Scene;
+class SceneCommandBuffer; // Forward declaration only, for the same reason as JobEngine above.
 
 /**
  * @brief Ordering slots for scene systems, spaced by 100 so a consumer can
@@ -46,10 +47,11 @@ class Scene;
  * LateUpdate order.
  */
 enum class UpdatePhase : int {
-    Physics       = 100, ///< Reserved. No implementation ships with this change.
-    Behaviour     = 200, ///< Built-in: the recursive Component::update() walk.
-    Animation     = 300, ///< coopa::anim::AnimationSystem: evaluate + apply.
-    LateBehaviour = 400, ///< Built-in: the recursive Component::late_update() walk.
+    Physics         = 100, ///< Reserved. No implementation ships with this change.
+    Behaviour       = 200, ///< Built-in: the recursive Component::update() walk.
+    Animation       = 300, ///< coopa::anim::AnimationSystem: evaluate + apply.
+    TransformResolve = 350, ///< coopa::scene::TransformSystem: top-down world-matrix resolve.
+    LateBehaviour   = 400, ///< Built-in: the recursive Component::late_update() walk.
 };
 
 /**
@@ -61,21 +63,41 @@ struct FrameContext {
     uint64_t frame_index = 0;    /**< Monotonically increasing frame counter, from Scene::frame_index(). */
 
     /**
-     * @brief The Scene's frame JobEngine, or nullptr.
+     * @brief The Scene's JobEngine, or nullptr.
      *
      * nullptr means no engine was ever installed via Scene::set_job_engine()
      * — every system must then do its work inline on the calling thread. This
      * is the default, so an application that never touches set_job_engine()
      * spawns no threads and behaves exactly as it did before phases existed.
      *
-     * A system MAY call create_handle()/submit()/submit_jobs()/wait_for() on
-     * this engine. A system MUST NEVER call begin_frame()/end_frame() on it:
-     * Scene owns the frame boundary (see Scene::set_job_engine()'s doc) —
-     * CounterPool is an untagged bump allocator, so a second begin_frame()
-     * from inside a system would silently invalidate every other subsystem's
-     * outstanding handles.
+     * A system MAY call create_handle()/submit()/submit_jobs()/parallel_for()/
+     * wait_for() on this engine, and MAY call begin_frame()/end_frame() on it
+     * (they are diagnostics-only now -- see coopa/job/handle.h -- so unlike
+     * earlier revisions there is no shared frame-boundary state to corrupt by
+     * doing so). This same engine may be installed on multiple Scenes at
+     * once, each processed concurrently as its own job.
      */
     coopa::job::JobEngine* jobs = nullptr;
+
+    /**
+     * @brief This call's deferred command buffer -- see coopa/scene/scene_commands.h.
+     *
+     * A system executing inline (worker_index == k_main_thread_index, the
+     * top-level case Scene::update()/late_update() always pass) may write
+     * through `commands` OR call a mutating Scene/SceneObject method
+     * directly, same as before this existed -- both are safe on the owner
+     * thread. A system that fans work out across jobs (e.g. via
+     * JobEngine::parallel_for()) must have each chunk record into
+     * `scene.commands_for(chunk_ctx.worker_index)` (using ITS OWN
+     * per-chunk JobContext::worker_index, not this outer FrameContext's)
+     * instead of ever calling a mutating Scene/SceneObject method from
+     * inside that chunk.
+     */
+    SceneCommandBuffer* commands = nullptr;
+
+    /// @brief k_main_thread_index (from coopa/job/context.h) for the top-level
+    ///        call; a system fanning out across jobs assigns its own per-chunk value.
+    uint32_t worker_index = 0;
 };
 
 /**

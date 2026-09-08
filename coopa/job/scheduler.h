@@ -8,23 +8,21 @@
  * tracking state.
  */
 
-#ifndef JOBS_SCHEDULER_H
-#define JOBS_SCHEDULER_H
+#ifndef COOPA_JOB_SCHEDULER_H
+#define COOPA_JOB_SCHEDULER_H
 
-#include <vector>
-#include <functional>
-#include <memory>
-#include <numeric>
-#include <mutex>
-#include <iostream>
 #include <algorithm>
+#include <mutex>
 #include <typeindex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
-#include <coopa/job/job.h>
-#include <coopa/job/handle.h>
+#include <coopa/job/context.h>
 #include <coopa/job/engine.h>
+#include <coopa/job/handle.h>
+#include <coopa/job/job.h>
 #include <coopa/job/platform.h>
 
 namespace coopa {
@@ -34,36 +32,32 @@ namespace job {
  * @struct JobNodeDefinition
  * @brief Defines a job's task callback and its component read/write access patterns.
  *
- * Used by JobScheduler to dynamically trace dependency hazards across jobs.
+ * `task` is a TaskWrapper (not std::function<void()>) so a job registered
+ * through JobScheduler pays the same small-buffer-optimized, allocation-free
+ * cost as one submitted directly to JobEngine.
  */
 struct JobNodeDefinition {
-    std::function<void()> task; /**< Callback representing the job's work. */
-    JobType type;               /**< Job type category. */
+    TaskWrapper task;            /**< The job's work. */
+    JobType type = 0;            /**< Job type category. */
     std::vector<std::type_index> read_component_types;  /**< Component type IDs this job reads. */
     std::vector<std::type_index> write_component_types; /**< Component type IDs this job writes. */
-    bool is_main_thread_job; /**< True if this job must execute on the main/render thread. */
+    bool is_main_thread_job = false; /**< True if this job must execute on the main/render thread. */
 
-    /**
-     * @brief Default constructor.
-     */
-    JobNodeDefinition() : type(0), is_main_thread_job(false) {}
+    JobNodeDefinition() = default;
 
     /**
      * @brief Constructs an explicit JobNodeDefinition.
-     * @param fn Task callback.
-     * @param t Job type tag.
-     * @param reads Component types for read-access.
-     * @param writes Component types for write-access.
-     * @param is_main_thread Set to true if main thread execution is required.
+     * @tparam F Callable, `void()` or `void(const JobContext&)`.
      */
+    template<typename F>
     JobNodeDefinition(
-        std::function<void()> fn,
+        F&& fn,
         JobType t,
         std::vector<std::type_index> reads = {},
         std::vector<std::type_index> writes = {},
         bool is_main_thread = false
     ) :
-        task(std::move(fn)),
+        task(std::forward<F>(fn)),
         type(t),
         read_component_types(std::move(reads)),
         write_component_types(std::move(writes)),
@@ -73,11 +67,17 @@ struct JobNodeDefinition {
 
 /**
  * @struct JobNode
- * @brief Represents a job definition combined with its submitted JobHandle.
+ * @brief A main-thread job parked until execute_main_thread_jobs() runs it.
+ *
+ * Unlike a worker-thread job (submitted straight to JobEngine, which resolves
+ * its dependencies via the event-driven dependency graph), a main-thread
+ * job's dependencies are waited on explicitly, right before running its
+ * task, by execute_main_thread_jobs() -- see that method's doc.
  */
 struct JobNode {
-    JobNodeDefinition definition; /**< The job definition. */
-    JobHandle handle; /**< The associated job handle tracking completion status. */
+    TaskWrapper task;                    /**< The job's work. */
+    JobHandle handle;                    /**< This job's own completion handle. */
+    std::vector<JobHandle> dependencies; /**< Waited on (via wait_for_all) before task runs. */
 };
 
 /**
@@ -89,8 +89,13 @@ struct JobNode {
  * - Write-After-Read (WAR): a writer must wait for all prior readers.
  * - Write-After-Write (WAW): a writer must wait for the prior writer.
  *
- * Includes explicit begin_frame()/end_frame() lifecycle methods to prevent
- * unbounded accumulation of tracking state (memory leak fix).
+ * Dependency lists are unbounded -- unlike earlier revisions, they are never
+ * silently truncated to fit an inline array, since JobEngine's own dependency
+ * graph (see dependency_graph.h) has no such limit either.
+ *
+ * begin_frame()/end_frame() still clear this scheduler's own hazard-tracking
+ * maps every frame (that state is genuinely per-frame bookkeeping, unrelated
+ * to JobEngine's now-optional frame boundary).
  */
 class JobScheduler {
 public:
@@ -98,7 +103,7 @@ public:
      * @brief Constructs a JobScheduler associated with a JobEngine.
      * @param engine The JobEngine reference where jobs will be submitted.
      */
-    JobScheduler(JobEngine& engine) : engine_(engine) {}
+    explicit JobScheduler(JobEngine& engine) : engine_(engine) {}
 
     // --- Frame Lifecycle ---
 
@@ -107,31 +112,32 @@ public:
      *
      * Clears all persistent hazard-tracking state (last-writer and active-reader
      * maps) to prevent unbounded memory growth. Also delegates to the engine's
-     * begin_frame() to reset the counter pool.
+     * begin_frame() (diagnostics only).
      *
      * Must be called at the start of each frame/update cycle before any add_job() calls.
      */
     void begin_frame() {
         std::lock_guard<std::mutex> lock(m_mutex_);
-
         persistent_last_writer_handles_.clear();
         persistent_active_reader_handles_.clear();
-
         engine_.begin_frame();
     }
 
     /**
      * @brief Signals the end of a frame.
      *
-     * Clears any residual main-thread job queue and delegates to the engine's
-     * end_frame(). Must be called after all frame work is complete.
+     * Closes (and drops) any main-thread job that execute_main_thread_jobs()
+     * was never called to run this frame, so its handle's slot isn't leaked,
+     * then delegates to the engine's end_frame(). Every main-thread job
+     * queued via add_job()/submit_all() is expected to be run by
+     * execute_main_thread_jobs() before end_frame() -- this is a defensive
+     * fallback, not the intended path.
      */
     void end_frame() {
         std::lock_guard<std::mutex> lock(m_mutex_);
-
+        for (auto& node : main_thread_jobs_queue_) node.handle.close();
         main_thread_jobs_queue_.clear();
         pending_job_definitions_.clear();
-
         engine_.end_frame();
     }
 
@@ -143,28 +149,24 @@ public:
      * Dependencies are automatically calculated upon submission based on
      * read/write component access patterns.
      *
-     * @param task The work function callback.
+     * @tparam F Callable, `void()` or `void(const JobContext&)`.
+     * @param task The work function.
      * @param type The category tag of the job.
      * @param read_types Component Type IDs this job reads.
      * @param write_types Component Type IDs this job writes.
      * @param main_thread True if execution must occur on the main thread.
      */
+    template<typename F>
     void add_job(
-        std::function<void()> task,
+        F&& task,
         JobType type,
         const std::vector<std::type_index>& read_types = {},
         const std::vector<std::type_index>& write_types = {},
         bool main_thread = false
     ) {
         std::lock_guard<std::mutex> lock(m_mutex_);
-
         pending_job_definitions_.emplace_back(
-            std::move(task),
-            type,
-            read_types,
-            write_types,
-            main_thread
-        );
+            std::forward<F>(task), type, read_types, write_types, main_thread);
     }
 
     // --- Submission ---
@@ -174,9 +176,12 @@ public:
      *
      * Builds a dependency graph by analyzing read/write access patterns across
      * all pending job definitions, then submits each job with its computed
-     * dependencies.
+     * dependencies (worker-thread jobs go straight to JobEngine::submit();
+     * main-thread jobs are parked for execute_main_thread_jobs()).
      *
-     * @return A vector of JobHandles representing the submitted jobs.
+     * @return A vector of JobHandles representing the submitted jobs. Every
+     *         one must eventually be closed (wait_for_all() below does not
+     *         do this for you).
      */
     std::vector<JobHandle> submit_all() {
         std::lock_guard<std::mutex> lock(m_mutex_);
@@ -184,125 +189,65 @@ public:
         std::vector<JobHandle> new_job_handles;
         new_job_handles.reserve(pending_job_definitions_.size());
 
-        // Move persistent state into locals for this batch.
         std::unordered_map<std::type_index, JobHandle> last_writer_handles = std::move(persistent_last_writer_handles_);
         std::unordered_map<std::type_index, std::vector<JobHandle>> active_reader_handles = std::move(persistent_active_reader_handles_);
-
-        // Pre-compute write type set for efficient reader-is-also-writer checks.
         std::unordered_set<std::type_index> write_type_set;
 
         for (JobNodeDefinition& def : pending_job_definitions_) {
             std::vector<JobHandle> dependencies;
 
-            // RAW hazard: wait for the last writer of any component we read.
             for (const std::type_index& read_type : def.read_component_types) {
                 auto it = last_writer_handles.find(read_type);
-                if (it != last_writer_handles.end()) {
-                    dependencies.push_back(it->second);
-                }
+                if (it != last_writer_handles.end()) dependencies.push_back(it->second);
             }
 
-            // WAW and WAR hazards: wait for readers and writers of components we write.
             for (const std::type_index& write_type : def.write_component_types) {
-                // WAR: wait for all active readers.
                 auto it_readers = active_reader_handles.find(write_type);
                 if (it_readers != active_reader_handles.end()) {
-                    dependencies.insert(dependencies.end(),
-                                        it_readers->second.begin(),
-                                        it_readers->second.end());
+                    dependencies.insert(dependencies.end(), it_readers->second.begin(), it_readers->second.end());
                     active_reader_handles.erase(it_readers);
                 }
-
-                // WAW: wait for the last writer.
                 auto it_writer = last_writer_handles.find(write_type);
-                if (it_writer != last_writer_handles.end()) {
-                    dependencies.push_back(it_writer->second);
-                }
+                if (it_writer != last_writer_handles.end()) dependencies.push_back(it_writer->second);
             }
 
-            // Deduplicate dependencies using handle index for O(N log N).
             std::sort(dependencies.begin(), dependencies.end(),
-                      [](const JobHandle& a, const JobHandle& b) {
-                          return a.index() < b.index();
-                      });
+                      [](const JobHandle& a, const JobHandle& b) { return a.index() < b.index(); });
             dependencies.erase(
                 std::unique(dependencies.begin(), dependencies.end(),
-                            [](const JobHandle& a, const JobHandle& b) {
-                                return a.index() == b.index();
-                            }),
+                            [](const JobHandle& a, const JobHandle& b) { return a.index() == b.index(); }),
                 dependencies.end());
 
-            // Clamp dependencies to inline capacity.
-            uint8_t dep_count = static_cast<uint8_t>(
-                std::min(dependencies.size(),
-                         static_cast<std::size_t>(k_max_inline_dependencies)));
-
-            // Create a handle for this job.
             JobHandle self_handle = engine_.create_handle();
 
             if (def.is_main_thread_job) {
-                // Main-thread job: wrap with dependency waiting.
-                auto* counter = self_handle.get_counter();
-                if (counter) {
-                    counter->fetch_add(1, std::memory_order_release);
-                }
-
-                // Capture dependencies and task for main-thread execution.
-                std::vector<JobHandle> captured_deps(dependencies.begin(),
-                                                      dependencies.begin() + dep_count);
-                auto captured_task = std::move(def.task);
-                JobEngine* engine_ptr = &engine_;
-
-                std::function<void()> wrapped_task = [
-                    task = std::move(captured_task),
-                    dep_handles = std::move(captured_deps),
-                    engine_ref = engine_ptr
-                ]() mutable {
-                    for (const auto& handle : dep_handles) {
-                        engine_ref->wait_for(handle);
-                    }
-                    task();
-                };
-
+                self_handle.add_jobs_(1);
                 JobNode node;
-                node.definition = def;
-                node.definition.task = std::move(wrapped_task);
+                node.task = std::move(def.task);
                 node.handle = self_handle;
+                node.dependencies = std::move(dependencies);
                 main_thread_jobs_queue_.push_back(std::move(node));
-
             } else {
-                // Worker-thread job: submit to engine with dependencies.
-                engine_.submit(
-                    std::move(def.task),
-                    def.type,
-                    self_handle,
-                    dep_count > 0 ? dependencies.data() : nullptr,
-                    dep_count
-                );
+                engine_.submit(std::move(def.task), def.type, self_handle,
+                                dependencies.data(), static_cast<uint32_t>(dependencies.size()));
             }
 
             new_job_handles.push_back(self_handle);
 
-            // Update tracking maps.
             for (const std::type_index& write_type : def.write_component_types) {
                 last_writer_handles[write_type] = self_handle;
             }
 
-            // Build write set for this job.
             write_type_set.clear();
-            for (const std::type_index& wt : def.write_component_types) {
-                write_type_set.insert(wt);
-            }
+            for (const std::type_index& wt : def.write_component_types) write_type_set.insert(wt);
 
             for (const std::type_index& read_type : def.read_component_types) {
-                // Only track as reader if not also a writer of the same component.
                 if (write_type_set.find(read_type) == write_type_set.end()) {
                     active_reader_handles[read_type].push_back(self_handle);
                 }
             }
         }
 
-        // Persist state for the next submit_all() call within this frame.
         persistent_last_writer_handles_ = std::move(last_writer_handles);
         persistent_active_reader_handles_ = std::move(active_reader_handles);
         pending_job_definitions_.clear();
@@ -313,35 +258,39 @@ public:
     // --- Main Thread Execution ---
 
     /**
-     * @brief Executes all enqueued main-thread jobs sequentially.
+     * @brief Executes every enqueued main-thread job, in submission order,
+     *        on the calling (main/render) thread.
      *
-     * This function must be called on the main/render thread once per update
-     * loop. Jobs are executed in submission order.
+     * For each job, first blocks (via JobEngine::wait_for_all(), which lets
+     * this thread help execute other work while it waits) until every one of
+     * that job's dependencies is complete, then runs its task, then resolves
+     * its own completion bookkeeping via JobEngine::complete_external_job()
+     * so anything depending on THIS job is woken correctly. Must be called
+     * once per frame, after submit_all().
      */
     void execute_main_thread_jobs() {
-        std::lock_guard<std::mutex> lock(m_mutex_);
-
-        for (JobNode& node : main_thread_jobs_queue_) {
-            node.definition.task();
-            auto* counter = node.handle.get_counter();
-            if (counter) {
-                counter->fetch_sub(1, std::memory_order_release);
-            }
+        std::vector<JobNode> jobs;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex_);
+            jobs = std::move(main_thread_jobs_queue_);
+            main_thread_jobs_queue_.clear();
         }
 
-        main_thread_jobs_queue_.clear();
+        for (JobNode& node : jobs) {
+            if (!node.dependencies.empty()) {
+                engine_.wait_for_all(node.dependencies);
+            }
+            JobContext ctx{engine_.worker_index(), &engine_, node.handle};
+            node.task(ctx);
+            engine_.complete_external_job(node.handle);
+        }
     }
 
     // --- Waiting ---
 
-    /**
-     * @brief Blocks the current thread until all handles in the batch are completed.
-     * @param batch_handles List of job handles to wait for.
-     */
+    /// @brief Blocks the current thread until every handle in the batch is complete.
     void wait_for_all(const std::vector<JobHandle>& batch_handles) {
-        for (const auto& h : batch_handles) {
-            engine_.wait_for(h);
-        }
+        engine_.wait_for_all(batch_handles);
     }
 
 private:
@@ -360,4 +309,4 @@ private:
 } // namespace job
 } // namespace coopa
 
-#endif // JOBS_SCHEDULER_H
+#endif // COOPA_JOB_SCHEDULER_H

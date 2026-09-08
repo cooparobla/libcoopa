@@ -7,6 +7,7 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <stdexcept>
 #include <cstdio> // For std::remove
@@ -30,8 +31,11 @@
 #include <coopa/job/collections/work_stealing_deque.h>
 #include <coopa/job/job.h>
 #include <coopa/job/handle.h>
+#include <coopa/job/context.h>
+#include <coopa/job/dependency_graph.h>
 #include <coopa/job/thread.h>
 #include <coopa/job/engine.h>
+#include <coopa/job/parallel_for.h>
 #include <coopa/job/scheduler.h>
 #include <coopa/event/signal.h>
 #include <coopa/asset/asset_manager.h>
@@ -39,7 +43,10 @@
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_system.h>
+#include <coopa/scene/scene_commands.h>
 #include <coopa/scene/scene_loader.h>
+#include <coopa/scene/scene_manager.h>
+#include <coopa/scene/systems/transform_system.h>
 #include <coopa/animation/keyframe.h>
 #include <coopa/animation/animation_curve.h>
 #include <coopa/animation/animation_clip.h>
@@ -604,6 +611,258 @@ void test_work_stealing_deque_no_torn_moves_under_contention() {
     }
 }
 
+// ---------------------------------------------------------
+// Job system rework: generation-tagged handles, unbounded
+// dependencies, parallel_for, cancellation, priority.
+// ---------------------------------------------------------
+
+void test_job_handle_generation_prevents_stale_aliasing() {
+    coopa::job::JobEngine engine(2, 8, 4); // handle_pool_capacity = 4
+    coopa::job::JobHandle first = engine.create_handle();
+    ASSERT_TRUE(first.is_valid());
+    engine.submit([]{}, 0, first);
+    engine.wait_for(first);
+    ASSERT_TRUE(first.is_complete());
+
+    coopa::job::JobHandle stale_copy = first; // same slot + generation
+    first.close(); // returns the slot to the free list
+
+    std::vector<coopa::job::JobHandle> churn;
+    for (int i = 0; i < 4; ++i) {
+        auto h = engine.create_handle();
+        ASSERT_TRUE(h.is_valid());
+        churn.push_back(h);
+    }
+
+    // stale_copy's generation can no longer match whichever handle now
+    // occupies that slot -- it must report complete regardless, and must
+    // never be mistaken for one of the new occupants.
+    ASSERT_TRUE(stale_copy.is_complete());
+    for (auto& h : churn) {
+        ASSERT_TRUE(!(h == stale_copy));
+        h.close();
+    }
+}
+
+void test_job_engine_fan_in_16_dependencies() {
+    // The previous design silently truncated dependency lists to
+    // k_max_inline_dependencies (4); this exercises 16 to prove that cliff
+    // is gone.
+    coopa::job::JobEngine engine(4);
+    constexpr int kDeps = 16;
+    std::atomic<int> completed{0};
+    std::vector<coopa::job::JobHandle> deps;
+    for (int i = 0; i < kDeps; ++i) {
+        auto h = engine.create_handle();
+        engine.submit([&completed]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            completed.fetch_add(1, std::memory_order_release);
+        }, 0, h);
+        deps.push_back(h);
+    }
+
+    coopa::job::JobHandle final_handle = engine.create_handle();
+    bool all_done_before_final = false;
+    engine.submit([&]() {
+        all_done_before_final = (completed.load(std::memory_order_acquire) == kDeps);
+    }, 0, final_handle, deps.data(), static_cast<uint32_t>(deps.size()));
+
+    engine.wait_for(final_handle);
+    ASSERT_EQ(completed.load(), kDeps);
+    ASSERT_TRUE(all_done_before_final);
+
+    for (auto& h : deps) h.close();
+    final_handle.close();
+}
+
+void test_job_engine_deque_overflow_falls_back_to_global_queue() {
+    // Small per-priority deque capacity so a single worker spawning many
+    // child jobs onto its own deque is guaranteed to overflow it (200
+    // children > 64 capacity). A full deque must fall back to the global
+    // queue rather than lose the job.
+    //
+    // Deliberately not smaller than this: WorkStealingDeque's fixed-size
+    // ring buffer (like other classic Chase-Lev implementations) assumes a
+    // thief's steal() -- which reserves a slot via a CAS on top_ and only
+    // *then* reads out of it -- completes before the owner wraps around and
+    // reuses that same physical slot for a new push(). That assumption holds
+    // overwhelmingly in real workloads (capacity is normally in the
+    // thousands), but shrinking capacity far enough relative to how hard a
+    // single test hammers push()/steal() concurrently (e.g. capacity 4 with
+    // this same 200-iteration loop) can make the reuse race observable under
+    // ThreadSanitizer. This is a property of the fixed-capacity Chase-Lev
+    // design generally, not something introduced by any specific caller.
+    coopa::job::JobEngine engine(1, 64);
+    constexpr int kChildren = 200;
+    std::atomic<int> ran{0};
+    coopa::job::JobHandle handle = engine.create_handle();
+    engine.submit([&engine, handle, &ran]() {
+        for (int i = 0; i < kChildren; ++i) {
+            engine.submit([&ran]() { ran.fetch_add(1, std::memory_order_relaxed); }, 0, handle);
+        }
+    }, 0, handle);
+
+    engine.wait_for(handle);
+    ASSERT_EQ(ran.load(), kChildren);
+    handle.close();
+}
+
+void test_job_engine_counter_pool_exhaustion_recovers() {
+    coopa::job::JobEngine engine(2, 64, 2); // handle_pool_capacity = 2
+    coopa::job::JobHandle a = engine.create_handle();
+    coopa::job::JobHandle b = engine.create_handle();
+    ASSERT_TRUE(a.is_valid());
+    ASSERT_TRUE(b.is_valid());
+
+    coopa::job::JobHandle c = engine.create_handle();
+    ASSERT_TRUE(!c.is_valid()); // pool exhausted
+
+    engine.submit([]{}, 0, a);
+    engine.wait_for(a);
+    a.close(); // frees one slot
+
+    coopa::job::JobHandle recovered = engine.create_handle();
+    ASSERT_TRUE(recovered.is_valid()); // pool recovered after a close(), no frame boundary needed
+
+    engine.submit([]{}, 0, b);
+    engine.wait_for(b);
+    b.close();
+    engine.submit([]{}, 0, recovered);
+    engine.wait_for(recovered);
+    recovered.close();
+}
+
+void test_job_engine_nested_wait_for_from_worker() {
+    // Single worker: `inner` can only ever be picked up by this same worker
+    // acting as a real worker during its nested wait_for(), not by another
+    // worker stealing it -- a genuine regression tripwire for the guest-only
+    // wait_for() that used to be unable to touch its own deque.
+    coopa::job::JobEngine engine(1);
+    std::atomic<bool> inner_ran{false};
+
+    coopa::job::JobHandle outer = engine.create_handle();
+    engine.submit([&engine, &inner_ran]() {
+        coopa::job::JobHandle inner = engine.create_handle();
+        engine.submit([&inner_ran]() { inner_ran.store(true, std::memory_order_release); }, 0, inner);
+        engine.wait_for(inner); // must not deadlock
+        inner.close();
+    }, 0, outer);
+
+    engine.wait_for(outer);
+    ASSERT_TRUE(inner_ran.load());
+    outer.close();
+}
+
+void test_job_engine_parallel_for_covers_range_exactly_once() {
+    coopa::job::JobEngine engine(4);
+    auto check = [&engine](size_t count, size_t grain) {
+        std::vector<std::atomic<int>> hits(count > 0 ? count : 1);
+        for (auto& h : hits) h.store(0);
+        engine.parallel_for_blocking(count, grain, [&hits](size_t start, size_t end) {
+            for (size_t i = start; i < end; ++i) hits[i].fetch_add(1, std::memory_order_relaxed);
+        });
+        for (size_t i = 0; i < count; ++i) {
+            ASSERT_EQ(hits[i].load(), 1);
+        }
+    };
+    check(100, 1);
+    check(100, 100); // one chunk
+    check(100, 0);   // auto grain
+    check(0, 4);     // empty range -- no chunks, no crash
+    check(3, 10);    // count < grain -- exactly one chunk covering [0,3)
+}
+
+void test_job_engine_cancel_skips_body_but_releases_counter() {
+    coopa::job::JobEngine engine(2);
+    std::atomic<bool> gate_open{false};
+    std::atomic<bool> ran{false};
+
+    coopa::job::JobHandle gate = engine.create_handle();
+    engine.submit([&gate_open]() {
+        while (!gate_open.load(std::memory_order_acquire)) std::this_thread::yield();
+    }, 0, gate);
+
+    coopa::job::JobHandle handle = engine.create_handle();
+    coopa::job::JobHandle deps[] = { gate };
+    engine.submit([&ran]() { ran.store(true); }, 0, handle, deps, 1);
+
+    engine.cancel(handle); // cancel while still parked on `gate`
+    gate_open.store(true, std::memory_order_release);
+
+    engine.wait_for(handle);
+    ASSERT_TRUE(!ran.load());
+    gate.close();
+    handle.close();
+}
+
+void test_job_engine_priority_ordering_single_worker() {
+    coopa::job::JobEngine engine(1);
+    std::atomic<bool> gate_open{false};
+    coopa::job::JobHandle gate = engine.create_handle();
+    engine.submit([&gate_open]() {
+        while (!gate_open.load(std::memory_order_acquire)) std::this_thread::yield();
+    }, 0, gate);
+
+    std::vector<int> order;
+    std::mutex order_mutex;
+    coopa::job::JobHandle low = engine.create_handle();
+    coopa::job::JobHandle high = engine.create_handle();
+    engine.submit([&]() { std::lock_guard<std::mutex> l(order_mutex); order.push_back(0); },
+                  0, low, nullptr, 0u, coopa::job::Priority::Low);
+    engine.submit([&]() { std::lock_guard<std::mutex> l(order_mutex); order.push_back(1); },
+                  0, high, nullptr, 0u, coopa::job::Priority::High);
+
+    gate_open.store(true, std::memory_order_release);
+    engine.wait_for(low);
+    engine.wait_for(high);
+
+    ASSERT_EQ(order.size(), static_cast<size_t>(2));
+    ASSERT_EQ(order[0], 1); // High ran before Low
+    ASSERT_EQ(order[1], 0);
+
+    gate.close();
+    low.close();
+    high.close();
+}
+
+void test_job_handle_survives_begin_end_frame() {
+    coopa::job::JobEngine engine(2);
+    coopa::job::JobHandle handle = engine.create_handle();
+    engine.begin_frame();
+    engine.end_frame();
+    engine.begin_frame(); // a second begin_frame -- must NOT invalidate `handle`
+
+    std::atomic<bool> ran{false};
+    engine.submit([&ran]() { ran.store(true); }, 0, handle);
+    engine.wait_for(handle);
+    ASSERT_TRUE(ran.load());
+    engine.end_frame();
+    handle.close();
+}
+
+void test_job_engine_shared_across_frames_and_subsystems() {
+    // Simulates two independent subsystems sharing one engine across several
+    // frames with no coordination beyond the engine itself -- the pattern
+    // that used to require AssetManager to own a private JobEngine.
+    coopa::job::JobEngine engine(2);
+    std::atomic<int> subsystem_a_count{0};
+    std::atomic<int> subsystem_b_count{0};
+    for (int frame = 0; frame < 5; ++frame) {
+        engine.begin_frame();
+        coopa::job::JobHandle a = engine.create_handle();
+        coopa::job::JobHandle b = engine.create_handle();
+        engine.submit([&]() { subsystem_a_count.fetch_add(1); }, 0, a);
+        engine.submit([&]() { subsystem_b_count.fetch_add(1); }, 0, b);
+        engine.wait_for(a);
+        engine.wait_for(b);
+        a.close();
+        b.close();
+        engine.end_frame();
+    }
+    ASSERT_EQ(subsystem_a_count.load(), 5);
+    ASSERT_EQ(subsystem_b_count.load(), 5);
+}
+
 void test_debug_logging() {
     coopa::debug::Logger logger("TestLogger");
     logger.info("This is an info log");
@@ -929,7 +1188,13 @@ void test_asset_manager_sync_load_and_cache() {
     ASSERT_TRUE(!h3.error().empty());
     std::remove(other_file.c_str());
 
-    assets.shutdown();
+    // No explicit assets.shutdown() here: h1/h2/h3 are still live handles
+    // into assets' slots, and shutdown() destroys every AssetSlot (see its
+    // doc) -- dereferencing a handle afterward, including implicitly via its
+    // destructor, is a use-after-free. AssetManager's own destructor calls
+    // shutdown() for us, at function-exit time, which is safe here because
+    // `assets` is declared before h1/h2/h3 and so (per C++'s reverse local
+    // destruction order) is destroyed only after they already are.
     std::remove(test_file.c_str());
 }
 
@@ -960,7 +1225,8 @@ void test_asset_manager_rejects_type_mismatch() {
     ASSERT_TRUE(text_handle.is_loaded());
     ASSERT_EQ(text_handle->contents, "shared path");
 
-    assets.shutdown();
+    // No explicit shutdown() -- see test_asset_manager_sync_load_and_cache's
+    // comment; text_handle is still live here.
     std::remove(test_file.c_str());
 }
 
@@ -996,7 +1262,8 @@ void test_asset_manager_base_dir_prevents_collision() {
     ASSERT_TRUE(assets.get<TextAsset>("shared.txt", dir_a).get() == handle_a.get());
     ASSERT_TRUE(assets.get<TextAsset>("shared.txt", dir_b).get() == handle_b.get());
 
-    assets.shutdown();
+    // No explicit shutdown() -- see test_asset_manager_sync_load_and_cache's
+    // comment; handle_a/handle_b are still live here.
     std::filesystem::remove_all(dir_a);
     std::filesystem::remove_all(dir_b);
 }
@@ -1030,7 +1297,8 @@ void test_asset_manager_async_load() {
     ASSERT_TRUE(handle2.is_loaded());
     ASSERT_TRUE(handle2.get() == handle.get());
 
-    assets.shutdown();
+    // No explicit shutdown() -- see test_asset_manager_sync_load_and_cache's
+    // comment; handle/handle2 are still live here.
     std::remove(test_file.c_str());
 }
 
@@ -1073,7 +1341,9 @@ void test_asset_manager_hot_reload() {
     ASSERT_EQ(handle.revision(), 2u);
     ASSERT_EQ(handle->contents, "reloaded contents");  // same handle, new payload
 
-    assets.shutdown();
+    // No explicit shutdown() -- see test_asset_manager_sync_load_and_cache's
+    // comment; handle is still live here (conn is destroyed before assets
+    // regardless, per reverse local-destruction order, so it never dangles).
     std::remove(test_file.c_str());
 }
 
@@ -1137,8 +1407,17 @@ void test_asset_manager_shutdown_drains_pending() {
         ofs << "in flight";
     }
 
-    auto handle = assets.load_async<TextAsset>(test_file);
-    ASSERT_TRUE(handle.is_valid());
+    {
+        // Scoped so `handle` is destroyed (a harmless ref_count decrement on
+        // a still-live slot) BEFORE shutdown() runs below -- shutdown()
+        // destroys every AssetSlot (see its doc), and AssetHandle::
+        // release_() (run by both its destructor and its assignment
+        // operators) dereferences the slot unconditionally, so there is no
+        // safe way to touch this handle again, including by reassigning it,
+        // once shutdown() has executed.
+        auto handle = assets.load_async<TextAsset>(test_file);
+        ASSERT_TRUE(handle.is_valid());
+    }
 
     // Deliberately do not call update() first -- shutdown() itself must
     // wait for the in-flight decode() job and run finalize() before tearing
@@ -1243,7 +1522,8 @@ void test_asset_manager_create_republishes_with_grace_period() {
     }
     ASSERT_TRUE(*a_gone);
 
-    assets.shutdown();
+    // No explicit shutdown() -- see test_asset_manager_sync_load_and_cache's
+    // comment; handle is still live here.
 }
 
 void test_asset_manager_idle_eviction_defers_payload_destruction() {
@@ -1715,9 +1995,10 @@ private:
 
 /**
  * @brief Every execute() call creates a handle, submits one trivial job onto
- *        it, and waits for it — exercising the exact JobEngine usage pattern
- *        AnimationSystem follows, without ever calling begin_frame()/
- *        end_frame() itself (Scene alone does that).
+ *        it, waits for it, and closes it — exercising the exact JobEngine
+ *        usage pattern AnimationSystem follows, without ever calling
+ *        begin_frame()/end_frame() itself (that boundary is diagnostics-only
+ *        now and optional -- see coopa/job/handle.h).
  */
 class JobUsingSystem : public coopa::scene::ISceneSystem {
 public:
@@ -1728,6 +2009,7 @@ public:
         if (!h.is_valid()) { *all_valid_ = false; return; }
         ctx.jobs->submit([] {}, 0, h);
         ctx.jobs->wait_for(h);
+        h.close();
     }
     const char* system_name() const override { return "JobUsing"; }
 private:
@@ -1815,17 +2097,23 @@ void test_scene_late_update_standalone() {
 void test_scene_frame_boundary_update_only() {
     using namespace scene_pipeline_test;
 
-    // Tiny pool capacity (8): if Scene::update() failed to reset the frame
-    // boundary every call (the blendy/toyengine shape — update() only, never
-    // late_update()), create_handle() would start returning invalid handles
-    // well before 50 frames.
-    coopa::job::JobEngine engine(2, 8);
+    // Regression coverage for the old design: Scene::update() used to have
+    // to reset the engine's frame boundary itself every call for a caller
+    // that only ever calls update() and never late_update() (the
+    // blendy/toyengine shape), since CounterPool was an untagged bump
+    // allocator only ever reclaimable in bulk. Now that handles are
+    // individually reclaimed (see coopa/job/handle.h), Scene no longer
+    // touches the frame boundary at all -- this runs far more iterations
+    // than the tiny handle pool capacity (4) could hold at once, relying
+    // entirely on JobUsingSystem's own handle.close() each call to keep the
+    // pool from ever exhausting.
+    coopa::job::JobEngine engine(2, 64, 4);
     coopa::scene::Scene scene("FrameBoundaryUpdateOnly");
     scene.set_job_engine(&engine);
     bool all_valid = true;
     scene.add_system(std::make_unique<JobUsingSystem>(&all_valid), 250);
 
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 0; i < 200; ++i) {
         scene.update(0.016f);
     }
     ASSERT_TRUE(all_valid);
@@ -1880,6 +2168,256 @@ void test_scene_move_preserves_systems() {
     moved.update(0.016f);
     ASSERT_EQ(log.size(), static_cast<size_t>(1));
     moved.late_update(0.016f);
+    engine.shutdown();
+}
+
+// ---------------------------------------------------------
+// Multi-scene processing, deferred SceneCommandBuffer, and
+// TransformSystem (Job system rework, part 2: Scenes)
+// ---------------------------------------------------------
+
+namespace scene_jobify_test {
+
+/// @brief Fans out one chunk per JobEngine worker, each recording an add_root_object()
+/// into its OWN SceneCommandBuffer -- exercises FrameContext::commands/worker_index.
+class SpawnPerWorkerSystem : public coopa::scene::ISceneSystem {
+public:
+    const char* system_name() const override { return "SpawnPerWorker"; }
+    void execute(coopa::scene::Scene& scene, const coopa::scene::FrameContext& ctx) override {
+        if (!ctx.jobs || ctx.jobs->worker_count() == 0) return;
+        ctx.jobs->parallel_for_blocking(ctx.jobs->worker_count(), 1,
+            [&scene](size_t start, size_t end, const coopa::job::JobContext& jctx) {
+                for (size_t i = start; i < end; ++i) {
+                    auto obj = std::make_unique<coopa::scene::SceneObject>(
+                        "FromWorker" + std::to_string(jctx.worker_index));
+                    scene.commands_for(jctx.worker_index).add_root_object(std::move(obj));
+                }
+            });
+    }
+};
+
+} // namespace scene_jobify_test
+
+void test_scene_command_buffer_flushes_in_ascending_worker_index_order() {
+    // Deterministic: records directly into each worker's buffer (any thread
+    // may call commands_for(i) -- only the CONVENTION is that worker i
+    // writes its own buffer, nothing stops a test setting them up directly)
+    // in REVERSE index order, to prove flush_commands() applies them in
+    // ascending buffer-index order rather than recording order.
+    coopa::job::JobEngine engine(4);
+    coopa::scene::Scene scene("CommandBufferOrder");
+    scene.set_job_engine(&engine); // sizes the per-worker buffers
+
+    for (uint32_t i = engine.worker_count(); i-- > 0; ) {
+        auto obj = std::make_unique<coopa::scene::SceneObject>("FromWorker" + std::to_string(i));
+        scene.commands_for(i).add_root_object(std::move(obj));
+    }
+
+    size_t before = scene.root_objects().size();
+    scene.flush_commands();
+    size_t after = scene.root_objects().size();
+
+    ASSERT_EQ(after - before, static_cast<size_t>(engine.worker_count()));
+    for (uint32_t i = 0; i < engine.worker_count(); ++i) {
+        ASSERT_EQ(scene.root_objects()[before + i]->name(), std::string("FromWorker") + std::to_string(i));
+    }
+    engine.shutdown();
+}
+
+void test_scene_command_buffer_parallel_writes_all_land_exactly_once() {
+    // Realistic usage: a system fans out via parallel_for(), each chunk
+    // writing into its OWN buffer via commands_for(jctx.worker_index). Which
+    // physical worker ends up running a given chunk is NOT guaranteed
+    // one-to-one with the chunk's logical index (work-stealing may let one
+    // fast worker grab more than one chunk) -- so this only asserts the
+    // aggregate invariant that matters: every recorded command lands exactly
+    // once, with none lost or duplicated, regardless of that mapping.
+    using namespace scene_jobify_test;
+
+    coopa::job::JobEngine engine(4);
+    coopa::scene::Scene scene("CommandBufferParallel");
+    scene.set_job_engine(&engine);
+    scene.add_system(std::make_unique<SpawnPerWorkerSystem>(), 250);
+
+    size_t before = scene.root_objects().size();
+    scene.update(0.016f);
+    scene.late_update(0.016f); // flush_commands() runs here
+
+    size_t spawned_count = 0;
+    for (auto& root : scene.root_objects()) {
+        if (root->name().rfind("FromWorker", 0) == 0) ++spawned_count;
+    }
+    ASSERT_EQ(spawned_count, static_cast<size_t>(engine.worker_count()));
+    ASSERT_EQ(scene.root_objects().size(), before + spawned_count);
+
+    engine.shutdown();
+}
+
+void test_scene_manager_concurrent_scenes_match_serial() {
+    using namespace scene_pipeline_test;
+
+    coopa::job::JobEngine engine(4);
+    coopa::scene::SceneManager mgr;
+    mgr.set_job_engine(&engine);
+
+    std::vector<CountingComponent*> counters;
+    for (int s = 0; s < 6; ++s) {
+        auto scene = std::make_unique<coopa::scene::Scene>("S" + std::to_string(s));
+        for (int i = 0; i < 20; ++i) {
+            auto obj = std::make_unique<coopa::scene::SceneObject>("Obj");
+            counters.push_back(obj->add_component<CountingComponent>());
+            scene->add_root_object(std::move(obj));
+        }
+        mgr.add_scene(std::move(scene));
+    }
+
+    // Six scenes concurrently processed across four workers, three frames --
+    // if two of Scene's methods ever ran concurrently on the SAME Scene,
+    // COOPA_SCENE_THREAD_CHECKS (on for this test binary) would abort.
+    for (int frame = 0; frame < 3; ++frame) {
+        mgr.begin_frame();
+        mgr.update(0.016f);
+        mgr.late_update(0.016f);
+        mgr.end_frame();
+    }
+
+    for (auto* c : counters) {
+        ASSERT_EQ(c->update_count, 3);
+    }
+    engine.shutdown();
+}
+
+void test_scene_manager_no_engine_additive_active_remove() {
+    using namespace scene_pipeline_test;
+
+    coopa::scene::SceneManager mgr; // no engine installed -- serial fallback path
+    std::vector<CountingComponent*> counters;
+    coopa::scene::Scene* first = nullptr;
+    std::vector<coopa::scene::Scene*> raws;
+    for (int s = 0; s < 3; ++s) {
+        auto scene = std::make_unique<coopa::scene::Scene>("S" + std::to_string(s));
+        auto obj = std::make_unique<coopa::scene::SceneObject>("Obj");
+        counters.push_back(obj->add_component<CountingComponent>());
+        scene->add_root_object(std::move(obj));
+        coopa::scene::Scene* raw = mgr.add_scene(std::move(scene));
+        raws.push_back(raw);
+        if (s == 0) first = raw;
+    }
+    ASSERT_TRUE(mgr.has_scene());
+    ASSERT_TRUE(&mgr.get_active_scene() == first); // first scene added becomes active
+    ASSERT_EQ(mgr.scenes().size(), static_cast<size_t>(3));
+
+    mgr.update(0.016f);
+    mgr.late_update(0.016f);
+    for (auto* c : counters) ASSERT_EQ(c->update_count, 1);
+
+    mgr.set_scene_active(raws[1], false);
+    mgr.update(0.016f);
+    mgr.late_update(0.016f);
+    ASSERT_EQ(counters[0]->update_count, 2);
+    ASSERT_EQ(counters[1]->update_count, 1); // unchanged -- inactive
+    ASSERT_EQ(counters[2]->update_count, 2);
+
+    ASSERT_TRUE(mgr.remove_scene(raws[1]));
+    ASSERT_EQ(mgr.scenes().size(), static_cast<size_t>(2));
+    ASSERT_TRUE(!mgr.remove_scene(raws[1])); // already removed
+}
+
+void test_transform_system_matches_lazy_resolve() {
+    using namespace coopa::scene;
+
+    auto build = [](Scene& scene) {
+        auto root = std::make_unique<SceneObject>("Root");
+        auto* root_tc = root->add_component<TransformComponent>();
+        root_tc->transform().set_position({1.0f, 2.0f, 3.0f});
+        for (int i = 0; i < 5; ++i) {
+            auto child = std::make_unique<SceneObject>("Child" + std::to_string(i));
+            auto* child_tc = child->add_component<TransformComponent>();
+            child_tc->set_parent_transform(&root_tc->transform());
+            child_tc->transform().set_position({static_cast<float>(i), 0.0f, 0.0f});
+            root->add_child(std::move(child));
+        }
+        scene.add_root_object(std::move(root));
+    };
+
+    Scene lazy_scene("Lazy");
+    build(lazy_scene);
+    std::vector<glm::mat4> lazy_matrices;
+    for (auto& child : lazy_scene.root_objects()[0]->children()) {
+        lazy_matrices.push_back(child->get_transform()->get_world_matrix());
+    }
+
+    coopa::job::JobEngine engine(4);
+    Scene resolved_scene("Resolved");
+    build(resolved_scene);
+    resolved_scene.set_job_engine(&engine);
+    install_transform_system(resolved_scene);
+    resolved_scene.start();
+    resolved_scene.update(0.016f);  // runs TransformSystem
+    resolved_scene.late_update(0.016f);
+
+    size_t i = 0;
+    for (auto& child : resolved_scene.root_objects()[0]->children()) {
+        ASSERT_TRUE(!child->get_transform()->transform().is_dirty());
+        glm::mat4 resolved = child->get_transform()->transform().world_matrix();
+        glm::mat4 expected = lazy_matrices[i++];
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                ASSERT_TRUE(std::abs(resolved[r][c] - expected[r][c]) < 1e-6f);
+            }
+        }
+    }
+    engine.shutdown();
+}
+
+void test_transform_system_concurrent_reads_are_race_free() {
+    using namespace coopa::scene;
+
+    Scene scene("ConcurrentReads");
+    auto root = std::make_unique<SceneObject>("Root");
+    auto* root_tc = root->add_component<TransformComponent>();
+    constexpr int kChildren = 64;
+    for (int i = 0; i < kChildren; ++i) {
+        auto child = std::make_unique<SceneObject>("Child" + std::to_string(i));
+        auto* tc = child->add_component<TransformComponent>();
+        tc->set_parent_transform(&root_tc->transform());
+        tc->transform().set_position({static_cast<float>(i), 0.0f, 0.0f});
+        root->add_child(std::move(child));
+    }
+    scene.add_root_object(std::move(root));
+
+    coopa::job::JobEngine engine(4);
+    scene.set_job_engine(&engine);
+    install_transform_system(scene);
+    scene.start();
+    scene.update(0.016f);
+    scene.late_update(0.016f);
+
+    auto& children = scene.root_objects()[0]->children();
+    std::vector<float> expected_x(children.size());
+    for (size_t i = 0; i < children.size(); ++i) {
+        expected_x[i] = children[i]->get_transform()->transform().world_matrix()[3].x;
+    }
+
+    // Every transform is clean after the resolve pass (world_matrix() itself
+    // asserts this in debug builds) -- read every child's world_matrix()
+    // concurrently, many times over, from several jobs at once. A race in
+    // the underlying cache would corrupt a value or trip that assert;
+    // recording a mismatch here (rather than asserting from inside the job
+    // body) keeps a failure from becoming an uncaught-exception abort on a
+    // worker thread.
+    std::atomic<bool> mismatch{false};
+    engine.parallel_for_blocking(children.size(), 1, [&](size_t start, size_t end) {
+        for (int rep = 0; rep < 50; ++rep) {
+            for (size_t i = start; i < end; ++i) {
+                float got = children[i]->get_transform()->transform().world_matrix()[3].x;
+                if (std::abs(got - expected_x[i]) >= 1e-6f) {
+                    mismatch.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+    ASSERT_TRUE(!mismatch.load());
     engine.shutdown();
 }
 
@@ -2412,7 +2950,8 @@ void test_animation_clip_loader_yaml() {
     ASSERT_TRUE(bad.is_failed());
     ASSERT_TRUE(!bad.error().empty());
 
-    assets.shutdown();
+    // No explicit shutdown() -- see test_asset_manager_sync_load_and_cache's
+    // comment; good/bad are still live handles here.
 }
 
 void test_animator_scene_yaml_registration() {
@@ -2448,30 +2987,36 @@ void test_animator_scene_yaml_registration() {
     assets.add_search_root(std::filesystem::path(clip_path).parent_path().string());
     register_animation_components(assets);
 
-    Scene scene = SceneLoader::load(scene_path);
-    install_animation_system(scene);
+    {
+        // Scoped so `scene` (whose Animator holds an AssetHandle<AnimationClip>
+        // bound to `assets`) is destroyed BEFORE assets.shutdown() runs below
+        // -- shutdown() destroys every AssetSlot (see its doc), and that
+        // handle's destructor dereferences the slot unconditionally.
+        Scene scene = SceneLoader::load(scene_path);
+        install_animation_system(scene);
 
-    auto* obj = scene.find_object("Obj");
-    ASSERT_TRUE(obj != nullptr);
-    auto* animator = obj->get_component<Animator>();
-    ASSERT_TRUE(animator != nullptr);
+        auto* obj = scene.find_object("Obj");
+        ASSERT_TRUE(obj != nullptr);
+        auto* animator = obj->get_component<Animator>();
+        ASSERT_TRUE(animator != nullptr);
 
-    // The clip loads synchronously fast enough in practice, but poll briefly
-    // to avoid a flaky race against the asset IO thread rather than assuming
-    // a fixed number of frames completes it.
-    for (int i = 0; i < 200 && animator->binding_count() == 0; ++i) {
-        assets.update(0.016f);
-        scene.update(0.0f);
-        scene.late_update(0.0f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // The clip loads synchronously fast enough in practice, but poll
+        // briefly to avoid a flaky race against the asset IO thread rather
+        // than assuming a fixed number of frames completes it.
+        for (int i = 0; i < 200 && animator->binding_count() == 0; ++i) {
+            assets.update(0.016f);
+            scene.update(0.0f);
+            scene.late_update(0.0f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_EQ(animator->current_state(), std::string("move"));
+        ASSERT_TRUE(animator->binding_count() > 0);
+
+        scene.update(0.5f);
+        scene.late_update(0.5f);
+        auto pos = obj->get_transform()->transform().position();
+        ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-2f);
     }
-    ASSERT_EQ(animator->current_state(), std::string("move"));
-    ASSERT_TRUE(animator->binding_count() > 0);
-
-    scene.update(0.5f);
-    scene.late_update(0.5f);
-    auto pos = obj->get_transform()->transform().position();
-    ASSERT_TRUE(std::abs(pos.x - 5.0f) < 1e-2f);
 
     // The registered parser's closure captures `assets` by reference --
     // clear it before `assets` is destroyed, mirroring every other
@@ -2844,6 +3389,16 @@ int main() {
     RUN_TEST(test_job_engine_repeated_engines_no_lost_or_phantom_jobs);
     RUN_TEST(test_work_stealing_deque);
     RUN_TEST(test_work_stealing_deque_no_torn_moves_under_contention);
+    RUN_TEST(test_job_handle_generation_prevents_stale_aliasing);
+    RUN_TEST(test_job_engine_fan_in_16_dependencies);
+    RUN_TEST(test_job_engine_deque_overflow_falls_back_to_global_queue);
+    RUN_TEST(test_job_engine_counter_pool_exhaustion_recovers);
+    RUN_TEST(test_job_engine_nested_wait_for_from_worker);
+    RUN_TEST(test_job_engine_parallel_for_covers_range_exactly_once);
+    RUN_TEST(test_job_engine_cancel_skips_body_but_releases_counter);
+    RUN_TEST(test_job_engine_priority_ordering_single_worker);
+    RUN_TEST(test_job_handle_survives_begin_end_frame);
+    RUN_TEST(test_job_engine_shared_across_frames_and_subsystems);
     RUN_TEST(test_debug_logging);
     RUN_TEST(test_signal_basic_emit);
     RUN_TEST(test_signal_disconnect);
@@ -2887,6 +3442,13 @@ int main() {
     RUN_TEST(test_scene_null_job_engine_runs_inline);
     RUN_TEST(test_scene_add_remove_system);
     RUN_TEST(test_scene_move_preserves_systems);
+
+    RUN_TEST(test_scene_command_buffer_flushes_in_ascending_worker_index_order);
+    RUN_TEST(test_scene_command_buffer_parallel_writes_all_land_exactly_once);
+    RUN_TEST(test_scene_manager_concurrent_scenes_match_serial);
+    RUN_TEST(test_scene_manager_no_engine_additive_active_remove);
+    RUN_TEST(test_transform_system_matches_lazy_resolve);
+    RUN_TEST(test_transform_system_concurrent_reads_are_race_free);
 
     RUN_TEST(test_animation_curve_sampling);
     RUN_TEST(test_animation_property_registry);

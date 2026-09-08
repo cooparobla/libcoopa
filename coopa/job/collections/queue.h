@@ -3,8 +3,8 @@
  * @brief Thread-safe ParallelQueue collection template.
  */
 
-#ifndef THREADABLE_QUEUE_H
-#define THREADABLE_QUEUE_H
+#ifndef COOPA_JOB_COLLECTIONS_QUEUE_H
+#define COOPA_JOB_COLLECTIONS_QUEUE_H
 
 #include <vector>
 #include <queue>
@@ -96,4 +96,4 @@ private:
 }
 }
 
-#endif
+#endif // COOPA_JOB_COLLECTIONS_QUEUE_H
