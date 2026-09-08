@@ -73,6 +73,31 @@ public:
      */
     void set_rotation(const glm::vec3& r) {
         rotation_degrees_ = r;
+        use_quat_ = false;
+        mark_dirty();
+    }
+
+    /**
+     * @brief Sets the local rotation from a quaternion, for callers (e.g. physxcoopa) that
+     *        integrate orientation directly and would otherwise lose precision converting
+     *        through Euler degrees every frame.
+     *
+     * Also updates rotation_degrees_ (via the exact analytic inverse of the ZYX composition
+     * recompute_() uses) so rotation_degrees()/set_rotation() keep behaving identically for
+     * every other reader -- there is exactly one rotation, expressed two ways, never two
+     * that can silently disagree. Without this, an object animated via AnimatedProperty's
+     * "rotation" binding (which reads rotation_degrees() and writes set_rotation(vec3), see
+     * coopa/animation/animated_property.h) and also driven by a quaternion writer on the
+     * same frame would have the two fight over which representation is current.
+     *
+     * @param q New orientation.
+     */
+    void set_rotation_quat(const glm::quat& q) {
+        rotation_quat_ = q;
+        glm::vec3 euler_radians;
+        glm::extractEulerAngleZYX(glm::mat4_cast(q), euler_radians.z, euler_radians.y, euler_radians.x);
+        rotation_degrees_ = glm::degrees(euler_radians);
+        use_quat_ = true;
         mark_dirty();
     }
 
@@ -91,6 +116,21 @@ public:
     const glm::vec3& position() const { return position_; }
     /** @brief Returns local rotation in Euler degrees. */
     const glm::vec3& rotation_degrees() const { return rotation_degrees_; }
+
+    /**
+     * @brief Returns the local rotation as a quaternion.
+     *
+     * If the rotation was last set via set_rotation_quat(), returns that value exactly (no
+     * round-trip through Euler degrees). Otherwise derives it from rotation_degrees_ on
+     * demand -- cheap, and avoids paying the conversion for every Transform that never uses
+     * the quaternion path.
+     */
+    const glm::quat& rotation_quat() const {
+        if (!use_quat_) {
+            rotation_quat_ = glm::quat(glm::radians(rotation_degrees_));
+        }
+        return rotation_quat_;
+    }
     /** @brief Returns local scale. */
     const glm::vec3& scale() const { return scale_; }
 
@@ -238,11 +278,13 @@ private:
     void recompute_() const {
         // Local matrix: T * R * S
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position_);
-        glm::mat4 R = glm::eulerAngleZYX(
-            glm::radians(rotation_degrees_.z),
-            glm::radians(rotation_degrees_.y),
-            glm::radians(rotation_degrees_.x)
-        );
+        glm::mat4 R = use_quat_
+            ? glm::mat4_cast(rotation_quat_)
+            : glm::eulerAngleZYX(
+                  glm::radians(rotation_degrees_.z),
+                  glm::radians(rotation_degrees_.y),
+                  glm::radians(rotation_degrees_.x)
+              );
         glm::mat4 S = glm::scale(glm::mat4(1.0f), scale_);
         local_matrix_ = T * R * S;
 
@@ -268,6 +310,11 @@ private:
     glm::vec3 position_;           /**< Local position. */
     glm::vec3 rotation_degrees_;   /**< Local Euler rotation in degrees (XYZ). */
     glm::vec3 scale_;              /**< Local scale. */
+
+    mutable glm::quat rotation_quat_{1.0f, 0.0f, 0.0f, 0.0f}; /**< Cached/authoritative quaternion
+                                                                     form -- see rotation_quat(). */
+    bool use_quat_ = false; /**< True once set_rotation_quat() has been called; cleared by
+                                  set_rotation(vec3), so Euler authoring is unaffected. */
 
     Transform*              parent_;   /**< Non-owning parent pointer (may be nullptr). */
     std::vector<Transform*> children_; /**< Non-owning child pointers for dirty propagation. */

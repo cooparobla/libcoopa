@@ -2323,6 +2323,51 @@ void test_scene_manager_no_engine_additive_active_remove() {
     ASSERT_TRUE(!mgr.remove_scene(raws[1])); // already removed
 }
 
+void test_transform_set_rotation_euler_unaffected_by_quat_support() {
+    coopa::util::Transform t;
+    t.set_rotation({15.0f, 30.0f, 45.0f});
+    glm::mat4 before = t.get_world_matrix();
+
+    // Round-trip through the quaternion path and back to Euler must reproduce the same
+    // matrix -- set_rotation_quat()'s Euler re-derivation is the exact analytic inverse of
+    // the eulerAngleZYX composition recompute_() uses.
+    glm::quat q = t.rotation_quat();
+    t.set_rotation_quat(q);
+    glm::vec3 degrees_after_quat = t.rotation_degrees();
+    t.set_rotation(degrees_after_quat);
+    glm::mat4 after = t.get_world_matrix();
+
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            ASSERT_TRUE(std::abs(before[r][c] - after[r][c]) < 1e-4f);
+        }
+    }
+}
+
+void test_transform_set_rotation_quat_matches_mat4_cast() {
+    coopa::util::Transform t;
+    glm::quat q = glm::angleAxis(glm::radians(37.0f), glm::normalize(glm::vec3(1.0f, 2.0f, 3.0f)));
+    t.set_rotation_quat(q);
+
+    glm::mat4 expected = glm::mat4_cast(q);
+    glm::mat4 actual = t.get_world_matrix(); // no position/scale set -> pure rotation matrix
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            ASSERT_TRUE(std::abs(expected[r][c] - actual[r][c]) < 1e-4f);
+        }
+    }
+
+    // set_rotation(vec3) must clear use_quat_, reverting to ordinary Euler authoring.
+    t.set_rotation({0.0f, 0.0f, 0.0f});
+    glm::mat4 identity_rot = t.get_world_matrix();
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float expected_identity = (r == c) ? 1.0f : 0.0f;
+            ASSERT_TRUE(std::abs(identity_rot[r][c] - expected_identity) < 1e-4f);
+        }
+    }
+}
+
 void test_transform_system_matches_lazy_resolve() {
     using namespace coopa::scene;
 
@@ -3447,6 +3492,8 @@ int main() {
     RUN_TEST(test_scene_command_buffer_parallel_writes_all_land_exactly_once);
     RUN_TEST(test_scene_manager_concurrent_scenes_match_serial);
     RUN_TEST(test_scene_manager_no_engine_additive_active_remove);
+    RUN_TEST(test_transform_set_rotation_euler_unaffected_by_quat_support);
+    RUN_TEST(test_transform_set_rotation_quat_matches_mat4_cast);
     RUN_TEST(test_transform_system_matches_lazy_resolve);
     RUN_TEST(test_transform_system_concurrent_reads_are_race_free);
 
