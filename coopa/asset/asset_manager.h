@@ -403,6 +403,9 @@ public:
 
     bool hot_reload_enabled() const { return hot_reload_enabled_; }
 
+    /// @brief Number of async loads still in flight; 0 once every load_async() has been finalized.
+    std::size_t pending_load_count() const { return pending_.size(); }
+
     // --- Per-frame pump ---
 
     /**
