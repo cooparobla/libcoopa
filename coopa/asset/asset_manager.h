@@ -119,6 +119,30 @@ public:
     /** @brief Clears every registered loader. Call before the objects a loader's closure/ctor captured (Device, Allocator, ...) are destroyed. */
     void clear_loaders() { loaders_.clear(); }
 
+    /**
+     * @brief Returns the loader registered for asset type T, or nullptr if none is registered.
+     *
+     * Lets a caller reach loader-specific configuration methods (e.g.
+     * gfx::loaders::TextureLoader::declare_color_space()) that IAssetLoader's type-erased
+     * interface doesn't expose — the caller is responsible for downcasting to the concrete
+     * loader type it registered.
+     *
+     * @tparam T Asset payload type whose loader to look up.
+     * @return The registered IAssetLoader, or nullptr if register_loader<T>() was never called.
+     */
+    template <typename T>
+    IAssetLoader* loader() {
+        auto it = loaders_.find(std::type_index(typeid(T)));
+        return it != loaders_.end() ? it->second.get() : nullptr;
+    }
+
+    /** @brief Const overload of loader<T>(). */
+    template <typename T>
+    const IAssetLoader* loader() const {
+        auto it = loaders_.find(std::type_index(typeid(T)));
+        return it != loaders_.end() ? it->second.get() : nullptr;
+    }
+
     // --- Loading ---
 
     /**

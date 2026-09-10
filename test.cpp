@@ -13,6 +13,7 @@
 #include <cstdio> // For std::remove
 #include <fstream>
 #include <filesystem>
+#include <unordered_map>
 
 #include <coopa/util/id.h>
 #include <coopa/util/string.h>
@@ -59,6 +60,15 @@
 #include <coopa/input/keys.h>
 #include <coopa/input/input.h>
 #include <coopa/input/input_map.h>
+#include <coopa/item/item_id.h>
+#include <coopa/item/item_def.h>
+#include <coopa/item/item_stack.h>
+#include <coopa/item/item_database.h>
+#include <coopa/item/item_database_loader.h>
+#include <coopa/item/inventory.h>
+#include <coopa/item/hotbar.h>
+#include <coopa/stat/resource.h>
+#include <coopa/stat/stat_block.h>
 #include <glm/glm.hpp>
 
 // ANSI Colors for nice UI
@@ -3409,6 +3419,442 @@ static void test_input_release_all_on_focus_loss() {
 
 } // namespace input_test
 
+namespace item_test {
+
+using namespace coopa::item;
+
+// --- item_id.h ---
+
+static void test_item_id_normalizes_and_hashes() {
+    ItemId a = ItemId::from_name("Potion_Health");
+    ItemId b = ItemId::from_name("  potion_health  ");
+    ASSERT_TRUE(a == b);
+    ASSERT_EQ(a.hash(), b.hash());
+    ASSERT_TRUE(a.is_valid());
+    ASSERT_EQ(a.str(), std::string("potion_health"));
+
+    ItemId invalid;
+    ASSERT_TRUE(!invalid.is_valid());
+
+    std::unordered_map<ItemId, int> map;
+    map[a] = 5;
+    ASSERT_EQ(map[b], 5); // same normalized identity as a key
+}
+
+// --- item_database.h ---
+
+static void test_item_database_define_find_clear() {
+    ItemDatabase db;
+    ItemDef def;
+    def.id = ItemId::from_name("sword_iron");
+    def.name = "Iron Sword";
+    def.max_stack = 1;
+    db.define(def);
+
+    ASSERT_TRUE(db.contains(def.id));
+    ASSERT_EQ(db.size(), 1u);
+    const ItemDef* found = db.find(def.id);
+    ASSERT_TRUE(found != nullptr);
+    ASSERT_EQ(found->name, "Iron Sword");
+    ASSERT_EQ(db.max_stack_of(def.id), 1);
+
+    ItemId unknown = ItemId::from_name("unknown_item");
+    ASSERT_TRUE(db.find(unknown) == nullptr);
+    ASSERT_EQ(db.max_stack_of(unknown), k_default_max_stack);
+
+    db.clear();
+    ASSERT_EQ(db.size(), 0u);
+}
+
+static ItemDatabase make_test_db() {
+    ItemDatabase db;
+    ItemDef potion;
+    potion.id = ItemId::from_name("potion_health");
+    potion.max_stack = 16;
+    db.define(potion);
+
+    ItemDef gold;
+    gold.id = ItemId::from_name("coin_gold");
+    gold.max_stack = 999;
+    db.define(gold);
+
+    ItemDef sword;
+    sword.id = ItemId::from_name("sword_iron");
+    sword.max_stack = 1;
+    db.define(sword);
+
+    ItemDef ruby;
+    ruby.id = ItemId::from_name("gem_ruby");
+    ruby.max_stack = 10;
+    db.define(ruby);
+    return db;
+}
+
+// --- inventory.h ---
+
+static void test_inventory_add_fills_partial_stacks_then_empties() {
+    ItemDatabase db = make_test_db();
+    Inventory inv(2, &db);
+    ItemId potion = ItemId::from_name("potion_health");
+
+    inv.set(0, ItemStack{potion, 10}, false);
+    int leftover = inv.add(potion, 20);
+
+    // slot0 (10/16) fills to 16 (uses 6 of the 20), the remaining 14 spills
+    // into the empty slot1.
+    ASSERT_EQ(leftover, 0);
+    ASSERT_EQ(inv.at(0).count, 16);
+    ASSERT_TRUE(inv.at(1).item == potion);
+    ASSERT_EQ(inv.at(1).count, 14);
+}
+
+static void test_inventory_add_returns_leftover_when_full() {
+    ItemDatabase db = make_test_db();
+    Inventory inv(1, &db);
+    ItemId potion = ItemId::from_name("potion_health");
+    inv.set(0, ItemStack{potion, 16}, false); // already at max_stack
+
+    int leftover = inv.add(potion, 5);
+    ASSERT_EQ(leftover, 5);
+    ASSERT_EQ(inv.at(0).count, 16);
+}
+
+static void test_inventory_remove_across_slots_and_count_of() {
+    ItemDatabase db = make_test_db();
+    Inventory inv(3, &db);
+    ItemId potion = ItemId::from_name("potion_health");
+    inv.set(0, ItemStack{potion, 5}, false);
+    inv.set(2, ItemStack{potion, 8}, false);
+
+    ASSERT_EQ(inv.count_of(potion), 13);
+
+    int removed = inv.remove(potion, 10);
+    ASSERT_EQ(removed, 10);
+    ASSERT_TRUE(inv.at(0).empty());
+    ASSERT_EQ(inv.at(2).count, 3);
+    ASSERT_EQ(inv.count_of(potion), 3);
+}
+
+static void test_inventory_move_or_merge_three_way() {
+    ItemDatabase db = make_test_db();
+    ItemId potion = ItemId::from_name("potion_health");
+    ItemId sword  = ItemId::from_name("sword_iron");
+
+    // Move into an empty slot.
+    {
+        Inventory inv(2, &db);
+        inv.set(0, ItemStack{sword, 1}, false);
+        ASSERT_TRUE(inv.move_or_merge(0, 1));
+        ASSERT_TRUE(inv.at(0).empty());
+        ASSERT_TRUE(inv.at(1).item == sword);
+        ASSERT_EQ(inv.at(1).count, 1);
+    }
+
+    // Merge stacks of the same item.
+    {
+        Inventory inv(2, &db);
+        inv.set(0, ItemStack{potion, 5}, false);
+        inv.set(1, ItemStack{potion, 3}, false);
+        ASSERT_TRUE(inv.move_or_merge(0, 1));
+        ASSERT_TRUE(inv.at(0).empty());
+        ASSERT_EQ(inv.at(1).count, 8);
+    }
+
+    // Swap two different items.
+    {
+        Inventory inv(2, &db);
+        inv.set(0, ItemStack{potion, 4}, false);
+        inv.set(1, ItemStack{sword, 1}, false);
+        ASSERT_TRUE(inv.move_or_merge(0, 1));
+        ASSERT_TRUE(inv.at(0).item == sword);
+        ASSERT_TRUE(inv.at(1).item == potion);
+        ASSERT_EQ(inv.at(1).count, 4);
+    }
+}
+
+static void test_inventory_move_or_merge_partial_merge_leaves_remainder() {
+    ItemDatabase db = make_test_db();
+    ItemId potion = ItemId::from_name("potion_health"); // max_stack 16
+    Inventory inv(2, &db);
+    inv.set(0, ItemStack{potion, 5}, false);
+    inv.set(1, ItemStack{potion, 14}, false);
+
+    ASSERT_TRUE(inv.move_or_merge(0, 1));
+    ASSERT_EQ(inv.at(1).count, 16);       // filled to max_stack
+    ASSERT_TRUE(!inv.at(0).empty());
+    ASSERT_EQ(inv.at(0).count, 3);        // remainder stays behind
+}
+
+static void test_inventory_move_or_merge_uses_itemdef_max_stack_not_stack_field() {
+    // ItemStack itself carries no max_stack -- the ItemDatabase (via ItemId)
+    // is the only authority. Two inventories sharing the same item id but
+    // pointed at databases with different max_stack values must cap the
+    // merge differently, proving the cap comes from the database, not from
+    // any value cached alongside the stack.
+    ItemId ruby = ItemId::from_name("gem_ruby");
+
+    ItemDatabase small_db;
+    ItemDef small_def; small_def.id = ruby; small_def.max_stack = 10;
+    small_db.define(small_def);
+
+    Inventory inv(2, &small_db);
+    inv.set(0, ItemStack{ruby, 8}, false);
+    inv.set(1, ItemStack{ruby, 8}, false);
+    ASSERT_TRUE(inv.move_or_merge(0, 1));
+    ASSERT_EQ(inv.at(1).count, 10);  // capped at small_db's max_stack
+    ASSERT_EQ(inv.at(0).count, 6);   // 8 - (10-8) leftover in source
+}
+
+static void test_inventory_unknown_item_falls_back_to_default_max_stack() {
+    Inventory inv(1, nullptr); // no database at all
+    ItemId mystery = ItemId::from_name("mystery_item");
+
+    int leftover = inv.add(mystery, 150);
+    ASSERT_EQ(inv.at(0).count, k_default_max_stack);
+    ASSERT_EQ(leftover, 150 - k_default_max_stack);
+}
+
+static void test_inventory_signals_fire_once_per_changed_slot() {
+    ItemDatabase db = make_test_db();
+    ItemId potion = ItemId::from_name("potion_health");
+    Inventory inv(2, &db);
+    inv.set(0, ItemStack{potion, 5}, false);
+    inv.set(1, ItemStack{potion, 3}, false);
+
+    int changed_count = 0;
+    int swapped_count = 0;
+    auto c1 = inv.on_slot_changed.connect([&](int, const ItemStack&) { changed_count++; });
+    auto c2 = inv.on_slots_swapped.connect([&](int, int) { swapped_count++; });
+
+    ASSERT_TRUE(inv.move_or_merge(0, 1)); // merge -- both slots change, one swap notification
+    ASSERT_EQ(changed_count, 2);
+    ASSERT_EQ(swapped_count, 1);
+}
+
+static void test_inventory_split_and_clear_slot() {
+    ItemDatabase db = make_test_db();
+    ItemId potion = ItemId::from_name("potion_health");
+    Inventory inv(2, &db);
+    inv.set(0, ItemStack{potion, 10}, false);
+
+    ASSERT_TRUE(inv.split(0, 4, 1));
+    ASSERT_EQ(inv.at(0).count, 6);
+    ASSERT_EQ(inv.at(1).count, 4);
+
+    ASSERT_TRUE(!inv.split(0, 0, 1)); // count must be > 0 -- slot1 no longer empty anyway
+
+    inv.clear_slot(0);
+    ASSERT_TRUE(inv.at(0).empty());
+}
+
+// --- hotbar.h ---
+
+static void test_hotbar_select_wraps_and_emits_only_on_change() {
+    Inventory inv(3);
+    Hotbar hb(&inv, 0, 3);
+
+    int emit_count = 0;
+    auto conn = hb.on_selection_changed.connect([&](int) { emit_count++; });
+
+    hb.select(0);
+    ASSERT_EQ(hb.selected(), 0);
+    ASSERT_EQ(emit_count, 1);
+
+    hb.select(0); // no change -- no emit
+    ASSERT_EQ(emit_count, 1);
+
+    hb.next();
+    ASSERT_EQ(hb.selected(), 1);
+    ASSERT_EQ(emit_count, 2);
+
+    hb.select(2);
+    hb.next(); // wraps past the end back to 0
+    ASSERT_EQ(hb.selected(), 0);
+
+    hb.prev(); // wraps before the start to count()-1
+    ASSERT_EQ(hb.selected(), 2);
+
+    hb.select(-1);
+    ASSERT_EQ(hb.selected(), -1);
+    ASSERT_EQ(hb.selected_slot(), -1);
+}
+
+static void test_hotbar_selected_stack_reads_through_to_inventory() {
+    ItemDatabase db = make_test_db();
+    ItemId potion = ItemId::from_name("potion_health");
+    Inventory inv(3, &db);
+    inv.set(1, ItemStack{potion, 5}, false);
+
+    Hotbar hb(&inv, 0, 3);
+    hb.select(1);
+    ASSERT_TRUE(hb.selected_stack().item == potion);
+    ASSERT_EQ(hb.selected_stack().count, 5);
+
+    hb.select(-1);
+    ASSERT_TRUE(hb.selected_stack().empty());
+}
+
+// --- item_database_loader.h ---
+
+static void test_item_database_loader_parses_yaml() {
+    std::string yaml =
+        "items:\n"
+        "  - id: potion_health\n"
+        "    name: Health Potion\n"
+        "    description: Restores health.\n"
+        "    icon: potion\n"
+        "    max_stack: 16\n"
+        "    category: consumable\n"
+        "    rarity: common\n"
+        "    tint: { r: 0.9, g: 0.2, b: 0.3, a: 0.95 }\n"
+        "  - id: mystery_box\n";
+    fkyaml::node root = fkyaml::node::deserialize(yaml);
+    ItemDatabase db;
+    parse_item_database(root, db);
+    ASSERT_EQ(db.size(), 2u);
+
+    const ItemDef* potion = db.find(ItemId::from_name("potion_health"));
+    ASSERT_TRUE(potion != nullptr);
+    ASSERT_EQ(potion->name, "Health Potion");
+    ASSERT_EQ(potion->max_stack, 16);
+    ASSERT_TRUE(potion->category == ItemCategory::Consumable);
+    ASSERT_TRUE(potion->rarity == ItemRarity::Common);
+    ASSERT_TRUE(std::abs(potion->tint.a - 0.95f) < 1e-5f);
+
+    // Fields omitted entirely fall back to ItemDef's own defaults.
+    const ItemDef* mystery = db.find(ItemId::from_name("mystery_box"));
+    ASSERT_TRUE(mystery != nullptr);
+    ASSERT_EQ(mystery->max_stack, k_default_max_stack);
+    ASSERT_TRUE(mystery->category == ItemCategory::Misc);
+    ASSERT_TRUE(mystery->rarity == ItemRarity::Common);
+
+    // Unrecognized category/rarity strings degrade rather than throw.
+    std::string yaml2 = "items:\n  - id: weird_item\n    category: nonsense\n    rarity: bogus\n";
+    fkyaml::node root2 = fkyaml::node::deserialize(yaml2);
+    ItemDatabase db2;
+    parse_item_database(root2, db2);
+    const ItemDef* weird = db2.find(ItemId::from_name("weird_item"));
+    ASSERT_TRUE(weird != nullptr);
+    ASSERT_TRUE(weird->category == ItemCategory::Misc);
+    ASSERT_TRUE(weird->rarity == ItemRarity::Common);
+}
+
+static void test_item_database_loader_merges_into_existing() {
+    ItemDatabase db;
+    ItemDef existing;
+    existing.id = ItemId::from_name("coin_gold");
+    existing.max_stack = 999;
+    db.define(existing);
+
+    std::string yaml = "items:\n  - id: potion_mana\n    max_stack: 8\n";
+    fkyaml::node root = fkyaml::node::deserialize(yaml);
+    parse_item_database(root, db);
+
+    ASSERT_EQ(db.size(), 2u);
+    ASSERT_TRUE(db.contains(ItemId::from_name("coin_gold")));
+    ASSERT_TRUE(db.contains(ItemId::from_name("potion_mana")));
+}
+
+} // namespace item_test
+
+namespace stat_test {
+
+using namespace coopa::stat;
+
+static void test_resource_damage_heal_clamped() {
+    Resource r(100.0f);
+    r.damage(30.0f);
+    ASSERT_TRUE(std::abs(r.current - 70.0f) < 1e-4f);
+
+    r.damage(1000.0f);
+    ASSERT_TRUE(r.current == 0.0f);
+    ASSERT_TRUE(r.is_depleted());
+
+    r.heal(1000.0f);
+    ASSERT_TRUE(r.current == r.max);
+    ASSERT_TRUE(r.is_full());
+}
+
+static void test_resource_set_max_keep_ratio_and_clamp() {
+    Resource r(100.0f);
+    r.damage(50.0f); // current = 50, normalized 0.5
+    r.set_max(50.0f, /*keep_ratio=*/true);
+    ASSERT_TRUE(std::abs(r.max - 50.0f) < 1e-4f);
+    ASSERT_TRUE(std::abs(r.current - 25.0f) < 1e-4f); // 0.5 * 50
+
+    Resource r2(100.0f);
+    r2.damage(10.0f); // current = 90
+    r2.set_max(50.0f, /*keep_ratio=*/false);
+    ASSERT_TRUE(std::abs(r2.current - 50.0f) < 1e-4f); // clamped down to the new max
+}
+
+static void test_resource_tick_regenerates_after_delay() {
+    Resource r(100.0f, /*regen=*/10.0f, /*delay=*/1.0f);
+    r.damage(50.0f);
+
+    r.tick(0.5f); // still inside the post-damage delay window
+    ASSERT_TRUE(std::abs(r.current - 50.0f) < 1e-4f);
+
+    r.tick(0.6f); // crosses the delay -- regen resumes
+    ASSERT_TRUE(r.current > 50.0f);
+    float after_first_regen_tick = r.current;
+
+    r.tick(0.5f);
+    ASSERT_TRUE(r.current > after_first_regen_tick);
+
+    r.tick(1000.0f); // a long tick clamps at max, doesn't overshoot
+    ASSERT_TRUE(r.is_full());
+}
+
+static void test_resource_on_depleted_fires_once_at_zero() {
+    Resource r(100.0f);
+    int depleted_count = 0;
+    auto conn = r.on_depleted.connect([&]() { depleted_count++; });
+
+    r.damage(50.0f);
+    ASSERT_EQ(depleted_count, 0);
+
+    r.damage(50.0f); // crosses to 0
+    ASSERT_EQ(depleted_count, 1);
+
+    r.damage(10.0f); // already at 0 -- no further edge
+    ASSERT_EQ(depleted_count, 1);
+
+    r.heal(20.0f);
+    r.damage(20.0f); // crosses to 0 again -- a fresh edge
+    ASSERT_EQ(depleted_count, 2);
+}
+
+static void test_resource_on_changed_silent_when_unchanged() {
+    Resource r(100.0f); // regen_per_second = 0 by default
+    int changed_count = 0;
+    auto conn = r.on_changed.connect([&](float, float) { changed_count++; });
+
+    r.tick(1.0f);        // already full, no regen configured -- silent
+    ASSERT_EQ(changed_count, 0);
+
+    r.damage(0.0f);       // non-positive amount -- no-op
+    ASSERT_EQ(changed_count, 0);
+
+    r.damage(10.0f);      // a real change
+    ASSERT_EQ(changed_count, 1);
+}
+
+static void test_stat_block_named_resources_are_pointer_stable() {
+    StatBlock block;
+    Resource* health = &block.resource("health");
+    health->current = 42.0f;
+
+    for (int i = 0; i < 50; ++i) {
+        block.resource("stat_" + std::to_string(i));
+    }
+
+    ASSERT_TRUE(std::abs(health->current - 42.0f) < 1e-4f);
+    ASSERT_EQ(block.size(), 51u);
+}
+
+} // namespace stat_test
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -3526,6 +3972,29 @@ int main() {
     RUN_TEST(input_test::test_input_press_and_release_within_one_frame_sets_both_edges);
     RUN_TEST(input_test::test_input_cursor_delta_first_frame_and_after_mode_change);
     RUN_TEST(input_test::test_input_release_all_on_focus_loss);
+
+    RUN_TEST(item_test::test_item_id_normalizes_and_hashes);
+    RUN_TEST(item_test::test_item_database_define_find_clear);
+    RUN_TEST(item_test::test_inventory_add_fills_partial_stacks_then_empties);
+    RUN_TEST(item_test::test_inventory_add_returns_leftover_when_full);
+    RUN_TEST(item_test::test_inventory_remove_across_slots_and_count_of);
+    RUN_TEST(item_test::test_inventory_move_or_merge_three_way);
+    RUN_TEST(item_test::test_inventory_move_or_merge_partial_merge_leaves_remainder);
+    RUN_TEST(item_test::test_inventory_move_or_merge_uses_itemdef_max_stack_not_stack_field);
+    RUN_TEST(item_test::test_inventory_unknown_item_falls_back_to_default_max_stack);
+    RUN_TEST(item_test::test_inventory_signals_fire_once_per_changed_slot);
+    RUN_TEST(item_test::test_inventory_split_and_clear_slot);
+    RUN_TEST(item_test::test_hotbar_select_wraps_and_emits_only_on_change);
+    RUN_TEST(item_test::test_hotbar_selected_stack_reads_through_to_inventory);
+    RUN_TEST(item_test::test_item_database_loader_parses_yaml);
+    RUN_TEST(item_test::test_item_database_loader_merges_into_existing);
+
+    RUN_TEST(stat_test::test_resource_damage_heal_clamped);
+    RUN_TEST(stat_test::test_resource_set_max_keep_ratio_and_clamp);
+    RUN_TEST(stat_test::test_resource_tick_regenerates_after_delay);
+    RUN_TEST(stat_test::test_resource_on_depleted_fires_once_at_zero);
+    RUN_TEST(stat_test::test_resource_on_changed_silent_when_unchanged);
+    RUN_TEST(stat_test::test_stat_block_named_resources_are_pointer_stable);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Test Summary: " << g_tests_run - g_tests_failed << " / " << g_tests_run << " Passed." << std::endl;

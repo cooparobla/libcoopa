@@ -331,10 +331,19 @@ public:
 
     /**
      * @brief Calls start() on all components, then recurses to children.
+     *
+     * Iterates by index rather than range-based for: a component's start()
+     * is allowed to add a further component to this same owner (e.g. a
+     * widget lazily attaching a Mask the first time it's started), which
+     * reallocates components_ -- a range-based for's cached begin()/end()
+     * would then dereference a dangling iterator into the freed buffer.
+     * Indexing re-reads size() each iteration, so it's immune to that, and
+     * a component added this way correctly gets its own start() called too
+     * rather than silently skipped.
      */
     void start() {
         if (!active_) return;
-        for (auto& comp : components_) comp->start();
+        for (size_t i = 0; i < components_.size(); ++i) components_[i]->start();
         for (auto& child : children_) child->start();
     }
 

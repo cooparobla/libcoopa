@@ -6,7 +6,7 @@ It is designed to be highly thread-safe and suitable for building multithreaded 
 
 ## Modules Overview
 
-`libcoopa` is organized into nine main modules:
+`libcoopa` is organized into eleven main modules:
 
 ### 1. [Utilities (`coopa/util/`)](file:///home/coopa/git/libcoopa/coopa/util/)
 Cross-platform helper utilities for math, file paths, strings, and unique IDs:
@@ -67,6 +67,18 @@ The complete keyboard/mouse vocabulary and state model, backend-agnostic — see
 - **[InputMap](file:///home/coopa/git/libcoopa/coopa/input/input_map.h)**: Named action/axis/vector bindings over keys and mouse buttons, with optional modifier chords, resolved against an `Input`.
 - **[IInputBackend](file:///home/coopa/git/libcoopa/coopa/input/input_backend.h)**: The interface a concrete windowing library implements so `Input`'s cursor/clipboard control calls have somewhere to go.
 - **[Key / MouseButton / Mods / ...](file:///home/coopa/git/libcoopa/coopa/input/keys.h)**: The dense, 0-based, backend-independent key/button vocabulary.
+
+### 10. [Item (`coopa/item/`)](file:///home/coopa/git/libcoopa/coopa/item/)
+The engine-agnostic model behind any slot-based inventory UI — see the [module README](file:///home/coopa/git/libcoopa/coopa/item/README.md):
+- **[ItemId / ItemDef / ItemDatabase](file:///home/coopa/git/libcoopa/coopa/item/item_database.h)**: Normalized, hashable item identity; the immutable per-kind definition (name/icon/max_stack/category/rarity/tint); and the `ItemId -> ItemDef` lookup table, definable from C++ or YAML side by side.
+- **[ItemDatabaseLoader](file:///home/coopa/git/libcoopa/coopa/item/item_database_loader.h)**: A `TypedAssetLoader<ItemDatabase>` parsing a YAML `items:` list, mirroring `coopa::anim::AnimationClipLoader`'s pure-CPU shape.
+- **[Inventory](file:///home/coopa/git/libcoopa/coopa/item/inventory.h)**: Fixed-capacity `ItemStack` storage with the authoritative move/merge/swap/split rules and change signals — the model a UI grid visualizes rather than owns.
+- **[Hotbar](file:///home/coopa/git/libcoopa/coopa/item/hotbar.h)**: A selectable window over an `Inventory`'s slots, e.g. a quick-slot bar.
+
+### 11. [Stat (`coopa/stat/`)](file:///home/coopa/git/libcoopa/coopa/stat/)
+Clamped, optionally-regenerating gameplay quantities (health, stamina, mana) — see the [module README](file:///home/coopa/git/libcoopa/coopa/stat/README.md):
+- **[Resource](file:///home/coopa/git/libcoopa/coopa/stat/resource.h)**: A single current/max meter with `damage`/`heal`/`tick`-driven delayed regen, `on_changed`/`on_depleted` signals.
+- **[StatBlock](file:///home/coopa/git/libcoopa/coopa/stat/stat_block.h)**: A named, pointer-stable registry of `Resource`s.
 
 ---
 
