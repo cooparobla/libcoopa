@@ -18,6 +18,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <functional>
 #include <typeindex>
 #include <stdexcept>
@@ -323,6 +324,24 @@ public:
         for (const auto& child : children_) {
             if (child->name() == name) return child.get();
             if (SceneObject* found = child->find_descendant(name)) return found;
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Finds a DIRECT child with the given name (non-recursive).
+     *
+     * Unlike find_descendant(), does not search grandchildren — the building
+     * block for path-style lookups (e.g. Scene::find_object_by_path()) where
+     * each segment after the first must name an immediate child of the last
+     * match, not just some descendant of it.
+     *
+     * @param name Name to search for among direct children.
+     * @return Non-owning pointer to the matching child, or nullptr.
+     */
+    SceneObject* find_child(std::string_view name) const {
+        for (const auto& child : children_) {
+            if (child->name() == name) return child.get();
         }
         return nullptr;
     }

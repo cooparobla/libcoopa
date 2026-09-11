@@ -2333,6 +2333,60 @@ void test_scene_manager_no_engine_additive_active_remove() {
     ASSERT_TRUE(!mgr.remove_scene(raws[1])); // already removed
 }
 
+void test_scene_object_find_child_direct_only() {
+    using namespace coopa::scene;
+
+    auto root = std::make_unique<SceneObject>("Root");
+    auto child = std::make_unique<SceneObject>("Child");
+    auto grandchild = std::make_unique<SceneObject>("Grandchild");
+    child->add_child(std::move(grandchild));
+    root->add_child(std::move(child));
+
+    ASSERT_TRUE(root->find_child("Child") != nullptr);
+    // find_child is non-recursive -- a grandchild must not be found from the root, unlike
+    // find_descendant() (see that method's own test coverage above).
+    ASSERT_TRUE(root->find_child("Grandchild") == nullptr);
+    ASSERT_TRUE(root->find_descendant("Grandchild") != nullptr);
+    ASSERT_TRUE(root->find_child("Nope") == nullptr);
+}
+
+void test_scene_find_object_by_path() {
+    using namespace coopa::scene;
+
+    Scene scene("Path");
+    auto root = std::make_unique<SceneObject>("sdf_blob");
+    auto mid = std::make_unique<SceneObject>("sdf_blob_sphere");
+    auto leaf = std::make_unique<SceneObject>("inner");
+    mid->add_child(std::move(leaf));
+    root->add_child(std::move(mid));
+    scene.add_root_object(std::move(root));
+
+    // Single segment is exactly find_object().
+    ASSERT_TRUE(scene.find_object_by_path("sdf_blob") == scene.find_object("sdf_blob"));
+
+    // Two- and three-deep paths resolve through direct children.
+    SceneObject* two_deep = scene.find_object_by_path("sdf_blob:sdf_blob_sphere");
+    ASSERT_TRUE(two_deep != nullptr);
+    ASSERT_TRUE(two_deep == scene.find_object("sdf_blob_sphere"));
+
+    SceneObject* three_deep = scene.find_object_by_path("sdf_blob:sdf_blob_sphere:inner");
+    ASSERT_TRUE(three_deep != nullptr);
+    ASSERT_TRUE(three_deep == scene.find_object("inner"));
+
+    // "inner" is only a grandchild of sdf_blob, not a direct child -- skipping the middle
+    // segment must fail rather than falling back to a recursive search.
+    ASSERT_TRUE(scene.find_object_by_path("sdf_blob:inner") == nullptr);
+
+    // Malformed paths and unknown segments fail closed rather than crashing.
+    ASSERT_TRUE(scene.find_object_by_path("") == nullptr);
+    ASSERT_TRUE(scene.find_object_by_path(":") == nullptr);
+    ASSERT_TRUE(scene.find_object_by_path("sdf_blob:") == nullptr);
+    ASSERT_TRUE(scene.find_object_by_path(":sdf_blob") == nullptr);
+    ASSERT_TRUE(scene.find_object_by_path("sdf_blob::inner") == nullptr);
+    ASSERT_TRUE(scene.find_object_by_path("nope") == nullptr);
+    ASSERT_TRUE(scene.find_object_by_path("sdf_blob:nope") == nullptr);
+}
+
 void test_transform_set_rotation_euler_unaffected_by_quat_support() {
     coopa::util::Transform t;
     t.set_rotation({15.0f, 30.0f, 45.0f});
@@ -3938,6 +3992,8 @@ int main() {
     RUN_TEST(test_scene_command_buffer_parallel_writes_all_land_exactly_once);
     RUN_TEST(test_scene_manager_concurrent_scenes_match_serial);
     RUN_TEST(test_scene_manager_no_engine_additive_active_remove);
+    RUN_TEST(test_scene_object_find_child_direct_only);
+    RUN_TEST(test_scene_find_object_by_path);
     RUN_TEST(test_transform_set_rotation_euler_unaffected_by_quat_support);
     RUN_TEST(test_transform_set_rotation_quat_matches_mat4_cast);
     RUN_TEST(test_transform_system_matches_lazy_resolve);

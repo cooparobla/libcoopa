@@ -19,6 +19,7 @@
 #include <coopa/event/event_bus.h>
 #include <coopa/job/engine.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 #include <functional>
@@ -496,6 +497,50 @@ public:
             if (SceneObject* found = root->find_descendant(name)) return found;
         }
         return nullptr;
+    }
+
+    /**
+     * @brief Finds a SceneObject by a ':'-separated hierarchy path, e.g. "sdf_blob:sdf_blob_sphere".
+     *
+     * The FIRST segment is resolved with find_object() (name-anywhere, depth-first); each
+     * subsequent segment must name a DIRECT child of the previous match (SceneObject::find_child()).
+     * A single-segment path is therefore exactly equivalent to find_object(), which makes this a
+     * strict superset -- callers can accept a path everywhere they used to accept a bare name.
+     * Resolving the head loosely is what lets "sdf_blob:sdf_blob_sphere" work whether or not
+     * sdf_blob happens to be a root object.
+     *
+     * @param path ':'-separated object names. Empty segments (including a leading/trailing/doubled
+     *             ':') and an empty path yield nullptr rather than skipping the segment.
+     * @return Non-owning pointer to the object, or nullptr if any segment fails to resolve.
+     */
+    SceneObject* find_object_by_path(std::string_view path) const {
+        if (path.empty()) return nullptr;
+
+        // A trailing ':' (e.g. "a:") leaves an empty final segment once split below, which the
+        // loop must reject rather than silently treat as "no more segments" -- check up front
+        // rather than relying on an empty `rest` to mean two different things.
+        if (path.back() == ':') return nullptr;
+
+        size_t head_end = path.find(':');
+        std::string_view head = (head_end == std::string_view::npos) ? path : path.substr(0, head_end);
+        if (head.empty()) return nullptr;
+
+        SceneObject* current = find_object(std::string(head));
+        if (!current || head_end == std::string_view::npos) return current;
+
+        std::string_view rest = path.substr(head_end + 1);
+        while (!rest.empty()) {
+            size_t seg_end = rest.find(':');
+            std::string_view segment = (seg_end == std::string_view::npos) ? rest : rest.substr(0, seg_end);
+            if (segment.empty()) return nullptr;
+
+            current = current->find_child(segment);
+            if (!current) return nullptr;
+
+            if (seg_end == std::string_view::npos) break;
+            rest = rest.substr(seg_end + 1);
+        }
+        return current;
     }
 
 private:
