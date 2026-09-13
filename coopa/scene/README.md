@@ -16,12 +16,12 @@ never by this module directly. gfxcoopa's
 
 ## Update Phases
 
-`Scene::update(dt)` and `Scene::late_update(dt)` no longer walk the
-`Component` tree directly — they run an ordered list of `ISceneSystem`
-instances (`coopa/scene/scene_system.h`). With nothing registered beyond the
-two built-ins (`BehaviourSystem` at `UpdatePhase::Behaviour`,
-`LateBehaviourSystem` at `UpdatePhase::LateBehaviour`, auto-installed by every
-`Scene`), both entry points behave exactly as before this pipeline existed.
+`Scene::update(dt)` and `Scene::late_update(dt)` run an ordered list of
+`ISceneSystem` instances (`coopa/scene/scene_system.h`) rather than walking the
+`Component` tree themselves. With nothing registered beyond the two built-ins
+(`BehaviourSystem` at `UpdatePhase::Behaviour`, `LateBehaviourSystem` at
+`UpdatePhase::LateBehaviour`, auto-installed by every `Scene`), the two entry
+points are equivalent to a direct recursive walk of the `Component` tree.
 
 ```text
 UpdatePhase::Physics       = 100   // reserved; no implementation ships in libcoopa

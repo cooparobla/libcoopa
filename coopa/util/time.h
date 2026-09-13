@@ -2,12 +2,11 @@
  * @file time.h
  * @brief Frame timing utility providing delta time and elapsed time.
  *
- * Consolidates what were previously two byte-identical copies
- * (toyengine's toyengine/core/time.h and blendy's src/blendy/core/time.h)
- * into a single implementation. It lives here rather than in gfxcoopa
- * because it is pure std::chrono with zero graphics content -- putting it
- * in gfxcoopa would make every pure-logic translation unit that just wants
- * a stopwatch pull in the whole graphics tree for no reason.
+ * The single frame-clock implementation shared by every consumer. It lives
+ * here rather than in gfxcoopa because it is pure std::chrono with zero
+ * graphics content -- putting it in gfxcoopa would make every pure-logic
+ * translation unit that just wants a stopwatch pull in the whole graphics
+ * tree for no reason.
  */
 
 #ifndef COOPA_UTIL_TIME_H

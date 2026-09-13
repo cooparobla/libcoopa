@@ -63,13 +63,11 @@ public:
     /**
      * @brief Constructs an AssetManager, optionally sharing an existing JobEngine.
      *
-     * Earlier revisions always spun up a private, dedicated IO JobEngine,
-     * because the counter pool's frame-boundary reset made sharing an engine
-     * across independent subsystems unsafe (see handle.h's class doc for why
-     * that constraint no longer applies). Now that handles are individually
-     * reclaimed rather than bulk-reset, decode() jobs can safely share the
-     * application's own JobEngine — pass it in, and this AssetManager will
-     * submit decode() work at Priority::Low so it never preempts frame work.
+     * Handles are reclaimed individually (see handle.h's class doc), so
+     * decode() jobs can safely share the application's own JobEngine — pass it
+     * in, and this AssetManager submits decode() work at Priority::Low so it
+     * never preempts frame work. Passing nullptr gets a private engine
+     * instead.
      *
      * @param engine Engine to submit decode() jobs on. If nullptr, this
      *   AssetManager constructs and owns a private fallback engine instead
@@ -280,7 +278,7 @@ public:
     template <typename T>
     AssetHandle<T> get(const std::string& virtual_path, const std::string& base_dir = "") const {
         AssetId id = AssetId::from_path(source_.resolve(virtual_path, base_dir));
-        auto it = slots_.find(id.hash());
+        auto it = slots_.find(id);
         if (it == slots_.end()) return AssetHandle<T>();
         if (it->second->type != std::type_index(typeid(T))) return AssetHandle<T>();
         return AssetHandle<T>(it->second.get());
@@ -371,7 +369,7 @@ public:
      * @param id Identity to evict.
      */
     void unload(const AssetId& id) {
-        auto it = slots_.find(id.hash());
+        auto it = slots_.find(id);
         if (it == slots_.end()) return;
         if (it->second->ref_count > 0) return;
         if (pending_.find(it->second.get()) != pending_.end()) return;
@@ -480,11 +478,8 @@ public:
      * @brief Drains in-flight loads, releases every payload, and clears loaders and slots.
      *
      * Must be called while whatever a registered loader's finalize() needs
-     * (Device, Allocator, CommandPool, ...) is still alive — this is the one
-     * teardown contract every downstream cache in this workspace previously
-     * had to invent for itself (see coopa::scene::SceneLoader::clear_component_parsers()
-     * and uicoopa's UIResourceCache::clear() for the prior art). Safe to call
-     * more than once; the destructor calls it too.
+     * (Device, Allocator, CommandPool, ...) is still alive. Safe to call more
+     * than once; the destructor calls it too.
      *
      * This destroys every AssetSlot, including ones still referenced by an
      * outstanding AssetHandle<T> — do not dereference a handle after calling
@@ -523,11 +518,11 @@ private:
     static constexpr int k_payload_grace_frames = 3;
 
     detail::AssetSlot* find_or_create_slot_(const AssetId& id, std::type_index type) {
-        auto it = slots_.find(id.hash());
+        auto it = slots_.find(id);
         if (it != slots_.end()) return it->second.get();
         auto slot = std::make_unique<detail::AssetSlot>(id, type);
         detail::AssetSlot* raw = slot.get();
-        slots_.emplace(id.hash(), std::move(slot));
+        slots_.emplace(id, std::move(slot));
         return raw;
     }
 
@@ -675,7 +670,10 @@ private:
         }
     }
 
-    std::unordered_map<uint64_t, std::unique_ptr<detail::AssetSlot>> slots_;
+    /// Keyed by the whole AssetId (hash + resolved path), not by the bare
+    /// hash: two different paths that collided on the 64-bit hash would
+    /// otherwise be served the same slot.
+    std::unordered_map<AssetId, std::unique_ptr<detail::AssetSlot>> slots_;
     std::unordered_map<detail::AssetSlot*, PendingLoad>               pending_;
     std::unordered_map<std::type_index, std::unique_ptr<IAssetLoader>> loaders_;
     std::vector<std::pair<std::shared_ptr<void>, int>>                 retired_; /**< {payload, frames_remaining}. */

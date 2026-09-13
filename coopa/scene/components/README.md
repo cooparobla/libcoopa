@@ -9,10 +9,8 @@ YAML parsers with `coopa::scene::SceneLoader::register_component_parser()`
 instead of this module knowing about them — see the parent
 [Scene Module README](file:///home/coopa/git/libcoopa/coopa/scene/README.md).
 
-The scene-wide `Animator` component that used to live here as the
-orbit-only, single-purpose `AnimationComponent` has moved to its own sibling
-module, `coopa::anim` — see
-[Animation Module README](file:///home/coopa/git/libcoopa/coopa/animation/README.md).
+The scene-wide `Animator` component lives in the sibling `coopa::anim` module
+— see [Animation Module README](file:///home/coopa/git/libcoopa/coopa/animation/README.md).
 It is registered the same way as any external component (via
 `register_component_parser("Animator", ...)`, see
 `coopa::anim::register_animation_components()`), not built into `SceneLoader`.

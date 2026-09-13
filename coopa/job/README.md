@@ -1,6 +1,6 @@
 # Job System Module
 
-The `job` module is a high-performance multi-threaded work-stealing job engine with automatic hazard-based dependency scheduling. Optimized for realtime/game-engine frame loops with zero-allocation job submission, lock-free work-stealing, and deterministic per-frame lifecycle management.
+The `job` module is a high-performance multi-threaded work-stealing job engine with automatic hazard-based dependency scheduling. Optimized for realtime/game-engine frame loops with zero-allocation job submission, lock-free work-stealing, and event-driven dependency resolution.
 
 ## Architecture & Design
 
@@ -11,7 +11,8 @@ graph TD
     JE -- "Spawns" --> WT[Worker Threads]
     WT -- "Pop / Steal (lock-free)" --> WSD["WorkStealingDeque (Chase-Lev)"]
     JE -- "Allocates" --> JH[JobHandle]
-    JS -- "begin_frame / end_frame" --> JE
+    JE -- "Owns" --> DG[DependencyGraph]
+    DG -- "Waiter stacks live on" --> CP
 ```
 
 ### Components
@@ -19,18 +20,21 @@ graph TD
 1. **[`Platform`](./platform.h)**
    - Compile-time constants for cache-line sizing (auto-detects x86-64 vs ARM/Apple Silicon), job pool capacity, inline dependency limits, and worker spin counts.
 2. **[`JobHandle`](./handle.h) & `CounterPool`**
-   - `CounterPool`: Pre-allocated array of `atomic<int32_t>` counters with a lock-free bump allocator and per-frame `reset()`.
-   - `JobHandle`: Trivially-copyable 16-byte token (pool pointer + index). Zero heap allocation on copy. Invalid handles report as always-complete.
+   - `CounterPool`: Pre-allocated slots, each holding a job counter plus a generation tag, handed out from and returned to a lock-free (ABA-tagged) free list. Slots are reclaimed individually — once a handle's counter reaches zero *and* it has been closed — never in bulk, so a handle's lifetime is independent of any frame boundary.
+   - `JobHandle`: Trivially-copyable 16-byte token (pool pointer + slot index + generation). Zero heap allocation on copy. Invalid and stale handles both report as always-complete; the generation tag is what distinguishes a stale handle from a live one occupying the same slot. Every handle must eventually be `close()`d (or wrapped in a `ScopedJobHandle`) to recycle its slot.
 3. **[`Job`](./job.h) & `TaskWrapper`**
    - `TaskWrapper`: Small-buffer-optimized callable with a 48-byte inline buffer. Most game lambdas fit without heap spillover; oversized callables fall back to `std::function`.
-   - `Job`: Contains a `TaskWrapper`, a `JobHandle`, a `JobType`, and up to 4 inline dependency handles (`JobHandle deps[4]`). No `std::vector` or `std::function` heap allocations.
-4. **[`Thread`](./thread.h)**
+   - `Job`: Contains a `TaskWrapper`, a `JobHandle` and a `JobType` — no dependency storage of its own, which keeps the zero-dependency fast path small. A job that *does* have dependencies is parked in a `PendingNode` (see below) until they are met.
+4. **[`DependencyGraph`](./dependency_graph.h)**
+   - Event-driven dependency resolution with no limit on fan-in. A dependent job becomes a `PendingNode` holding one `WaiterNode` per dependency, and each waiter is pushed onto that *dependency's own* lock-free waiter stack (stored in its `CounterPool` slot). Whichever thread drives a dependency's counter to zero harvests its stack and fires every waiter: no scanning, no global lock, no polling.
+   - A harvest *closes* the stack it drains rather than merely emptying it, which is what gives every `WaiterNode` exactly one owner — either the harvester that popped it, or the submitter whose push was refused. That exclusivity is what makes it safe to free a `PendingNode` the moment its last dependency fires.
+5. **[`Thread`](./thread.h)**
    - Non-copyable, non-movable thread wrapper managing execution loops, cooperative stop signals, and lifecycle logging.
-5. **[`JobEngine`](./engine.h)**
-   - Core parallel manager. Per-thread lock-free Chase-Lev work-stealing deques replace the previous mutex-guarded `std::deque` design. Workers use a spin-then-sleep strategy (configurable spin count) to minimize CV syscall overhead. Flat `std::array` lookup for thread dedications and type counts. Cache-line-padded atomics prevent false sharing. Provides `begin_frame()` / `end_frame()` lifecycle and `create_handle()` for zero-allocation handle allocation.
-6. **[`JobScheduler`](./scheduler.h)**
+6. **[`JobEngine`](./engine.h)**
+   - Core parallel manager, built on per-thread lock-free Chase-Lev work-stealing deques. Workers use a spin-then-sleep strategy (configurable spin count) to minimize CV syscall overhead. Flat `std::array` lookup for thread dedications and type counts. Cache-line-padded atomics prevent false sharing. `create_handle()` allocates handles without touching the heap. `begin_frame()`/`end_frame()` reset per-frame diagnostic counters only, and compile to nothing unless `COOPA_JOB_DIAGNOSTICS` is on.
+7. **[`JobScheduler`](./scheduler.h)**
    - Graph scheduler detecting RAW, WAR, and WAW hazards across enqueued jobs to auto-calculate dependencies. Per-frame `begin_frame()` / `end_frame()` clears persistent tracking maps to prevent unbounded memory growth. Uses `unordered_set` for O(1) reader-is-also-writer checks.
-7. **[`WorkStealingDeque`](./collections/work_stealing_deque.h)**
+8. **[`WorkStealingDeque`](./collections/work_stealing_deque.h)**
    - Lock-free Chase-Lev deque. Owner pushes/pops from the bottom (no synchronization), thieves steal from the top (single CAS). Fixed capacity, cache-line-padded top/bottom indices.
 
 ## Usage Code Example
@@ -97,18 +101,19 @@ void direct_submit() {
 }
 ```
 
-### Frame-boundary ownership when shared with `coopa::scene`
+### Sharing one engine across subsystems
 
-`begin_frame()`/`end_frame()` must have exactly one caller per `JobEngine`
-instance — `CounterPool::reset()` is an untagged bump-pointer reset, so a
-second `begin_frame()` from an unrelated caller silently invalidates every
-other subsystem's outstanding `JobHandle`s. When a `JobEngine` is installed
-on a `coopa::scene::Scene` via `Scene::set_job_engine()`, **`Scene` becomes
-that engine's sole frame-boundary owner** — every `coopa::scene::ISceneSystem`
-(e.g. `coopa::anim::AnimationSystem`) may call `create_handle()`/`submit()`/
-`submit_jobs()`/`wait_for()` on it, but must never call `begin_frame()`/
-`end_frame()` itself. See `coopa/scene/README.md`'s "Update Phases" section
-for how `Scene::update()`/`late_update()` drive that boundary. This is
-unrelated to `coopa::asset::AssetManager`'s own dedicated `JobEngine`, which
-is a separate instance with its own frame lifecycle — the two are never the
-same engine.
+A single `JobEngine` can be shared freely by any number of long-lived
+subsystems. Because `CounterPool` slots are generation-tagged and reclaimed
+individually, one subsystem can never invalidate another's outstanding
+`JobHandle`s, and no subsystem needs to own the frame boundary: any of them may
+call `create_handle()`/`submit()`/`submit_jobs()`/`wait_for()` at any time.
+
+`begin_frame()`/`end_frame()` only reset diagnostic counters, so calling them
+from more than one place costs nothing but muddled diagnostics. A `JobEngine`
+installed on a `coopa::scene::Scene` via `Scene::set_job_engine()` is shared on
+exactly these terms — `Scene` does not touch the engine's frame boundary at all.
+
+`coopa::asset::AssetManager` can likewise be handed an existing engine, and
+falls back to constructing a private one only when none is supplied. Its
+`decode()` jobs run at `Priority::Low` so they never preempt frame work.

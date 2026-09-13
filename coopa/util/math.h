@@ -3,19 +3,20 @@
  * @brief Utility structures and functions for matrix transformations and general mathematics.
  */
 
-#ifndef MATH_UTIL_H
-#define MATH_UTIL_H
+#ifndef COOPA_UTIL_MATH_H
+#define COOPA_UTIL_MATH_H
 
 #include <cstdlib>
 #include <iostream>
 #include <iomanip>
-#include <fstream> // Include this header for file operations
 
 #include <glm/glm.hpp>
 
 /**
  * @struct Mat4
  * @brief A 4x4 matrix implementation optimized for column-major printing and local multiplication hazards.
+ *
+ * Provided for consumers; libcoopa itself uses glm types throughout.
  */
 struct Mat4 {
     float m[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}}; /**< The 4x4 float array representing the matrix cells. */
@@ -147,4 +148,4 @@ private:
     MathUtil() = delete; /**< Disallow instantiation. */
 };
 
-#endif // MATH_UTIL_H
+#endif // COOPA_UTIL_MATH_H

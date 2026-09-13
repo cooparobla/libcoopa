@@ -7,11 +7,10 @@
  * std::function, and dispatches to either a plain `void()` body or a
  * `void(const JobContext&)` body depending on what the caller supplied.
  *
- * Job no longer carries its own dependency array -- with dependencies now
- * resolved event-driven and without an inline-count limit (see
- * dependency_graph.h), a job's unmet dependency list lives in a PendingNode
- * there instead, keeping Job itself small for the (overwhelmingly common)
- * zero-dependency fast path.
+ * A Job carries no dependency array of its own: an unmet dependency list lives
+ * in a PendingNode in dependency_graph.h, which resolves dependencies
+ * event-driven and with no inline-count limit. That keeps Job itself small for
+ * the (overwhelmingly common) zero-dependency fast path.
  */
 
 #ifndef COOPA_JOB_JOB_H

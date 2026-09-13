@@ -8,13 +8,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# CMAKE_CURRENT_SOURCE_DIR/CMAKE_CURRENT_BINARY_DIR, not CMAKE_SOURCE_DIR/
-# CMAKE_BINARY_DIR: this file is now also pulled in via add_subdirectory()
-# from gfxcoopa (and, once migrated, every other consumer), where
-# CMAKE_SOURCE_DIR/CMAKE_BINARY_DIR refer to the *top-level* project's dirs,
-# not libcoopa's own. Using the un-prefixed variables here was latent and
-# harmless while libcoopa only ever built standalone; it broke the moment
-# something else add_subdirectory'd it.
+# Always CMAKE_CURRENT_SOURCE_DIR/CMAKE_CURRENT_BINARY_DIR, never
+# CMAKE_SOURCE_DIR/CMAKE_BINARY_DIR: consumers pull this file in via
+# add_subdirectory(), where the un-prefixed variables point at the *top-level*
+# project's directories rather than libcoopa's own.
 get_filename_component(ROOT_DIR_PARENT "${CMAKE_CURRENT_SOURCE_DIR}" DIRECTORY)
 
 # Configure and include root directory header
@@ -35,11 +32,9 @@ target_include_directories(libcoopa_lib INTERFACE
 target_compile_definitions(libcoopa_lib INTERFACE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
 
 # The job system uses std::thread/std::mutex/std::condition_variable directly
-# (coopa/job/engine.h, thread.h); on some platforms/toolchains that requires
-# explicitly linking a threading library (e.g. pthreads on Linux), which this
-# target never did before -- it happened to work by accident of libstdc++
-# pulling it in transitively. Threads::Threads is a no-op on toolchains that
-# don't need it (e.g. most Windows configurations).
+# (coopa/job/engine.h, thread.h), which on some platforms/toolchains requires
+# explicitly linking a threading library (e.g. pthreads on Linux).
+# Threads::Threads is a no-op where none is needed (e.g. most Windows configs).
 find_package(Threads REQUIRED)
 target_link_libraries(libcoopa_lib INTERFACE Threads::Threads)
 

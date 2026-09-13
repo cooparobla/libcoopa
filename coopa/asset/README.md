@@ -143,10 +143,11 @@ it removes `std::shared_ptr<void>` casts from the implementation.
 ### [`asset_source.h`](file:///home/coopa/git/libcoopa/coopa/asset/asset_source.h)
 
 `AssetSource` — search-root path resolution (`add_search_root`, `resolve`,
-`exists`) plus static `read_bytes`/`last_write_time_ns` helpers. Deliberately
-supersedes `coopa::util::FileUtil` (global-namespace legacy with a live
-substring-length bug and no users outside libcoopa's own tests) rather than
-building on it.
+`exists`) plus static `read_bytes`/`last_write_time_ns` helpers. Resolution is
+self-contained: paths resolve against the source's own base directory and
+search roots, with no dependency on process-wide roots or environment
+variables. This is the resolver asset loaders should use; `coopa::util::FileUtil`
+is a separate, process-global path helper serving a different purpose.
 
 ### [`asset_manager.h`](file:///home/coopa/git/libcoopa/coopa/asset/asset_manager.h)
 

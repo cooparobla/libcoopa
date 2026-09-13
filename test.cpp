@@ -369,6 +369,61 @@ void test_job_scheduler_main_thread() {
     scheduler.end_frame();
 }
 
+// A main-thread job that is queued but never executed must still have its
+// handle slot returned to the CounterPool by end_frame(). The pool here is
+// deliberately tiny so that a per-frame slot leak exhausts it long before the
+// loop finishes, which is what makes this a real tripwire rather than a
+// no-op: once the pool is exhausted, create_handle() starts handing back
+// invalid handles and every subsequent submission silently degrades.
+void test_job_scheduler_end_frame_reclaims_unexecuted_main_thread_jobs() {
+    constexpr uint32_t k_pool_capacity = 32;
+    coopa::job::JobEngine engine(2, 256, k_pool_capacity);
+    coopa::job::JobScheduler scheduler(engine);
+
+    std::atomic<int> ran{0};
+
+    for (uint32_t frame = 0; frame < k_pool_capacity * 8; ++frame) {
+        scheduler.begin_frame();
+        scheduler.add_job([&]() { ran.fetch_add(1); }, 1, {}, {}, true /* is_main_thread_job */);
+        scheduler.submit_all();
+        // Deliberately skip execute_main_thread_jobs() -- the dropped-job path.
+        scheduler.end_frame();
+
+        ASSERT_EQ(engine.get_counter_pool().debug_outstanding_count(), 0u);
+    }
+
+    // The dropped tasks must never have run...
+    ASSERT_EQ(ran.load(), 0);
+    // ...and the pool must still be able to serve a fresh handle.
+    coopa::job::JobHandle handle = engine.create_handle();
+    ASSERT_TRUE(handle.is_valid());
+    handle.close();
+}
+
+// A job depending on a main-thread job that gets dropped by end_frame() must
+// still be released, not stranded: end_frame() resolves the dropped handle's
+// completion rather than merely closing it.
+void test_job_scheduler_dropped_main_thread_job_releases_dependents() {
+    coopa::job::JobEngine engine(2);
+    coopa::job::JobScheduler scheduler(engine);
+
+    scheduler.begin_frame();
+    scheduler.add_job([]() {}, 1, {}, {typeid(int)}, true /* is_main_thread_job */);
+    std::vector<coopa::job::JobHandle> handles = scheduler.submit_all();
+    ASSERT_EQ(handles.size(), static_cast<size_t>(1));
+
+    std::atomic<bool> dependent_ran{false};
+    coopa::job::JobHandle dependent = engine.create_handle();
+    engine.submit([&]() { dependent_ran.store(true); }, 1, dependent,
+                  handles.data(), 1);
+
+    scheduler.end_frame();
+
+    engine.wait_for(dependent);
+    ASSERT_TRUE(dependent_ran.load());
+    dependent.close();
+}
+
 void test_job_engine_dependencies() {
     coopa::job::JobEngine engine(4);
     engine.begin_frame();
@@ -484,29 +539,20 @@ void test_job_engine_fan_in_dependencies() {
 }
 
 void test_job_engine_repeated_engines_no_lost_or_phantom_jobs() {
-    // Regression test for two bugs found while building coopa::asset (which
-    // constructs a fresh, short-lived JobEngine per AssetManager and calls
-    // wait_for() from the main thread immediately after submit()):
+    // Covers the short-lived-engine pattern (construct an engine, submit, then
+    // wait_for() from the main thread immediately) against two failure modes:
     //
-    // 1. submit()'s no-dependency path used wake_one_worker() (notify_one())
-    //    for a job deposited into one SPECIFIC thread's inbox. notify_one()
-    //    can wake an unrelated idle thread instead of that inbox's owner; if
-    //    every other worker was already asleep, the real owner never woke
-    //    and wait_for() on that job's handle hung forever.
-    // 2. WorkStealingDeque::pop() and steal() both used to move their output
-    //    item out of the shared buffer slot BEFORE confirming their CAS on
-    //    top_ actually won ownership of that slot. On the well-known
-    //    contended "last element" path, the loser had already performed an
-    //    unsynchronized move-read of the same slot the winner was also
-    //    moving from. For a plain scalar this is harmless in practice; for
-    //    Job (whose TaskWrapper move nulls out the source's callable) it can
-    //    silently hand back a corrupted, no-op job while the counter still
-    //    gets decremented as if it ran — wait_for() returns having believed
-    //    the job completed, but its body never executed.
+    // 1. Lost wakeup: a job deposited into one SPECIFIC worker's inbox must
+    //    wake THAT worker. Waking an arbitrary idle worker instead leaves the
+    //    inbox's owner asleep, and wait_for() on that handle hangs forever.
+    // 2. Phantom completion: a job's counter must only be decremented by a
+    //    worker that actually ran its body. A torn hand-off (see
+    //    test_work_stealing_deque_no_torn_moves_under_contention) can yield a
+    //    no-op job whose counter is still decremented, so wait_for() returns
+    //    believing work completed that never executed.
     //
-    // A tight repeated construct/submit/wait_for loop reproduced both within
-    // a few hundred iterations before the fix; this keeps a permanent,
-    // bounded-runtime tripwire for a regression.
+    // A tight repeated construct/submit/wait_for loop is what exposes both, so
+    // this runs a few hundred iterations as a bounded-runtime tripwire.
     const int k_iterations = 400;
     for (int i = 0; i < k_iterations; ++i) {
         coopa::job::JobEngine engine(2);
@@ -558,11 +604,10 @@ void test_work_stealing_deque() {
 }
 
 void test_work_stealing_deque_no_torn_moves_under_contention() {
-    // Regression test: pop() and steal() both used to move their output item
-    // out of buffer_[idx] BEFORE their CAS on top_ confirmed they actually
-    // won that slot. On the contended "exactly one item left" path, the
-    // loser (owner pop() vs. a thief, or two racing thieves) had already
-    // done an unsynchronized move-read of the same slot the winner was also
+    // pop() and steal() must each win their CAS on top_ BEFORE moving the item
+    // out of buffer_[idx]. On the contended "exactly one item left" path, the
+    // loser (owner pop() vs. a thief, or two racing thieves) would otherwise
+    // perform an unsynchronized move-read of the same slot the winner is also
     // moving from. A plain int can't reveal this (a racy read of a scalar
     // just yields a value, not corruption); a type whose move leaves the
     // source in a detectably-different state can.
@@ -626,6 +671,93 @@ void test_work_stealing_deque_no_torn_moves_under_contention() {
 // dependencies, parallel_for, cancellation, priority.
 // ---------------------------------------------------------
 
+// Hammers the interleaving where a WaiterNode is held by two threads at once:
+// submit_with_dependencies()'s phase-2 re-check and a completer's
+// harvest_and_fire(). Either may win the node's `fired` CAS and drive `unmet`
+// to zero; the loser still dereferences the node afterwards, so freeing it at
+// that moment is a use-after-free.
+//
+// Every dependency is completed by its own thread, all released from a spin
+// barrier at the instant the submitting thread enters phase 1, so the final
+// `unmet` decrement lands while other threads are still walking their harvest.
+// Best run under ASan/TSan; what it asserts unconditionally is that the
+// dependent job runs exactly once -- never lost, never doubled.
+// A handle may be reused after its counter has already reached zero (the
+// fan-in pattern in handle.h's doc: submit, let it finish, submit more against
+// the same handle). A dependent registered against the SECOND wave must wait
+// for that wave, not be told the handle is already complete because the first
+// wave finished.
+void test_job_engine_dependency_on_reused_handle_waits_for_second_wave() {
+    for (int iteration = 0; iteration < 50; ++iteration) {
+        coopa::job::JobEngine engine(2);
+        coopa::job::JobHandle shared = engine.create_handle();
+
+        // Wave 1: drive the counter to zero.
+        engine.submit([]() {}, 1, shared);
+        engine.wait_for(shared);
+
+        // Wave 2: same handle, slow enough that an early-firing dependent
+        // would observe the flag still unset.
+        std::atomic<bool> wave2_done{false};
+        engine.submit([&]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            wave2_done.store(true);
+        }, 1, shared);
+
+        std::atomic<bool> saw_wave2{false};
+        coopa::job::JobHandle dependent = engine.create_handle();
+        engine.submit([&]() { saw_wave2.store(wave2_done.load()); }, 1, dependent, &shared, 1);
+
+        engine.wait_for(dependent);
+        ASSERT_TRUE(saw_wave2.load());
+
+        shared.close();
+        dependent.close();
+        engine.shutdown();
+    }
+}
+
+void test_dependency_graph_waiter_node_lifetime_under_contention() {
+    constexpr int k_iterations = 3000;
+    constexpr int k_deps = 8;
+
+    coopa::job::JobEngine engine(4);
+
+    for (int iteration = 0; iteration < k_iterations; ++iteration) {
+        coopa::job::JobHandle deps[k_deps];
+        for (int i = 0; i < k_deps; ++i) {
+            deps[i] = engine.create_handle();
+            deps[i].add_jobs_(1); // Completed by hand below, not by a queued task.
+        }
+
+        std::atomic<int> dependent_runs{0};
+        std::atomic<bool> go{false};
+        coopa::job::JobHandle dependent = engine.create_handle();
+
+        std::vector<std::thread> completers;
+        completers.reserve(k_deps);
+        for (int i = 0; i < k_deps; ++i) {
+            completers.emplace_back([&, i]() {
+                while (!go.load(std::memory_order_acquire)) { /* spin */ }
+                engine.complete_external_job(deps[i]);
+            });
+        }
+
+        go.store(true, std::memory_order_release);
+        engine.submit([&]() { dependent_runs.fetch_add(1); }, 1, dependent, deps, k_deps);
+
+        for (std::thread& t : completers) t.join();
+
+        engine.wait_for(dependent);
+        ASSERT_EQ(dependent_runs.load(), 1); // Ran exactly once: not lost, not doubled.
+
+        dependent.close();
+        for (int i = 0; i < k_deps; ++i) deps[i].close();
+    }
+
+    engine.shutdown();
+}
+
 void test_job_handle_generation_prevents_stale_aliasing() {
     coopa::job::JobEngine engine(2, 8, 4); // handle_pool_capacity = 4
     coopa::job::JobHandle first = engine.create_handle();
@@ -644,9 +776,9 @@ void test_job_handle_generation_prevents_stale_aliasing() {
         churn.push_back(h);
     }
 
-    // stale_copy's generation can no longer match whichever handle now
-    // occupies that slot -- it must report complete regardless, and must
-    // never be mistaken for one of the new occupants.
+    // stale_copy's generation cannot match whichever handle now occupies that
+    // slot -- it must report complete regardless, and must never be mistaken
+    // for one of the new occupants.
     ASSERT_TRUE(stale_copy.is_complete());
     for (auto& h : churn) {
         ASSERT_TRUE(!(h == stale_copy));
@@ -745,8 +877,8 @@ void test_job_engine_counter_pool_exhaustion_recovers() {
 void test_job_engine_nested_wait_for_from_worker() {
     // Single worker: `inner` can only ever be picked up by this same worker
     // acting as a real worker during its nested wait_for(), not by another
-    // worker stealing it -- a genuine regression tripwire for the guest-only
-    // wait_for() that used to be unable to touch its own deque.
+    // worker stealing it: a nested wait_for() must be able to serve itself
+    // from its own deque, or this deadlocks.
     coopa::job::JobEngine engine(1);
     std::atomic<bool> inner_ran{false};
 
@@ -851,9 +983,9 @@ void test_job_handle_survives_begin_end_frame() {
 }
 
 void test_job_engine_shared_across_frames_and_subsystems() {
-    // Simulates two independent subsystems sharing one engine across several
-    // frames with no coordination beyond the engine itself -- the pattern
-    // that used to require AssetManager to own a private JobEngine.
+    // Two independent subsystems sharing one engine across several frames with
+    // no coordination beyond the engine itself -- neither may disturb the
+    // other's outstanding handles.
     coopa::job::JobEngine engine(2);
     std::atomic<int> subsystem_a_count{0};
     std::atomic<int> subsystem_b_count{0};
@@ -1241,13 +1373,11 @@ void test_asset_manager_rejects_type_mismatch() {
 }
 
 void test_asset_manager_base_dir_prevents_collision() {
-    // Regression test: identity used to be built from the raw virtual_path
-    // alone, before it was resolved against base_dir. Two different scene
-    // directories that both reference the same relative filename (e.g.
-    // "meshes/cube.000.yaml" in gfxcoopa's real usage) would silently share
-    // one cached slot and one would serve the other's asset. AssetId must
-    // be built from the RESOLVED path instead, so distinct files with the
-    // same relative name never collide.
+    // An AssetId must be built from the RESOLVED path, never from the raw
+    // virtual_path. Two scene directories that both reference the same
+    // relative filename (e.g. "meshes/cube.000.yaml" in gfxcoopa's real usage)
+    // would otherwise share one cached slot, and one would serve the other's
+    // asset.
     using namespace asset_test;
     coopa::asset::AssetManager assets;
     assets.register_loader<TextAsset>(std::make_unique<TextAssetLoader>());
@@ -1968,12 +2098,12 @@ void test_scene_inherit_no_inherit_unchanged() {
 // Scene phase pipeline tests
 // ---------------------------------------------------------
 //
-// These guard the entire compatibility risk of the coopa::scene::ISceneSystem
-// pipeline: Scene::update()/late_update() used to be two hardcoded Component
-// tree walks; they are now an ordered list of systems, of which the walks are
-// just the two built-ins. Every existing consumer (blendy/toyengine call
-// update() only; several uicoopa tests call late_update() standalone; two
-// callers call both) must see byte-identical behavior.
+// Scene::update()/late_update() each run an ordered list of ISceneSystems, of
+// which the recursive Component tree walks are just the two built-ins. These
+// tests pin that down for every calling shape consumers actually use:
+// update() only (blendy/toyengine), late_update() standalone (several uicoopa
+// tests), and both together. With only the built-ins registered, each entry
+// point must behave exactly like a direct Component tree walk.
 
 namespace scene_pipeline_test {
 
@@ -2107,16 +2237,13 @@ void test_scene_late_update_standalone() {
 void test_scene_frame_boundary_update_only() {
     using namespace scene_pipeline_test;
 
-    // Regression coverage for the old design: Scene::update() used to have
-    // to reset the engine's frame boundary itself every call for a caller
+    // Scene never touches the engine's frame boundary, including for a caller
     // that only ever calls update() and never late_update() (the
-    // blendy/toyengine shape), since CounterPool was an untagged bump
-    // allocator only ever reclaimable in bulk. Now that handles are
-    // individually reclaimed (see coopa/job/handle.h), Scene no longer
-    // touches the frame boundary at all -- this runs far more iterations
-    // than the tiny handle pool capacity (4) could hold at once, relying
-    // entirely on JobUsingSystem's own handle.close() each call to keep the
-    // pool from ever exhausting.
+    // blendy/toyengine shape). Handles are reclaimed individually (see
+    // coopa/job/handle.h), so this runs far more iterations than the tiny
+    // handle pool capacity (4) could ever hold at once, relying entirely on
+    // JobUsingSystem's own handle.close() each call to keep the pool from
+    // exhausting.
     coopa::job::JobEngine engine(2, 64, 4);
     coopa::scene::Scene scene("FrameBoundaryUpdateOnly");
     scene.set_job_engine(&engine);
@@ -2161,7 +2288,7 @@ void test_scene_add_remove_system() {
 
     ASSERT_TRUE(scene.remove_system("Behaviour"));
     scene.update(0.016f);
-    ASSERT_EQ(counter->update_count, 1); // unchanged: the built-in Component::update() walk no longer runs
+    ASSERT_EQ(counter->update_count, 1); // removing BehaviourSystem stops the Component::update() walk
 }
 
 void test_scene_move_preserves_systems() {
@@ -3188,7 +3315,7 @@ void test_animation_system_parallel_matches_serial() {
     engine.shutdown();
 }
 
-void test_procedural_orbit_matches_legacy_formula() {
+void test_procedural_orbit_matches_closed_form() {
     using namespace coopa::anim;
     using namespace coopa::scene;
 
@@ -3224,8 +3351,8 @@ void test_procedural_orbit_matches_legacy_formula() {
         accumulated = t;
         scene.update(dt);
         scene.late_update(dt);
-        // The old AnimationComponent's formula, verbatim -- this test is the
-        // automated half of the blendy migration's correctness guarantee.
+        // The closed-form orbit the procedural evaluator must reproduce:
+        // centre + radius * {cos, sin}(speed * t + phase), with a fixed z.
         float ex = -1.5f + 2.7f * std::cos(1.0f * t + 0.0f);
         float ey = 0.0f + 2.7f * std::sin(1.0f * t + 0.0f);
         float ez = 0.0f + 1.0f;
@@ -3290,7 +3417,7 @@ void test_procedural_crossfade_against_keyframed() {
 // ---------------------------------------------------------
 namespace input_test {
 
-// --- input_map.h --- (ported from gfxcoopa/pixengine, KeyState-predicate form)
+// --- input_map.h --- (KeyState-predicate form)
 
 static void test_input_map_action_down_with_any_bound_key() {
     using namespace coopa::input;
@@ -3298,10 +3425,9 @@ static void test_input_map_action_down_with_any_bound_key() {
     map.bind("jump", Key::Space);
     map.bind("jump", Key::W);
 
-    // A magic keycode (e.g. a raw backend int) would have silently misbehaved
-    // here under the sealed dense Key enum -- this test exists specifically
-    // to keep that class of bug (see pixengine's original migration notes)
-    // impossible.
+    // Every key bound to an action participates: with two keys bound, holding
+    // either one must report the action as down. The dense Key enum is what
+    // keeps this exhaustive -- there is no out-of-band keycode to miss.
     auto only_w_down = [](Key k) { return k == Key::W; };
     ASSERT_TRUE(map.is_down("jump", only_w_down));
 
@@ -3695,7 +3821,7 @@ static void test_inventory_split_and_clear_slot() {
     ASSERT_EQ(inv.at(0).count, 6);
     ASSERT_EQ(inv.at(1).count, 4);
 
-    ASSERT_TRUE(!inv.split(0, 0, 1)); // count must be > 0 -- slot1 no longer empty anyway
+    ASSERT_TRUE(!inv.split(0, 0, 1)); // count must be > 0 -- and slot1 isn't empty at this point anyway
 
     inv.clear_slot(0);
     ASSERT_TRUE(inv.at(0).empty());
@@ -3928,12 +4054,16 @@ int main() {
     RUN_TEST(test_job_engine);
     RUN_TEST(test_job_scheduler);
     RUN_TEST(test_job_scheduler_main_thread);
+    RUN_TEST(test_job_scheduler_end_frame_reclaims_unexecuted_main_thread_jobs);
+    RUN_TEST(test_job_scheduler_dropped_main_thread_job_releases_dependents);
     RUN_TEST(test_job_engine_dependencies);
     RUN_TEST(test_job_engine_chained_dependencies);
     RUN_TEST(test_job_engine_fan_in_dependencies);
     RUN_TEST(test_job_engine_repeated_engines_no_lost_or_phantom_jobs);
     RUN_TEST(test_work_stealing_deque);
     RUN_TEST(test_work_stealing_deque_no_torn_moves_under_contention);
+    RUN_TEST(test_job_engine_dependency_on_reused_handle_waits_for_second_wave);
+    RUN_TEST(test_dependency_graph_waiter_node_lifetime_under_contention);
     RUN_TEST(test_job_handle_generation_prevents_stale_aliasing);
     RUN_TEST(test_job_engine_fan_in_16_dependencies);
     RUN_TEST(test_job_engine_deque_overflow_falls_back_to_global_queue);
@@ -4011,7 +4141,7 @@ int main() {
     RUN_TEST(test_animation_rotation_does_not_wrap);
     RUN_TEST(test_animation_clip_loader_yaml);
     RUN_TEST(test_animation_system_parallel_matches_serial);
-    RUN_TEST(test_procedural_orbit_matches_legacy_formula);
+    RUN_TEST(test_procedural_orbit_matches_closed_form);
     RUN_TEST(test_procedural_crossfade_against_keyframed);
     // Run last: registers the "Animator" SceneLoader parser with a closure
     // capturing a local AssetManager, and tears both down at the end.

@@ -3,11 +3,9 @@
  * @brief Named action/axis bindings over keys and mouse buttons, resolved
  * against an Input.
  *
- * Originally gfxcoopa/input/input_map.h (namespace coopa::gfx::input, itself
- * a consolidation of near-identical copies duplicated in toyengine and
- * pixengine) — moved here alongside keys.h; see coopa/input/README.md. Since
- * moving, it has grown mouse-button bindings, modifier chords, edge queries,
- * and 2D vector bindings, on top of the original key/axis surface.
+ * Covers key and mouse-button bindings, modifier chords, edge queries, axis
+ * pairs, and 2D vector bindings. Lives alongside keys.h, independent of any
+ * windowing library; see coopa/input/README.md.
  */
 
 #ifndef COOPA_INPUT_INPUT_MAP_H
@@ -105,9 +103,9 @@ public:
     }
 
     /// @brief True if any key bound to `action` is currently down, per
-    /// `is_key_pressed`. Legacy predicate form, kept for callers that want to
-    /// query without constructing a real Input (e.g. a mock over a fake key
-    /// set); only Key bindings participate, since a KeyState has no notion of
+    /// `is_key_pressed`. Predicate form, for callers that want to query
+    /// without constructing a real Input (e.g. a mock over a fake key set);
+    /// only Key bindings participate, since a KeyState has no notion of
     /// mouse buttons or modifiers.
     bool is_down(std::string_view action, const KeyState& is_key_pressed) const {
         for (const Binding& b : bindings(action)) {
@@ -132,7 +130,7 @@ public:
         return value;
     }
 
-    /// @brief Legacy predicate form of axis() -- see is_down(action, const KeyState&).
+    /// @brief Predicate form of axis() -- see is_down(action, const KeyState&).
     float axis(std::string_view axis, const KeyState& is_key_pressed) const {
         auto it = axes_.find(std::string(axis));
         if (it == axes_.end()) return 0.0f;

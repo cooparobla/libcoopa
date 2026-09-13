@@ -220,7 +220,7 @@ public:
      */
     static void register_component_parser(const std::string& name, ComponentParser fn) {
         std::unique_lock<std::shared_mutex> lock(parsers_mutex_());
-        parsers_()[normalize_tag_(name)] = std::move(fn);
+        parsers_()[normalize_component_tag(name)] = std::move(fn);
     }
 
     /**
@@ -285,11 +285,6 @@ private:
     static std::shared_mutex& loader_mutex_() {
         static std::shared_mutex mutex;
         return mutex;
-    }
-
-    /** @brief Strips a leading '!' so tag-form and type-form names compare equal. */
-    static std::string normalize_tag_(const std::string& tag) {
-        return (!tag.empty() && tag[0] == '!') ? tag.substr(1) : tag;
     }
 
     /** @brief Loads and parses the root node, via the custom loader if one is installed. */
@@ -368,7 +363,7 @@ private:
         } else {
             raw_tag = node.get_tag_name();
         }
-        std::string tag = normalize_tag_(raw_tag);
+        std::string tag = normalize_component_tag(raw_tag);
 
         if (tag == "Transform") {
             if (auto* tc = obj.get_transform()) {

@@ -218,15 +218,13 @@ public:
      * @brief Runs every registered system with order < UpdatePhase::LateBehaviour.
      *
      * With nothing else registered this is just the built-in BehaviourSystem
-     * (the recursive Component::update() walk), so existing callers see no
-     * change.
+     * (the recursive Component::update() walk), making it equivalent to a
+     * direct walk of the Component tree.
      *
-     * A JobEngine installed via set_job_engine() is handed to every system
-     * via FrameContext::jobs, but this Scene no longer drives its frame
-     * boundary (begin_frame()/end_frame() are diagnostics-only now that
-     * JobHandle slots are individually reclaimed rather than bulk-reset per
-     * frame -- see coopa/job/handle.h) -- an engine may be freely shared
-     * across many concurrently-processing Scenes and other subsystems.
+     * A JobEngine installed via set_job_engine() is handed to every system via
+     * FrameContext::jobs. This Scene never touches that engine's frame
+     * boundary, so one engine may be freely shared across many
+     * concurrently-processing Scenes and other subsystems.
      *
      * Safe to call from any thread, but only ONE thread at a time for a
      * given Scene -- see this class's single-owner doc. Multiple distinct
@@ -347,10 +345,9 @@ public:
      * @brief Installs the JobEngine every system sees via FrameContext::jobs
      *        (non-owning; the caller keeps ownership).
      *
-     * Unlike earlier revisions, this Scene does NOT need exclusive ownership
-     * of the engine's frame boundary -- JobHandle slots are individually
-     * reclaimed rather than bulk-reset (see coopa/job/handle.h), so the same
-     * engine may be freely shared across this Scene, other concurrently-
+     * This Scene needs no exclusive ownership of the engine's frame boundary:
+     * JobHandle slots are reclaimed individually (see coopa/job/handle.h), so
+     * the same engine may be shared across this Scene, other concurrently-
      * processing Scenes, coopa::asset::AssetManager, and anything else, with
      * no coordination required between them.
      *
@@ -505,7 +502,7 @@ public:
      * The FIRST segment is resolved with find_object() (name-anywhere, depth-first); each
      * subsequent segment must name a DIRECT child of the previous match (SceneObject::find_child()).
      * A single-segment path is therefore exactly equivalent to find_object(), which makes this a
-     * strict superset -- callers can accept a path everywhere they used to accept a bare name.
+     * strict superset -- a path is accepted anywhere a bare name is.
      * Resolving the head loosely is what lets "sdf_blob:sdf_blob_sphere" work whether or not
      * sdf_blob happens to be a root object.
      *

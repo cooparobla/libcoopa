@@ -3,8 +3,8 @@
  * @brief Thread-safe ParallelVector collection template.
  */
 
-#ifndef THREADABLE_VECTOR_H
-#define THREADABLE_VECTOR_H
+#ifndef COOPA_JOB_COLLECTIONS_VECTOR_H
+#define COOPA_JOB_COLLECTIONS_VECTOR_H
 
 #include <vector>
 #include <mutex>
@@ -17,6 +17,9 @@ namespace job {
 /**
  * @class ParallelVector
  * @brief Thread-safe vector wrapper using std::vector, std::mutex, and std::condition_variable.
+ *
+ * Provided for consumers; the job system itself does not use it.
+ *
  * @tparam T Element type.
  */
 template<typename T>

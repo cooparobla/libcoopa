@@ -2,13 +2,12 @@
  * @file scene_system.h
  * @brief Ordered per-frame system pipeline that Scene::update()/late_update() drive.
  *
- * A Scene no longer just walks Component::update()/late_update() directly —
- * it runs a small ordered list of ISceneSystem instances, of which the
- * Component walks are just the two built-in members (BehaviourSystem and
- * LateBehaviourSystem). This gives future subsystems (animation now, physics
- * later) a defined point in the frame to run at, and gives the Scene a single
- * place to own a JobEngine's frame boundary — see FrameContext::jobs below
- * for why that ownership matters.
+ * A Scene runs a small ordered list of ISceneSystem instances, of which the
+ * recursive Component::update()/late_update() walks are just the two built-in
+ * members (BehaviourSystem and LateBehaviourSystem). This gives every
+ * subsystem (animation, transform resolution, a future physics system) a
+ * defined point in the frame to run at, and a single place to reach the
+ * Scene's JobEngine — see FrameContext::jobs below.
  */
 
 #ifndef COOPA_SCENE_SCENE_SYSTEM_H
@@ -40,14 +39,12 @@ class SceneCommandBuffer; // Forward declaration only, for the same reason as Jo
  *
  * Scene::update() runs every system with order < LateBehaviour;
  * Scene::late_update() runs every system with order >= LateBehaviour. That
- * split is what keeps both existing public entry points behaving exactly as
- * they did before this pipeline existed (see Scene::update()'s doc for the
- * full compatibility argument) while still landing Animation before the
- * built-in late_update() walk, matching Unity's Update -> animation ->
- * LateUpdate order.
+ * split keeps each public entry point responsible for exactly the phases named
+ * after it, and lands Animation before the built-in late_update() walk,
+ * matching Unity's Update -> animation -> LateUpdate order.
  */
 enum class UpdatePhase : int {
-    Physics         = 100, ///< Reserved. No implementation ships with this change.
+    Physics         = 100, ///< Reserved. No implementation ships in libcoopa.
     Behaviour       = 200, ///< Built-in: the recursive Component::update() walk.
     Animation       = 300, ///< coopa::anim::AnimationSystem: evaluate + apply.
     TransformResolve = 350, ///< coopa::scene::TransformSystem: top-down world-matrix resolve.
@@ -68,14 +65,14 @@ struct FrameContext {
      * nullptr means no engine was ever installed via Scene::set_job_engine()
      * — every system must then do its work inline on the calling thread. This
      * is the default, so an application that never touches set_job_engine()
-     * spawns no threads and behaves exactly as it did before phases existed.
+     * spawns no threads and every system runs inline on the calling thread.
      *
      * A system MAY call create_handle()/submit()/submit_jobs()/parallel_for()/
      * wait_for() on this engine, and MAY call begin_frame()/end_frame() on it
-     * (they are diagnostics-only now -- see coopa/job/handle.h -- so unlike
-     * earlier revisions there is no shared frame-boundary state to corrupt by
-     * doing so). This same engine may be installed on multiple Scenes at
-     * once, each processed concurrently as its own job.
+     * (those are diagnostics-only -- see coopa/job/handle.h -- so there is no
+     * shared frame-boundary state to corrupt by doing so). This same engine
+     * may be installed on multiple Scenes at once, each processed
+     * concurrently as its own job.
      */
     coopa::job::JobEngine* jobs = nullptr;
 
@@ -85,8 +82,8 @@ struct FrameContext {
      * A system executing inline (worker_index == k_main_thread_index, the
      * top-level case Scene::update()/late_update() always pass) may write
      * through `commands` OR call a mutating Scene/SceneObject method
-     * directly, same as before this existed -- both are safe on the owner
-     * thread. A system that fans work out across jobs (e.g. via
+     * directly -- both are safe on the owner thread. A system that fans work
+     * out across jobs (e.g. via
      * JobEngine::parallel_for()) must have each chunk record into
      * `scene.commands_for(chunk_ctx.worker_index)` (using ITS OWN
      * per-chunk JobContext::worker_index, not this outer FrameContext's)

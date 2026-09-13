@@ -6,16 +6,13 @@ time, modifiers, and cursor/clipboard control — so that every consumer of
 this workspace (gfxcoopa, uicoopa, pixengine, toyengine, blendy) talks to
 **one** input API and never names a windowing library's own input calls.
 
-It used to live in gfxcoopa (`gfxcoopa/input/keys.h` and `input_map.h`,
-namespace `coopa::gfx::input`), which was the wrong home: those two files had
-zero dependency on Vulkan or GLFW, yet every downstream repo had to pull in a
-full graphics stack just to name `Key::Space`. Meanwhile the actual input
-*state* — polling, callbacks, accumulators — lived in gfxcoopa's
-`presentation::Window`, mixed in with GLFW window management, and was
-incomplete enough that consumers reimplemented pieces of it: uicoopa
-hand-rolled mouse-button edge detection, toyengine hand-rolled cursor-delta
-tracking with first-frame suppression. `coopa::input::Input` absorbs all of
-that into one place.
+The module lives in libcoopa rather than in a graphics package because none of
+it depends on Vulkan, GLFW, or any windowing library: naming `Key::Space` must
+not require pulling in a full graphics stack. Input *state* — level, edges,
+held time, accumulators — lives here too, in `coopa::input::Input`, rather than
+inside whichever class happens to own the OS window, so consumers query one
+complete API instead of reimplementing edge detection or cursor-delta tracking
+for themselves. A windowing backend only feeds it via `push_*()`.
 
 ---
 
@@ -77,8 +74,7 @@ state persists frame to frame; `pressed`/`released` edges and every
 accumulator (`chars()`, `key_events()`, `cursor_delta()`, `scroll_delta()`,
 ...) are scoped to exactly one frame.
 
-Two behaviors worth knowing about, both absorbed from workarounds that used
-to live in consumer repos:
+Two behaviors worth knowing about:
 
 - **First-frame cursor delta suppression.** The very first `push_cursor_position()`
   ever, and the first one after `set_cursor_mode()` changes mode, reports a
@@ -126,8 +122,7 @@ ASSERT_TRUE(input.key_pressed(Key::Space));
 ## Testing
 
 Unit tests live in `libcoopa`'s top-level `test.cpp`, under `input_test`:
-`InputMap` binding/unbind/axis behavior (ported unchanged from gfxcoopa,
-where they were pixengine's originally), plus `Input` coverage for
+`InputMap` binding/unbind/axis behavior, plus `Input` coverage for
 press/release edges clearing on `begin_frame()`, held-time accumulation, a
 press+release inside one frame setting both edges, cursor delta including
 first-frame suppression and re-arming after `set_cursor_mode()`,

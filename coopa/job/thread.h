@@ -29,8 +29,9 @@ namespace job {
  *
  * Each Thread wraps a std::thread and provides:
  * - Atomic stop flag for cooperative cancellation.
- * - Per-thread mutex and condition variable (passed to the loop callback
- *   for backward compatibility, though the engine uses shared synchronization).
+ * - Per-thread mutex and condition variable, passed to the loop callback for
+ *   callbacks that want to park on them. JobEngine's own worker loop parks on
+ *   the engine-wide pair instead, so it ignores both.
  * - Lifecycle logging on construction and destruction.
  *
  * Thread is non-copyable and non-movable.

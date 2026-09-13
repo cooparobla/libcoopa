@@ -3,8 +3,8 @@
  * @brief Defines the LogMessage structure representing a log entry.
  */
 
-#ifndef LOG_MESSAGE_H
-#define LOG_MESSAGE_H
+#ifndef COOPA_DEBUG_MESSAGE_H
+#define COOPA_DEBUG_MESSAGE_H
 
 #include <chrono>
 #include <string>
@@ -51,4 +51,4 @@ struct LogMessage {
 }
 }
 
-#endif // LOG_MESSAGE_H
+#endif // COOPA_DEBUG_MESSAGE_H

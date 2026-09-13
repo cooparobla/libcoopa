@@ -3,8 +3,8 @@
  * @brief Utility functions for string manipulations within the StringUtil namespace.
  */
 
-#ifndef STRING_UTIL_H
-#define STRING_UTIL_H
+#ifndef COOPA_UTIL_STRING_H
+#define COOPA_UTIL_STRING_H
 
 #include <string>
 #include <vector>
@@ -97,4 +97,4 @@ namespace StringUtil {
 
 } 
 
-#endif // STRING_UTIL_H
+#endif // COOPA_UTIL_STRING_H

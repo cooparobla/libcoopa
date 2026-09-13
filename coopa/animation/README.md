@@ -102,11 +102,10 @@ walk) and `LateBehaviour` (400, the `Component::late_update()` walk) — see
   **same frame** (Behaviour runs before Animation).
 - A UI `CanvasComponent::late_update()` (measure → arrange → emit) always
   sees the **final** animated pose (Animation runs before LateBehaviour).
-- This also resolves the class of bug `uicoopa`'s `ColorOnSignal` needed a
-  `shared_ptr<FadeState>` hack for: a `Button`'s own color chase and an
-  `Animator` track both targeting `Graphic::color` no longer race by
-  component-list order — the `Animator`'s write, at phase 300, deterministically
-  wins over anything at phase 200.
+- Two writers to the same property resolve deterministically by phase rather
+  than by component-list order: a `Button`'s own color chase (phase 200) and an
+  `Animator` track (phase 300) both targeting `Graphic::color` always resolve
+  with the `Animator`'s write winning.
 
 ---
 
@@ -239,11 +238,8 @@ An `Animator` component references one or more clips by name:
 
 `"Animator"` is **not** built into `SceneLoader` — it is registered via
 `register_animation_components(AssetManager&)`, alongside the
-`AnimationClipLoader`. This deliberately replaces the old, built-in
-`coopa::scene::AnimationComponent` (orbit-only, one hardcoded trajectory,
-bypassed the asset system) rather than extending it; see that type's removal
-in this module's git history and blendy's migrated `sphere_orbit.yaml` for
-the before/after.
+`AnimationClipLoader`. Trajectories are data, loaded through the asset system,
+rather than anything hardcoded into the scene layer.
 
 ---
 
@@ -287,6 +283,6 @@ Unit tests live in `libcoopa`'s top-level `test.cpp`, under the
 dedup/no-clobber, wrap modes, crossfade blending, name/path resolution,
 lazy-bind-when-initially-inactive, rotation non-wrapping, YAML loading
 including a malformed-file failure path, procedural-vs-keyframed blending,
-the orbit evaluator against the old `AnimationComponent`'s exact formula, and
-a serial-vs-forced-parallel bit-identical check). The `coopa::scene` phase
+the orbit evaluator against its closed-form formula, and a
+serial-vs-forced-parallel bit-identical check). The `coopa::scene` phase
 pipeline itself is covered separately, under `scene_pipeline_test`.

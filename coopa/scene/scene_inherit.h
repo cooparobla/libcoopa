@@ -52,6 +52,7 @@
 
 #include <fkYAML/node.hpp>
 #include <coopa/debug/logger.h>
+#include <coopa/scene/component.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -139,16 +140,11 @@ private:
 
     // ---- tag / list helpers ----
 
-    /** @brief Strips a leading '!' so tag-form and type-form names compare equal (mirrors SceneLoader). */
-    static std::string normalize_tag_(const std::string& tag) {
-        return (!tag.empty() && tag[0] == '!') ? tag.substr(1) : tag;
-    }
-
     /** @brief The normalized type/tag name of a component node, or "" if it has neither. */
     static std::string component_tag_(const fkyaml::node& node) {
-        if (node.has_tag_name()) return normalize_tag_(node.get_tag_name());
+        if (node.has_tag_name()) return normalize_component_tag(node.get_tag_name());
         if (node.is_mapping() && node.contains("type")) {
-            return normalize_tag_(node.at("type").get_value<std::string>());
+            return normalize_component_tag(node.at("type").get_value<std::string>());
         }
         return "";
     }

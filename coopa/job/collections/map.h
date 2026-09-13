@@ -3,8 +3,8 @@
  * @brief Thread-safe ParallelMap collection template.
  */
 
-#ifndef PARALLEL_MAP_H
-#define PARALLEL_MAP_H
+#ifndef COOPA_JOB_COLLECTIONS_MAP_H
+#define COOPA_JOB_COLLECTIONS_MAP_H
 
 #include <parallel_hashmap/phmap.h> // Include the parallel_hashmap library
 
@@ -25,6 +25,8 @@ namespace job {
  * This class encapsulates the phmap::parallel_flat_hash_map, offering common
  * map operations with a focus on simplicity and leveraging the underlying
  * map's thread-safety for individual operations.
+ *
+ * Provided for consumers; the job system itself does not use it.
  *
  * @tparam KeyType The type of the keys in the map.
  * @tparam ValueType The type of the values in the map.
@@ -255,4 +257,4 @@ private:
 }
 }
 
-#endif // PARALLEL_MAP_H
+#endif // COOPA_JOB_COLLECTIONS_MAP_H

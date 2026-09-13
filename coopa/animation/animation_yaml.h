@@ -28,10 +28,9 @@ namespace anim {
  * destroyed to avoid a dangling capture surviving into a later
  * SceneLoader::load() call.
  *
- * Uses a new "Animator" tag rather than the (deprecated, now-removed)
- * "Animation" tag — see coopa/animation/README.md for why this system
- * replaces coopa::scene::AnimationComponent entirely rather than
- * generalizing its hardcoded SceneLoader branch.
+ * The component tag is "Animator". Like every non-Transform component, it is
+ * registered from outside libcoopa rather than built into SceneLoader — see
+ * coopa/animation/README.md.
  *
  * @param assets The AssetManager clip states' `clip:` paths load through.
  */

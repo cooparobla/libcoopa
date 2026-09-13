@@ -11,10 +11,9 @@
  * `input_map.bind("jump", Key::Space)` instead of naming `GLFW_KEY_SPACE`,
  * and what makes the vocabulary itself backend-swappable.
  *
- * Originally gfxcoopa/input/keys.h (namespace coopa::gfx::input) — moved here
- * because it has zero dependency on Vulkan or any windowing library, so it
- * has no business requiring a graphics repo as a build dependency just to
- * name a key. See coopa/input/README.md.
+ * This vocabulary lives in libcoopa, not in a graphics package, because it has
+ * zero dependency on Vulkan or any windowing library: naming a key should not
+ * require a graphics repo as a build dependency. See coopa/input/README.md.
  */
 
 #ifndef COOPA_INPUT_KEYS_H

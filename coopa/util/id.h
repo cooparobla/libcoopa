@@ -3,8 +3,8 @@
  * @brief Header-only utility class for thread-safe unique ID generation.
  */
 
-#ifndef ID_UTIL_HPP
-#define ID_UTIL_HPP
+#ifndef COOPA_UTIL_ID_H
+#define COOPA_UTIL_ID_H
 
 #include <atomic> // For std::atomic to ensure thread-safe ID generation
 #include <limits> // For std::numeric_limits
@@ -62,15 +62,10 @@ private:
      * preventing race conditions when multiple threads request IDs.
      * Initialized to 0 so the first ID returned by get_unique_id() is 1.
      *
-     * Using 'static inline' (C++17 and later) allows the static member
-     * to be defined and initialized directly within the class definition
-     * in a header file, avoiding the need for a separate out-of-class definition.
+     * `static inline` (C++17) defines and initializes the member directly in
+     * the class definition, so this header needs no out-of-class definition.
      */
     static inline std::atomic<unsigned int> next_id_ = 0;
 };
 
-// The out-of-class initialization for next_id_ is no longer needed
-// due to the use of 'static inline' (C++17 and later).
-// std::atomic<unsigned int> IdUtil::next_id_ = 0;
-
-#endif // ID_UTIL_HPP
+#endif // COOPA_UTIL_ID_H

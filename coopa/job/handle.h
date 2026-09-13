@@ -3,18 +3,12 @@
  * @brief Defines JobHandle/CounterPool: generation-tagged, individually-reclaimed
  *        handles for tracking asynchronous job completion.
  *
- * Earlier revisions of this pool were an untagged bump allocator: every slot was
- * only ever freed in bulk by CounterPool::reset(), which meant a handle could not
- * outlive a single begin_frame()/end_frame() pair, and a second begin_frame() from
- * anywhere in the process would silently invalidate every other subsystem's
- * outstanding handles. That forced every long-lived subsystem (Scene, AssetManager)
- * to either own a private JobEngine or fight over exclusive ownership of the frame
- * boundary.
- *
- * This revision replaces the bump allocator with a lock-free free list of
- * generation-tagged slots, so individual handles can be allocated and released at
- * any time, independent of any frame boundary, while a stale handle (one whose
- * slot has since been recycled) can still be told apart from a live one.
+ * Slots come from a lock-free free list and carry a generation tag, so handles
+ * are allocated and released individually, at any time and independent of any
+ * frame boundary, and a stale handle (one whose slot has since been recycled)
+ * can always be told apart from a live one. Long-lived subsystems (Scene,
+ * AssetManager) can therefore share a single engine without any of them needing
+ * to own its frame boundary.
  *
  * A slot's lifetime tracks two independent things:
  *  - The **job counter**: how many submitted-but-incomplete jobs still reference
@@ -48,6 +42,21 @@ namespace job {
 
 /// @brief Sentinel value representing an uninitialized or invalid handle/slot index.
 inline constexpr uint32_t k_invalid_handle_index = UINT32_MAX;
+
+namespace detail {
+/// @brief Storage whose address is the closed-waiter-stack sentinel. Never read.
+inline char waiters_closed_tag = 0;
+} // namespace detail
+
+/**
+ * @brief The value a slot's waiter stack holds once a completion has harvested it.
+ *
+ * Distinct from nullptr (open and empty) and from any real waiter address, so a
+ * push can tell "nothing registered yet" apart from "this wave already
+ * finished". dependency_graph.h owns the protocol; CounterPool only has to know
+ * the value so add_jobs() can reopen a stack for a fresh wave of work.
+ */
+inline void* const k_waiters_closed = &detail::waiters_closed_tag;
 
 /**
  * @class CounterPool
@@ -138,9 +147,23 @@ public:
 
     // --- Job counter (drives is_complete() and dependency-graph waiters) ---
 
-    /// @brief Adds `n` to the outstanding job count (called from submit()/submit_jobs()).
+    /**
+     * @brief Adds `n` to the outstanding job count (called from submit()/submit_jobs()).
+     *
+     * A handle may be reused after its counter has already reached zero (the
+     * fan-in pattern described in this file's doc). A completion harvest closes
+     * the slot's waiter stack, so re-opening it here is what lets dependents
+     * registered against this second wave actually wait for it instead of being
+     * told the handle is already complete. Only ever CASes closed -> open, so a
+     * live stack is never clobbered.
+     */
     void add_jobs(uint32_t index, int32_t n) {
-        slots_[index].counter.fetch_add(n, std::memory_order_release);
+        int32_t before = slots_[index].counter.fetch_add(n, std::memory_order_release);
+        if (before == 0) {
+            void* expected = k_waiters_closed;
+            slots_[index].waiters.compare_exchange_strong(
+                expected, nullptr, std::memory_order_acq_rel, std::memory_order_relaxed);
+        }
     }
 
     /**

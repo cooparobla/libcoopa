@@ -72,6 +72,21 @@ public:
     Scene* scene = nullptr;
 };
 
+/**
+ * @brief Strips a leading '!' so a YAML tag-form name ("!MeshRenderer") and a
+ *        type-form name ("MeshRenderer") compare equal.
+ *
+ * Shared by SceneLoader and SceneInheritance, which must agree exactly on how
+ * a component node is named for inheritance overrides to match the components
+ * they override.
+ *
+ * @param tag The raw tag or type name.
+ * @return The name without a leading '!'.
+ */
+inline std::string normalize_component_tag(const std::string& tag) {
+    return (!tag.empty() && tag[0] == '!') ? tag.substr(1) : tag;
+}
+
 } // namespace scene
 } // namespace coopa
 

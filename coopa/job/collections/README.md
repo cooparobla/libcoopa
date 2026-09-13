@@ -1,6 +1,11 @@
 # Concurrent Collections Module
 
-The `job/collections` module provides thread-safe wrappers for standard data structures used throughout parallel jobs.
+The `job/collections` module provides the concurrent containers the job system runs on, plus two general-purpose thread-safe wrappers offered to consumers.
+
+`ParallelQueue` and `WorkStealingDeque` are load-bearing: `JobEngine` dispatches
+every job through them. `ParallelMap` and `ParallelVector` are not used anywhere
+inside libcoopa -- they are provided for consumers, and are exercised only by
+this repository's own test suite.
 
 ## Collection API Details
 

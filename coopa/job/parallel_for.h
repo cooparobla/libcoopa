@@ -3,13 +3,11 @@
  * @brief Out-of-line definitions of JobEngine::parallel_for()/parallel_for_blocking(),
  *        declared in engine.h.
  *
- * Replaces the hand-chunking pattern every parallel call site used to write
- * for itself (see e.g. the pre-existing AnimationSystem::evaluate_parallel_(),
- * which built a `std::vector<std::function<void()>>` and called
- * submit_jobs()). The body is captured exactly once into a shared holder
- * rather than copied into every chunk, and each chunk's own closure (a
- * shared_ptr plus two indices) is small enough to stay inside TaskWrapper's
- * inline buffer -- no heap allocation per chunk.
+ * The shared chunking path for parallel call sites, so none of them has to
+ * hand-roll one. The body is captured exactly once into a shared holder rather
+ * than copied into every chunk, and each chunk's own closure (a shared_ptr plus
+ * two indices) is small enough to stay inside TaskWrapper's inline buffer -- no
+ * heap allocation per chunk.
  */
 
 #ifndef COOPA_JOB_PARALLEL_FOR_H

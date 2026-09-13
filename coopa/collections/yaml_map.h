@@ -3,8 +3,8 @@
  * @brief Provides the YAMLMap wrapper class for managing YAML configurations.
  */
 
-#ifndef YAML_MAP_H
-#define YAML_MAP_H
+#ifndef COOPA_COLLECTIONS_YAML_MAP_H
+#define COOPA_COLLECTIONS_YAML_MAP_H
 
 #include <fkYAML/node.hpp> // Correct include
 #include <string>
@@ -301,4 +301,4 @@ private:
 } // namespace collections
 } // namespace coopa
 
-#endif // YAML_MAP_H
+#endif // COOPA_COLLECTIONS_YAML_MAP_H

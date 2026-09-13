@@ -33,10 +33,10 @@ namespace asset {
  *      back" behavior every ad-hoc resolver in this workspace already used
  *      (uicoopa's UIResourceCache::resolve_path_, gfxcoopa's mesh loader).
  *
- * Deliberately supersedes coopa::util's global-namespace FileUtil rather
- * than building on it — FileUtil has no users outside libcoopa's own tests
- * and a live substring-length bug in get_asset_path(). AssetSource is the
- * one resolver every downstream loader should use going forward.
+ * Resolution is deliberately self-contained: a virtual path is resolved
+ * against this source's own base directory, with no dependency on process-wide
+ * roots or environment variables. That is what lets two scenes in different
+ * directories refer to `mesh.obj` and get different assets.
  */
 class AssetSource {
 public:

@@ -3,8 +3,8 @@
  * @brief Defines the DebugContext class for submitting log messages to a parallel queue.
  */
 
-#ifndef DEBUG_CONTEXT_H
-#define DEBUG_CONTEXT_H
+#ifndef COOPA_DEBUG_CONTEXT_H
+#define COOPA_DEBUG_CONTEXT_H
 
 #include <coopa/job/collections/queue.h>
 #include <coopa/debug/message.h>
@@ -53,4 +53,4 @@ private:
 }
 }
 
-#endif // DEBUG_CONTEXT_H
+#endif // COOPA_DEBUG_CONTEXT_H

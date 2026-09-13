@@ -3,8 +3,8 @@
  * @brief Defines the Printer abstract base class for log output.
  */
 
-#ifndef PRINTER_H
-#define PRINTER_H
+#ifndef COOPA_DEBUG_PRINTER_H
+#define COOPA_DEBUG_PRINTER_H
 
 #include <string>
 
@@ -42,4 +42,4 @@ private:
 }
 }
 
-#endif // PRINTER_H
+#endif // COOPA_DEBUG_PRINTER_H

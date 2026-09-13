@@ -89,13 +89,12 @@ struct JobNode {
  * - Write-After-Read (WAR): a writer must wait for all prior readers.
  * - Write-After-Write (WAW): a writer must wait for the prior writer.
  *
- * Dependency lists are unbounded -- unlike earlier revisions, they are never
- * silently truncated to fit an inline array, since JobEngine's own dependency
- * graph (see dependency_graph.h) has no such limit either.
+ * Dependency lists are unbounded and never truncated, since JobEngine's own
+ * dependency graph (see dependency_graph.h) has no inline-count limit either.
  *
- * begin_frame()/end_frame() still clear this scheduler's own hazard-tracking
- * maps every frame (that state is genuinely per-frame bookkeeping, unrelated
- * to JobEngine's now-optional frame boundary).
+ * begin_frame()/end_frame() clear this scheduler's own hazard-tracking maps
+ * every frame. That state is genuinely per-frame bookkeeping, and is separate
+ * from JobEngine's frame boundary, which is diagnostics-only.
  */
 class JobScheduler {
 public:
@@ -126,16 +125,25 @@ public:
     /**
      * @brief Signals the end of a frame.
      *
-     * Closes (and drops) any main-thread job that execute_main_thread_jobs()
-     * was never called to run this frame, so its handle's slot isn't leaked,
-     * then delegates to the engine's end_frame(). Every main-thread job
-     * queued via add_job()/submit_all() is expected to be run by
-     * execute_main_thread_jobs() before end_frame() -- this is a defensive
-     * fallback, not the intended path.
+     * Drops any main-thread job that execute_main_thread_jobs() was never
+     * called to run this frame, then delegates to the engine's end_frame().
+     * Every main-thread job queued via add_job()/submit_all() is expected to
+     * be run by execute_main_thread_jobs() before end_frame() -- this is a
+     * defensive fallback, not the intended path.
+     *
+     * Dropping a job still has to resolve its handle exactly as running it
+     * would: submit_all() charged the handle one outstanding job, and
+     * CounterPool::close() can only reclaim a slot whose counter has already
+     * reached zero. Closing without that decrement would strand the slot
+     * (never returned to the free list) and leave anything that took a
+     * dependency on this job waiting forever.
      */
     void end_frame() {
         std::lock_guard<std::mutex> lock(m_mutex_);
-        for (auto& node : main_thread_jobs_queue_) node.handle.close();
+        for (auto& node : main_thread_jobs_queue_) {
+            engine_.complete_external_job(node.handle); // Drives the counter to 0 and fires dependents.
+            node.handle.close();                        // Now actually reclaims the slot.
+        }
         main_thread_jobs_queue_.clear();
         pending_job_definitions_.clear();
         engine_.end_frame();

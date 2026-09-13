@@ -2,8 +2,9 @@
  * @file context.h
  * @brief Job categorization, priority, and the per-invocation JobContext.
  *
- * JobType and Priority replace the ad hoc global `using JobType = uint32_t;`
- * that used to be declared twice (job.h and engine.h) outside any namespace.
+ * JobType and Priority are the namespaced vocabulary the whole job system
+ * categorizes and orders work by; they live here so job.h and engine.h share
+ * one definition.
  * JobContext is handed to any job body that opts in to receiving it (see
  * TaskWrapper's dual-signature dispatch in job.h), giving a running job access
  * to which worker it is executing on and whether it has been cancelled.

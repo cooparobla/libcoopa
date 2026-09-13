@@ -13,16 +13,14 @@
  *   style, no lock); every other submitter uses a global MPMC queue
  * - Randomized work-stealing victim order (no thread-0 convoying)
  * - A worker's sleep predicate counts only jobs actually sitting in a deque or
- *   queue, so jobs parked on unmet dependencies no longer keep every worker
- *   spinning
+ *   queue, so jobs parked on unmet dependencies do not keep workers spinning
  * - wait_for() run from a worker thread participates as that real worker (not a
  *   steal-only guest), so a job may safely wait on another job without deadlock
  *
- * This revision is a clean break from the previous API: JobType/Priority now
- * live in coopa::job (see context.h) instead of a bare global `using JobType`,
- * submit()'s dependency count is unbounded (no more silent truncation past 4),
- * and every handle returned by create_handle()/submit_jobs() must eventually be
- * closed (see handle.h's JobHandle::close() / ScopedJobHandle) to recycle its slot.
+ * API notes: JobType/Priority live in coopa::job (see context.h); submit()
+ * accepts an unbounded dependency count; and every handle returned by
+ * create_handle()/submit_jobs() must eventually be closed (see handle.h's
+ * JobHandle::close() / ScopedJobHandle) to recycle its slot.
  */
 
 #ifndef COOPA_JOB_ENGINE_H
@@ -140,8 +138,8 @@ public:
     JobEngine(JobEngine&&) = delete;
     JobEngine& operator=(JobEngine&&) = delete;
 
-    // --- Frame lifecycle (diagnostics only -- see handle.h's class doc for why
-    //     handles no longer need a frame boundary to be safely reused) ---
+    // --- Frame lifecycle (diagnostics only -- handles are safely reused
+    //     without a frame boundary; see handle.h's class doc) ---
 
     /// @brief Resets per-frame diagnostic counters. No-op when COOPA_JOB_DIAGNOSTICS is off.
     void begin_frame() {
@@ -195,6 +193,7 @@ public:
     }
 
     /// @brief Direct access to the counter pool (diagnostics / advanced use).
+    /// Provided for consumers and leak assertions; not used by the engine itself.
     CounterPool& get_counter_pool() { return counter_pool_; }
 
     // --- Thread dedication ---
@@ -203,8 +202,9 @@ public:
      * @brief Dedicates a job type to a specific worker thread.
      *
      * Jobs of this type always land in a dedicated per-type queue that only
-     * `thread_index` ever pulls from -- a hard guarantee, unlike the
-     * soft/steal-able dedication of earlier revisions.
+     * `thread_index` ever pulls from: a hard guarantee, not a steal-able hint.
+     *
+     * Provided for consumers; libcoopa itself does not dedicate any thread.
      */
     void dedicate_thread_to_job_type(JobType type, unsigned int thread_index) {
         if (thread_index >= num_threads_) {

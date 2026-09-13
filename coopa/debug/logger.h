@@ -3,18 +3,15 @@
  * @brief Defines the thread-safe Logger class for writing formatted logs to stderr.
  */
 
-#ifndef LOGGER_H
-#define LOGGER_H
+#ifndef COOPA_DEBUG_LOGGER_H
+#define COOPA_DEBUG_LOGGER_H
 
 #include <chrono>
-#include <ctime>
-#include <iomanip>
 #include <iostream>
-#include <sstream>
 #include <string>
-#include <algorithm> // For std::transform
 #include <mutex>     // For std::mutex and std::lock_guard
 
+#include <coopa/debug/detail/log_format.h>
 #include <coopa/debug/printer.h>
 
 namespace coopa
@@ -70,52 +67,29 @@ private:
      * @param indent The indentation level for tree formatting.
      */
     void log(std::string level, const std::string& message, unsigned int indent = 0) {
-        // Use a lock_guard to ensure the mutex is locked before writing and unlocked afterwards.
-        // This provides RAII for mutex locking, ensuring it's always released.
-        std::lock_guard<std::mutex> lock(mtx_); 
+        // RAII lock so the mutex is always released, and so the whole line is
+        // written as one operation -- otherwise concurrent loggers interleave
+        // mid-line on the console.
+        std::lock_guard<std::mutex> lock(mtx_);
 
-        auto now = std::chrono::system_clock::now(); 
-        
-        // Get milliseconds from the time_point
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-        
-        std::time_t time = std::chrono::system_clock::to_time_t(now); 
-        std::tm tm_snapshot; 
-
-    #ifdef _WIN32
-        // Microsoft Visual C++ specific for thread-safe localtime
-        localtime_s(&tm_snapshot, &time); 
-    #else
-        // POSIX standard for thread-safe localtime
-        localtime_r(&time, &tm_snapshot); 
-    #endif
-
-        std::stringstream ss; 
-        // Format to HH:MM:SS.ms (removed date)
-        ss << std::put_time(&tm_snapshot, "%H:%M:%S") << '.' 
-           << std::setfill('0') << std::setw(3) << ms.count();
-        
-        // Construct the full log message and print it as a single operation to minimize
-        // potential interleaving if not fully protected by the mutex (though lock_guard
-        // should handle the entire block). Using a single cerr << statement improves robustness.
-        if (indent > 0) { 
-            std::cerr << ss.str() << " [" << level << "]::[\e[3m" << name_ << "\e[0m]" 
-                      << std::string(indent, '\t') << "- " << message << std::endl; 
-        } else { 
-            std::cerr << ss.str() << " [" << level << "]::[\e[3m" << name_ << "\e[0m]" 
-                      << " " << message << std::endl; 
+        const std::string stamp = detail::format_timestamp(std::chrono::system_clock::now());
+        if (indent > 0) {
+            std::cerr << stamp << " [" << level << "]::[\e[3m" << name_ << "\e[0m]"
+                      << std::string(indent, '\t') << "- " << message << std::endl;
+        } else {
+            std::cerr << stamp << " [" << level << "]::[\e[3m" << name_ << "\e[0m]"
+                      << " " << message << std::endl;
         }
     }
 
     std::string name_; /**< Name of this logger instance. */
 
-    // C++17 inline static member for header-only libraries
-    // This allows the mutex to be defined directly in the header
-    // and correctly shared across all translation units.
+    // `inline static` so the one mutex is shared across every translation
+    // unit that includes this header, rather than one per TU.
     inline static std::mutex mtx_; /**< Mutex to ensure console printing is thread-safe. */
 };
 
 }
 }
 
-#endif  // LOGGER_H
+#endif  // COOPA_DEBUG_LOGGER_H

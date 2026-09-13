@@ -32,7 +32,7 @@ namespace scene {
  * @brief Manages the lifecycle of zero or more Scenes, one of which is "active"
  *        (the primary scene get_active_scene()/add_system() etc. address).
  *
- * Single-scene usage (unchanged from earlier revisions):
+ * Single-scene usage:
  * @code
  * SceneManager mgr;
  * mgr.load_scene("assets/scenes/cube/scene.yaml");
