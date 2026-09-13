@@ -6,7 +6,7 @@ It is designed to be highly thread-safe and suitable for building multithreaded 
 
 ## Modules Overview
 
-`libcoopa` is organized into eleven main modules:
+`libcoopa` is organized into twelve main modules:
 
 ### 1. [Utilities (`coopa/util/`)](file:///home/coopa/git/libcoopa/coopa/util/)
 Cross-platform helper utilities for math, file paths, strings, and unique IDs:
@@ -80,6 +80,14 @@ The engine-agnostic model behind any slot-based inventory UI — see the [module
 Clamped, optionally-regenerating gameplay quantities (health, stamina, mana) — see the [module README](file:///home/coopa/git/libcoopa/coopa/stat/README.md):
 - **[Resource](file:///home/coopa/git/libcoopa/coopa/stat/resource.h)**: A single current/max meter with `damage`/`heal`/`tick`-driven delayed regen, `on_changed`/`on_depleted` signals.
 - **[StatBlock](file:///home/coopa/git/libcoopa/coopa/stat/stat_block.h)**: A named, pointer-stable registry of `Resource`s.
+
+### 12. [Maps (`coopa/maps/`)](file:///home/coopa/git/libcoopa/coopa/maps/)
+Seeded Voronoi world generation — climate, biomes, rivers, roads, nations, settlements and landmarks — see the [module README](file:///home/coopa/git/libcoopa/coopa/maps/README.md):
+- **[MapGenerator](file:///home/coopa/git/libcoopa/coopa/maps/map_generator.h)**: Builds the Delaunay/Voronoi dual graph from a jittered point lattice and drives the generation passes over it.
+- **[MapGraph](file:///home/coopa/git/libcoopa/coopa/maps/map_data.h)**: The generated world — index-addressed cells, corners, edges, towns, regions, countries and landmarks.
+- **[Passes](file:///home/coopa/git/libcoopa/coopa/maps/passes/README.md)**: Twelve ordered annotation stages: water, coast, elevation, temperature, rivers, moisture, biomes, roads, regions, towns, landmarks, noisy edges.
+- **[Biomes](file:///home/coopa/git/libcoopa/coopa/maps/biome.h) & [names](file:///home/coopa/git/libcoopa/coopa/maps/name_generator.h)**: 33 biomes classified on temperature × elevation × moisture, and a per-region synthetic language that names every place.
+- **[map_yaml](file:///home/coopa/git/libcoopa/coopa/maps/map_yaml.h) & [renderers](file:///home/coopa/git/libcoopa/coopa/maps/map_renderer.h)**: Full-graph YAML save/load, plus software biome and elevation renders written out as PNG.
 
 ---
 

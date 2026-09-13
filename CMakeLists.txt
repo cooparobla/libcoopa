@@ -56,3 +56,10 @@ target_link_libraries(libcoopa PRIVATE coopa::lib)
 # above's default, so the test suite actually catches a Scene single-owner
 # contract violation if one is ever introduced.
 target_compile_definitions(libcoopa PRIVATE COOPA_SCENE_THREAD_CHECKS)
+
+# Standalone map generator demo. Generates a random map and writes
+# <prefix>_biomes.png, <prefix>_elevation.png and <prefix>.yaml. Kept out of
+# coopa/ so that tree stays header-only; the vendored stb/delaunator/noise
+# headers it needs are already on libcoopa_lib's include path.
+add_executable(coopa_mapgen examples/map_generator.cpp)
+target_link_libraries(coopa_mapgen PRIVATE coopa::lib)
