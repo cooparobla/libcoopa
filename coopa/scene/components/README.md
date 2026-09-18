@@ -39,7 +39,7 @@ It is registered the same way as any external component (via
                                    │ scale         │
                                    └───────────────┘
 
-  (MeshRenderer, Camera, DirectionalLight, PointLight, EnvironmentLight,
+  (MeshRenderer, Camera, DirectionalLight, PointLight, SpotLight, EnvironmentLight,
    GiProbeVolume, ReflectionProbe -> gfxcoopa/gfxcoopa/engine/components/)
   (RectTransform, Canvas, Image, Text, Button, layout groups -> uicoopa/uicoopa/)
   (Animator -> coopa/animation/animator.h, registered via register_component_parser)
