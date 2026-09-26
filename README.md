@@ -6,7 +6,7 @@ It is designed to be highly thread-safe and suitable for building multithreaded 
 
 ## Modules Overview
 
-`libcoopa` is organized into eleven main modules:
+`libcoopa` is organized into twelve main modules:
 
 ### 1. [Utilities (`coopa/util/`)](file:///home/coopa/git/libcoopa/coopa/util/)
 Cross-platform helper utilities for math, file paths, strings, and unique IDs:
@@ -80,6 +80,13 @@ The engine-agnostic model behind any slot-based inventory UI — see the [module
 Clamped, optionally-regenerating gameplay quantities (health, stamina, mana) — see the [module README](file:///home/coopa/git/libcoopa/coopa/stat/README.md):
 - **[Resource](file:///home/coopa/git/libcoopa/coopa/stat/resource.h)**: A single current/max meter with `damage`/`heal`/`tick`-driven delayed regen, `on_changed`/`on_depleted` signals.
 - **[StatBlock](file:///home/coopa/git/libcoopa/coopa/stat/stat_block.h)**: A named, pointer-stable registry of `Resource`s.
+
+### 12. [Routine (`coopa/routine/`)](file:///home/coopa/git/libcoopa/coopa/routine/)
+Unity-style coroutines on C++20 `<coroutine>` — see the [module README](file:///home/coopa/git/libcoopa/coopa/routine/README.md):
+- **[Routine](file:///home/coopa/git/libcoopa/coopa/routine/routine.h)**: The return type of a routine body. A move-only owner of one coroutine frame, so a stopped or abandoned routine unwinds its locals; a behaviour spanning frames is written as straight-line code instead of a state machine in `update()`.
+- **[Yield vocabulary](file:///home/coopa/git/libcoopa/coopa/routine/yield.h)**: `next_frame()`, `frames(n)`, `seconds(s)`, `seconds_realtime(s)`, `wait_until(pred)`, `wait_while(pred)` — plus the two Unity has no equivalent for: `wait_for(JobHandle)` and `on_worker(fn)`, which suspend a routine on `coopa::job` work without occupying a thread and resume it back on the tick thread.
+- **[RoutineRunner / RoutineHandle / RoutineScope](file:///home/coopa/git/libcoopa/coopa/routine/runner.h)**: The per-tick pump, a token that stays safe past its runner's lifetime, and the `ScopedConnection`-style RAII owner that stops a component's routines when the component dies. Nested routines (`co_yield other()`) stack exactly as Unity's nested enumerators do.
+- **[RoutineSystem](file:///home/coopa/git/libcoopa/coopa/routine/routine_system.h)**: The `ISceneSystem` at `UpdatePhase::Routine` (after `Component::update()`, before `late_update()`), with `set_time_scale()` for Unity's `Time.timeScale`, and the `start_routine()` / `stop_routines()` component helpers.
 
 ---
 

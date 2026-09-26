@@ -40,12 +40,13 @@ class SceneCommandBuffer; // Forward declaration only, for the same reason as Jo
  * Scene::update() runs every system with order < LateBehaviour;
  * Scene::late_update() runs every system with order >= LateBehaviour. That
  * split keeps each public entry point responsible for exactly the phases named
- * after it, and lands Animation before the built-in late_update() walk,
- * matching Unity's Update -> animation -> LateUpdate order.
+ * after it, and lands Routine and Animation before the built-in late_update()
+ * walk, matching Unity's Update -> coroutines -> animation -> LateUpdate order.
  */
 enum class UpdatePhase : int {
     Physics         = 100, ///< Reserved. No implementation ships in libcoopa.
     Behaviour       = 200, ///< Built-in: the recursive Component::update() walk.
+    Routine         = 250, ///< coopa::routine::RoutineSystem: resume every running Routine.
     Animation       = 300, ///< coopa::anim::AnimationSystem: evaluate + apply.
     TransformResolve = 350, ///< coopa::scene::TransformSystem: top-down world-matrix resolve.
     LateBehaviour   = 400, ///< Built-in: the recursive Component::late_update() walk.

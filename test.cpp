@@ -69,6 +69,10 @@
 #include <coopa/item/hotbar.h>
 #include <coopa/stat/resource.h>
 #include <coopa/stat/stat_block.h>
+#include <coopa/routine/routine.h>
+#include <coopa/routine/yield.h>
+#include <coopa/routine/runner.h>
+#include <coopa/routine/routine_system.h>
 #include <glm/glm.hpp>
 
 // ANSI Colors for nice UI
@@ -4035,6 +4039,559 @@ static void test_stat_block_named_resources_are_pointer_stable() {
 
 } // namespace stat_test
 
+// ---------------------------------------------------------
+// Routine (coroutine) Tests
+// ---------------------------------------------------------
+
+namespace routine_test {
+
+namespace cr = coopa::routine;
+
+/** @brief Shared scratch every routine body in this section writes through. */
+struct Trace {
+    std::vector<std::string> log;
+    int steps = 0;
+    bool flag = false;
+    bool reached_end = false;
+};
+
+/** @brief Counts one step per resume, suspending with next_frame() in between. */
+cr::Routine count_frames(Trace* t, int n) {
+    for (int i = 0; i < n; ++i) {
+        ++t->steps;
+        co_yield cr::next_frame();
+    }
+    t->reached_end = true;
+}
+
+/** @brief Records the tick it resumed on after a seconds() wait. */
+cr::Routine wait_seconds_then_mark(Trace* t, float duration) {
+    co_yield cr::seconds(duration);
+    t->reached_end = true;
+}
+
+/** @brief Records the tick it resumed on after a seconds_realtime() wait. */
+cr::Routine wait_realtime_then_mark(Trace* t, float duration) {
+    co_yield cr::seconds_realtime(duration);
+    t->reached_end = true;
+}
+
+/** @brief Waits a fixed number of ticks. */
+cr::Routine wait_frames_then_mark(Trace* t, uint32_t count) {
+    co_yield cr::frames(count);
+    t->reached_end = true;
+}
+
+/** @brief Blocks on `flag` becoming true, then on it becoming false again. */
+cr::Routine until_then_while(Trace* t) {
+    co_yield cr::wait_until([t] { return t->flag; });
+    t->log.push_back("until");
+    co_yield cr::wait_while([t] { return t->flag; });
+    t->log.push_back("while");
+}
+
+/** @brief Nested child routine; runs across two resumes. */
+cr::Routine nested_child(Trace* t) {
+    t->log.push_back("child-begin");
+    co_yield cr::next_frame();
+    t->log.push_back("child-end");
+}
+
+/** @brief Nests nested_child() and records around it. */
+cr::Routine nested_parent(Trace* t) {
+    t->log.push_back("parent-begin");
+    co_yield nested_child(t);
+    t->log.push_back("parent-end");
+}
+
+/** @brief Increments a counter when destroyed, proving a stopped routine unwinds. */
+struct DestructorProbe {
+    int* counter;
+    explicit DestructorProbe(int* c) : counter(c) {}
+    ~DestructorProbe() { ++(*counter); }
+};
+
+/** @brief Holds a live local across a suspension so stopping must destroy it. */
+cr::Routine holds_a_local(Trace* t, int* destructions) {
+    DestructorProbe probe(destructions);
+    (void)probe;
+    for (;;) {
+        ++t->steps;
+        co_yield cr::next_frame();
+    }
+}
+
+/** @brief Everything a self-stopping routine needs to reach itself. */
+struct SelfStop {
+    cr::RoutineRunner* runner = nullptr;
+    cr::RoutineHandle handle;
+    int steps = 0;
+    bool after_stop = false;
+};
+
+/** @brief Stops itself from inside its own body, mid-resume. */
+cr::Routine stops_itself(SelfStop* s) {
+    ++s->steps;
+    co_yield cr::next_frame();
+    ++s->steps;
+    s->runner->stop(s->handle);
+    co_yield cr::next_frame();
+    s->after_stop = true; // Must never run.
+}
+
+/** @brief Starts a second routine from inside its own body, mid-tick. */
+cr::Routine starts_a_sibling(Trace* t, cr::RoutineRunner* runner) {
+    t->log.push_back("outer-begin");
+    co_yield cr::next_frame();
+    runner->start(count_frames(t, 2));
+    co_yield cr::next_frame();
+    t->log.push_back("outer-end");
+}
+
+/** @brief Suspends on a JobHandle the caller completes by hand. */
+cr::Routine awaits_job(Trace* t, coopa::job::JobHandle handle) {
+    t->log.push_back("before");
+    co_yield cr::wait_for(handle);
+    t->log.push_back("after");
+}
+
+/** @brief Records which thread the worker body ran on, and which one resumed it. */
+struct ThreadProbe {
+    std::thread::id caller;
+    std::thread::id worker;
+    std::thread::id resumed;
+    bool body_ran = false;
+};
+
+/** @brief Runs a body on the engine and resumes on the tick thread. */
+cr::Routine hops_to_worker(ThreadProbe* p) {
+    co_yield cr::on_worker([p] {
+        p->worker = std::this_thread::get_id();
+        p->body_ran = true;
+    });
+    p->resumed = std::this_thread::get_id();
+}
+
+/** @brief Throws out of the body after one suspension. */
+cr::Routine throws_after_a_yield(Trace* t) {
+    t->log.push_back("before-throw");
+    co_yield cr::next_frame();
+    throw std::runtime_error("routine blew up");
+}
+
+/** @brief Appends to a shared log every time it resumes, forever. */
+cr::Routine log_every_tick(std::vector<std::string>* log, std::string tag) {
+    for (;;) {
+        log->push_back(tag);
+        co_yield cr::next_frame();
+    }
+}
+
+/** @brief A component that owns its routines through a RoutineScope. */
+class RoutineComponent : public coopa::scene::Component {
+public:
+    std::string type_name() const override { return "RoutineComponent"; }
+
+    void start() override {
+        scope.start(*this, count_frames(&trace, 1000));
+    }
+
+    cr::RoutineScope scope;
+    Trace trace;
+};
+
+} // namespace routine_test
+
+void test_routine_body_runs_immediately_to_first_yield() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    auto handle = runner.start(count_frames(&t, 3));
+
+    // Unity's StartCoroutine parity: everything before the first co_yield has
+    // already run by the time start() returns.
+    ASSERT_EQ(t.steps, 1);
+    ASSERT_TRUE(handle.is_running());
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(1));
+}
+
+void test_routine_next_frame_resumes_once_per_tick() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    auto handle = runner.start(count_frames(&t, 3));
+
+    runner.tick(0.016f);
+    ASSERT_EQ(t.steps, 2);
+    runner.tick(0.016f);
+    ASSERT_EQ(t.steps, 3);
+    ASSERT_TRUE(!t.reached_end);
+
+    runner.tick(0.016f); // The loop exits and the body runs to completion.
+    ASSERT_TRUE(t.reached_end);
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(0));
+}
+
+void test_routine_seconds_accumulates_delta_without_drift() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    runner.start(wait_seconds_then_mark(&t, 1.0f));
+
+    // 0.1f is not exactly representable, so ten subtractions accumulate error;
+    // the routine must still resume on the tenth tick, not the eleventh.
+    for (int i = 0; i < 9; ++i) {
+        runner.tick(0.1f);
+        ASSERT_TRUE(!t.reached_end);
+    }
+    runner.tick(0.1f);
+    ASSERT_TRUE(t.reached_end);
+}
+
+void test_routine_frames_countdown() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace three;
+    Trace one;
+    runner.start(wait_frames_then_mark(&three, 3));
+    runner.start(wait_frames_then_mark(&one, 1));
+
+    runner.tick(0.016f);
+    ASSERT_TRUE(one.reached_end); // frames(1) is next_frame()
+    ASSERT_TRUE(!three.reached_end);
+    runner.tick(0.016f);
+    ASSERT_TRUE(!three.reached_end);
+    runner.tick(0.016f);
+    ASSERT_TRUE(three.reached_end);
+}
+
+void test_routine_wait_until_and_wait_while() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    runner.start(until_then_while(&t));
+
+    runner.tick(0.016f);
+    runner.tick(0.016f);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(0));
+
+    t.flag = true;
+    runner.tick(0.016f);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(1));
+    ASSERT_EQ(t.log[0], std::string("until"));
+
+    runner.tick(0.016f); // Still true, so wait_while keeps waiting.
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(1));
+
+    t.flag = false;
+    runner.tick(0.016f);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(2));
+    ASSERT_EQ(t.log[1], std::string("while"));
+}
+
+void test_routine_nested_routine_ordering() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    auto handle = runner.start(nested_parent(&t));
+
+    // The child starts immediately, exactly as `yield return StartCoroutine(x)` does.
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(2));
+    ASSERT_EQ(t.log[0], std::string("parent-begin"));
+    ASSERT_EQ(t.log[1], std::string("child-begin"));
+
+    // The child finishes and hands control straight back to the parent, in the
+    // same tick -- libcoopa does not spend a frame per nesting level.
+    runner.tick(0.016f);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(4));
+    ASSERT_EQ(t.log[2], std::string("child-end"));
+    ASSERT_EQ(t.log[3], std::string("parent-end"));
+    ASSERT_TRUE(!handle.is_running());
+}
+
+void test_routine_stop_runs_local_destructors() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    int destructions = 0;
+    auto handle = runner.start(holds_a_local(&t, &destructions));
+
+    runner.tick(0.016f);
+    ASSERT_EQ(t.steps, 2);
+    ASSERT_EQ(destructions, 0);
+
+    ASSERT_TRUE(handle.stop());
+    ASSERT_EQ(destructions, 1); // The frame was destroyed, so the local unwound.
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(0));
+
+    runner.tick(0.016f);
+    ASSERT_EQ(t.steps, 2); // Stopped for good.
+    ASSERT_TRUE(!handle.stop()); // Stopping twice is a harmless no-op.
+}
+
+void test_routine_stop_self_from_inside_body_is_safe() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    SelfStop s;
+    s.runner = &runner;
+    s.handle = runner.start(stops_itself(&s));
+    ASSERT_EQ(s.steps, 1);
+
+    runner.tick(0.016f); // Resumes, stops itself mid-body, then suspends.
+    ASSERT_EQ(s.steps, 2);
+    ASSERT_TRUE(!s.after_stop);
+    ASSERT_TRUE(!s.handle.is_running());
+
+    runner.tick(0.016f);
+    ASSERT_TRUE(!s.after_stop);
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(0));
+}
+
+void test_routine_start_from_inside_body_joins_next_tick() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    runner.start(starts_a_sibling(&t, &runner));
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(1));
+    ASSERT_EQ(t.steps, 0);
+
+    runner.tick(0.016f);
+    // The sibling was started from inside a tick: its body ran immediately up
+    // to the first suspension, but the pump already walking the active list
+    // does not resume it again this tick.
+    ASSERT_EQ(t.steps, 1);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(1));
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(2));
+
+    runner.tick(0.016f); // The sibling has joined the pump.
+    ASSERT_EQ(t.steps, 2);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(2));
+    ASSERT_EQ(t.log[1], std::string("outer-end"));
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(1));
+
+    runner.tick(0.016f);
+    ASSERT_TRUE(t.reached_end);
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(0));
+}
+
+void test_routine_scope_destruction_stops_its_routines() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    cr::RoutineHandle handle;
+    {
+        cr::RoutineScope scope;
+        handle = scope.start(runner, count_frames(&t, 1000));
+        runner.tick(0.016f);
+        ASSERT_EQ(t.steps, 2);
+        ASSERT_EQ(scope.active_count(), static_cast<size_t>(1));
+    }
+    ASSERT_TRUE(!handle.is_running());
+    runner.tick(0.016f);
+    ASSERT_EQ(t.steps, 2);
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(0));
+}
+
+void test_routine_handle_outlives_runner() {
+    using namespace routine_test;
+
+    Trace t;
+    cr::RoutineHandle handle;
+    {
+        cr::RoutineRunner runner;
+        handle = runner.start(count_frames(&t, 1000));
+        ASSERT_TRUE(handle.is_running());
+    }
+    // The runner is gone: the handle degrades to "not running" rather than dangling.
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_TRUE(!handle.stop());
+    ASSERT_EQ(t.steps, 1);
+}
+
+void test_routine_wait_for_job_handle_resumes_on_completion() {
+    using namespace routine_test;
+
+    coopa::job::JobEngine engine(2);
+    cr::RoutineRunner runner(&engine);
+    Trace t;
+
+    std::atomic<bool> release{false};
+    coopa::job::JobHandle handle = engine.create_handle();
+    engine.submit([&release]() {
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+    }, 0, handle);
+
+    runner.start(awaits_job(&t, handle));
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(1));
+
+    for (int i = 0; i < 20; ++i) runner.tick(0.016f);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(1)); // Still blocked on the job.
+
+    release.store(true, std::memory_order_release);
+    engine.wait_for(handle);
+    runner.tick(0.016f);
+    ASSERT_EQ(t.log.size(), static_cast<size_t>(2));
+    ASSERT_EQ(t.log[1], std::string("after"));
+
+    handle.close(); // wait_for() never closes a handle it did not allocate.
+}
+
+void test_routine_on_worker_runs_off_thread_and_resumes_on_main() {
+    using namespace routine_test;
+
+    coopa::job::JobEngine engine(2);
+    cr::RoutineRunner runner(&engine);
+
+    ThreadProbe p;
+    p.caller = std::this_thread::get_id();
+    auto handle = runner.start(hops_to_worker(&p));
+
+    for (int i = 0; i < 2000 && handle.is_running(); ++i) runner.tick(0.001f);
+
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_TRUE(p.body_ran);
+    ASSERT_TRUE(p.worker != p.caller);   // The body ran on a worker thread.
+    ASSERT_TRUE(p.resumed == p.caller);  // The routine came back to the tick thread.
+}
+
+void test_routine_on_worker_without_engine_runs_inline() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner; // No engine installed.
+    ThreadProbe p;
+    p.caller = std::this_thread::get_id();
+    auto handle = runner.start(hops_to_worker(&p));
+
+    ASSERT_TRUE(p.body_ran);            // Ran inline the moment it was yielded.
+    ASSERT_TRUE(p.worker == p.caller);
+    ASSERT_TRUE(handle.is_running());
+
+    runner.tick(0.016f);
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_TRUE(p.resumed == p.caller);
+}
+
+void test_routine_exception_logs_and_stops_routine() {
+    using namespace routine_test;
+
+    cr::RoutineRunner runner;
+    Trace t;
+    auto handle = runner.start(throws_after_a_yield(&t));
+    ASSERT_TRUE(runner.last_exception() == nullptr);
+
+    runner.tick(0.016f); // Throws here; logged, not rethrown out of tick().
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_EQ(runner.active_count(), static_cast<size_t>(0));
+    ASSERT_TRUE(runner.last_exception() != nullptr);
+
+    bool caught = false;
+    try {
+        std::rethrow_exception(runner.last_exception());
+    } catch (const std::runtime_error& e) {
+        caught = (std::string(e.what()) == "routine blew up");
+    }
+    ASSERT_TRUE(caught);
+
+    runner.clear_last_exception();
+    ASSERT_TRUE(runner.last_exception() == nullptr);
+}
+
+void test_routine_system_phase_order() {
+    using namespace routine_test;
+    using namespace scene_pipeline_test;
+
+    coopa::scene::Scene scene("RoutinePhase");
+    std::vector<std::string> log;
+    scene.add_system(std::make_unique<RecordingSystem>("behaviour", &log), 200);
+    auto* system = static_cast<cr::RoutineSystem*>(
+        scene.add_system(std::make_unique<cr::RoutineSystem>(), coopa::scene::UpdatePhase::Routine));
+    scene.add_system(std::make_unique<RecordingSystem>("animation", &log), 300);
+
+    system->runner().start(log_every_tick(&log, "routine"));
+    log.clear(); // Drop the entry the immediate first resume produced.
+
+    scene.update(0.016f);
+    ASSERT_EQ(log.size(), static_cast<size_t>(3));
+    ASSERT_EQ(log[0], std::string("behaviour"));
+    ASSERT_EQ(log[1], std::string("routine"));
+    ASSERT_EQ(log[2], std::string("animation"));
+
+    // Removing the system stops everything it was running.
+    ASSERT_TRUE(scene.remove_system("Routine"));
+    log.clear();
+    scene.update(0.016f);
+    ASSERT_EQ(log.size(), static_cast<size_t>(2));
+}
+
+void test_routine_time_scale_affects_seconds_not_realtime() {
+    using namespace routine_test;
+
+    coopa::scene::Scene scene("TimeScale");
+    auto* system = static_cast<cr::RoutineSystem*>(
+        scene.add_system(std::make_unique<cr::RoutineSystem>(), coopa::scene::UpdatePhase::Routine));
+    system->set_time_scale(0.0f);
+
+    Trace scaled;
+    Trace realtime;
+    system->runner().start(wait_seconds_then_mark(&scaled, 0.5f));
+    system->runner().start(wait_realtime_then_mark(&realtime, 0.5f));
+
+    for (int i = 0; i < 10; ++i) scene.update(0.125f);
+    ASSERT_TRUE(!scaled.reached_end);   // Paused: scaled time never advanced.
+    ASSERT_TRUE(realtime.reached_end);  // Wall clock kept running.
+
+    system->set_time_scale(1.0f);
+    for (int i = 0; i < 4; ++i) scene.update(0.125f);
+    ASSERT_TRUE(scaled.reached_end);
+}
+
+void test_routine_component_helpers_start_and_stop() {
+    using namespace routine_test;
+
+    coopa::scene::Scene scene("ComponentRoutines");
+    auto* system = static_cast<cr::RoutineSystem*>(
+        scene.add_system(std::make_unique<cr::RoutineSystem>(), coopa::scene::UpdatePhase::Routine));
+
+    auto obj = std::make_unique<coopa::scene::SceneObject>("Actor");
+    auto* component = obj->add_component<RoutineComponent>();
+    coopa::scene::SceneObject* raw_obj = scene.add_root_object(std::move(obj));
+    scene.start(); // Publishes Scene* onto every component, then calls start().
+
+    // The RoutineScope member started one routine, owned by the component.
+    ASSERT_EQ(system->runner().active_count(), static_cast<size_t>(1));
+    ASSERT_EQ(component->trace.steps, 1);
+
+    scene.update(0.016f);
+    ASSERT_EQ(component->trace.steps, 2);
+
+    // start_routine() is the free-function StartCoroutine equivalent.
+    Trace extra;
+    auto handle = cr::start_routine(*component, count_frames(&extra, 1000));
+    ASSERT_TRUE(handle.is_running());
+    ASSERT_EQ(system->runner().active_count(), static_cast<size_t>(2));
+
+    ASSERT_EQ(cr::stop_routines(*component), static_cast<size_t>(2));
+    ASSERT_TRUE(!handle.is_running());
+    ASSERT_EQ(system->runner().active_count(), static_cast<size_t>(0));
+
+    // Destroying the owner must not leave the scope pointing at a dead routine.
+    ASSERT_TRUE(scene.remove_root_object(raw_obj));
+    scene.update(0.016f);
+    ASSERT_EQ(system->runner().active_count(), static_cast<size_t>(0));
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -4117,6 +4674,25 @@ int main() {
     RUN_TEST(test_scene_null_job_engine_runs_inline);
     RUN_TEST(test_scene_add_remove_system);
     RUN_TEST(test_scene_move_preserves_systems);
+
+    RUN_TEST(test_routine_body_runs_immediately_to_first_yield);
+    RUN_TEST(test_routine_next_frame_resumes_once_per_tick);
+    RUN_TEST(test_routine_seconds_accumulates_delta_without_drift);
+    RUN_TEST(test_routine_frames_countdown);
+    RUN_TEST(test_routine_wait_until_and_wait_while);
+    RUN_TEST(test_routine_nested_routine_ordering);
+    RUN_TEST(test_routine_stop_runs_local_destructors);
+    RUN_TEST(test_routine_stop_self_from_inside_body_is_safe);
+    RUN_TEST(test_routine_start_from_inside_body_joins_next_tick);
+    RUN_TEST(test_routine_scope_destruction_stops_its_routines);
+    RUN_TEST(test_routine_handle_outlives_runner);
+    RUN_TEST(test_routine_wait_for_job_handle_resumes_on_completion);
+    RUN_TEST(test_routine_on_worker_runs_off_thread_and_resumes_on_main);
+    RUN_TEST(test_routine_on_worker_without_engine_runs_inline);
+    RUN_TEST(test_routine_exception_logs_and_stops_routine);
+    RUN_TEST(test_routine_system_phase_order);
+    RUN_TEST(test_routine_time_scale_affects_seconds_not_realtime);
+    RUN_TEST(test_routine_component_helpers_start_and_stop);
 
     RUN_TEST(test_scene_command_buffer_flushes_in_ascending_worker_index_order);
     RUN_TEST(test_scene_command_buffer_parallel_writes_all_land_exactly_once);
