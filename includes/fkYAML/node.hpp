@@ -11839,7 +11839,11 @@ struct from_node_int_helper<BasicNodeType, IntType, false> {
         const node_int_type tmp_int = n.as_int();
 
         // under/overflow check.
-        if (std::is_same<IntType, uint64_t>::value) {
+        // coopa patch: any unsigned 64-bit type, not just uint64_t itself. On macOS size_t is
+        // `unsigned long` while uint64_t is `unsigned long long`, so the is_same test alone sent
+        // size_t down the signed branch, where max() wraps to -1 and every value "overflows".
+        if (std::is_same<IntType, uint64_t>::value ||
+            (std::is_unsigned<IntType>::value && sizeof(IntType) == sizeof(uint64_t))) {
             if FK_YAML_UNLIKELY (tmp_int < 0) {
                 throw exception("Integer value underflow detected.");
             }
@@ -11883,7 +11887,11 @@ inline void from_node(const BasicNodeType& n, IntegerType& i) {
         const auto tmp_int = static_cast<int64_t>(n.as_float());
 
         // under/overflow check.
-        if (std::is_same<IntegerType, uint64_t>::value) {
+        // coopa patch: any unsigned 64-bit type, not just uint64_t itself. On macOS size_t is
+        // `unsigned long` while uint64_t is `unsigned long long`, so the is_same test alone sent
+        // size_t down the signed branch, where max() wraps to -1 and every value "overflows".
+        if (std::is_same<IntegerType, uint64_t>::value ||
+            (std::is_unsigned<IntegerType>::value && sizeof(IntegerType) == sizeof(uint64_t))) {
             if FK_YAML_UNLIKELY (tmp_int < 0) {
                 throw exception("Integer value underflow detected.");
             }
