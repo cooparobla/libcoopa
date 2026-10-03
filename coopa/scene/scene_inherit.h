@@ -39,6 +39,14 @@
  *   - A component or child entry carrying `remove: true` deletes every
  *     matching base entry instead of merging.
  *
+ * Object assets (prefabs): `prefab: objects/crate` is the same reference as `inherit_from`,
+ * written for reusable object files (`objects/<name>.yaml`, shape `object: {...}`). Two things
+ * differ: the extension may be omitted, and the instance's own root Transform REPLACES the
+ * prefab's (an instance is placed absolutely -- a prefab's root offset must not shift every
+ * copy), while children and other components merge as above. References resolve against
+ * the declaring file's folder, the root scene's folder, then the project's asset roots
+ * (set_search_roots), so `objects/crate` works from any scene.
+ *
  * Reserved keys, stripped or left behind as internal bookkeeping: `id` and
  * `remove` are only ever read by the merge pass; `__source_dirs` is a
  * sequence of directories (nearest first) that a node's relative asset paths
@@ -95,8 +103,30 @@ public:
         return resolve_document_(path, load_document, stack, root_dir);
     }
 
+    /**
+     * @brief Expands one object node's `prefab` / `inherit_from` (and its children's) as if it
+     *        were declared in `declaring_path` -- an instance spawned at runtime, or the editor
+     *        showing an instance's resolved components.
+     */
+    static fkyaml::node resolve_object(fkyaml::node obj, const std::string& declaring_path, const DocumentLoader& load_document) {
+        std::vector<std::string> stack;
+        const std::string dir = std::filesystem::is_directory(declaring_path) ? declaring_path : parent_dir_(declaring_path);
+        stamp_source_dir_(obj, dir);
+        resolve_object_inherit_(obj, load_document, stack, dir, dir);
+        return obj;
+    }
+
+    /** @brief Asset roots searched for references after the declaring / root scene folders. */
+    static void set_search_roots(std::vector<std::string> roots) { search_roots_() = std::move(roots); }
+    static const std::vector<std::string>& search_roots() { return search_roots_(); }
+
 private:
     static constexpr int kMaxDepth = 32;
+
+    static std::vector<std::string>& search_roots_() {
+        static std::vector<std::string> roots;
+        return roots;
+    }
 
     // ---- small path helpers ----
 
@@ -125,8 +155,10 @@ private:
      *        .caml container) can still make sense of it.
      */
     static std::string resolve_inherit_path_(
-        const std::string& raw_path, const std::string& declaring_dir, const std::string& root_dir)
+        const std::string& raw, const std::string& declaring_dir, const std::string& root_dir)
     {
+        // An extensionless reference (`objects/crate`) means the .yaml (or its .caml twin).
+        const std::string raw_path = std::filesystem::path(raw).has_extension() ? raw : raw + ".yaml";
         std::filesystem::path p(raw_path);
         if (p.is_absolute()) return raw_path;
 
@@ -136,6 +168,10 @@ private:
         candidate = coopa::yaml::resolve_variant(std::filesystem::path(root_dir) / raw_path);
         if (std::filesystem::exists(candidate)) return candidate.string();
 
+        for (const auto& root : search_roots_()) {
+            candidate = coopa::yaml::resolve_variant(std::filesystem::path(root) / raw_path);
+            if (std::filesystem::exists(candidate)) return candidate.string();
+        }
         return raw_path;
     }
 
@@ -405,8 +441,9 @@ private:
             }
         }
 
-        if (!obj.contains("inherit_from")) return;
-        std::vector<std::string> refs = as_string_list_(obj.at("inherit_from"));
+        const bool is_prefab = obj.contains("prefab");
+        if (!obj.contains("inherit_from") && !is_prefab) return;
+        std::vector<std::string> refs = as_string_list_(obj.at(is_prefab ? "prefab" : "inherit_from"));
 
         fkyaml::node merged_base;
         bool have_base = false;
@@ -419,8 +456,21 @@ private:
             have_base = true;
         }
 
+        if (have_base && is_prefab) {
+            // A prefab instance places itself: its own root Transform replaces the prefab's.
+            bool own_transform = false;
+            if (obj.contains("components") && obj.at("components").is_sequence()) {
+                for (const auto& c : obj.at("components")) own_transform |= component_tag_(c) == "Transform";
+            }
+            if (own_transform && merged_base.contains("components") && merged_base.at("components").is_sequence()) {
+                auto& seq = merged_base.at("components").as_seq();
+                seq.erase(std::remove_if(seq.begin(), seq.end(), [](const fkyaml::node& c) { return component_tag_(c) == "Transform"; }),
+                          seq.end());
+            }
+        }
         if (have_base) obj = merge_object_(merged_base, obj);
         else erase_key_(obj, "inherit_from");
+        erase_key_(obj, "prefab");
     }
 
     /** @brief Loads `path`, expands every inherit_from reachable from it, and returns the merged document. */

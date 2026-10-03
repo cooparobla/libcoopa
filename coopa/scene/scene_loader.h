@@ -128,6 +128,14 @@ public:
          * @param relative Path as written in the scene file.
          * @return The resolved path, or `relative` unchanged if no candidate exists.
          */
+        /**
+         * @brief The directory a component's relative asset paths start from: the file that
+         *        actually wrote it (a prefab in objects/, say) when provenance is known, else
+         *        the scene's. Hand it to AssetSource / AssetManager lookups, which then fall
+         *        back to the project's asset roots.
+         */
+        const std::string& base_dir() const { return search_dirs.empty() ? scene_dir : search_dirs.front(); }
+
         std::string resolve(const std::string& relative) const {
             if (std::filesystem::path(relative).is_absolute()) return relative;
             for (const auto& dir : search_dirs) {
@@ -218,7 +226,57 @@ public:
                                                      bool auto_transform = true) {
         const std::string scene_dir = std::filesystem::path(scene_path).parent_path().string();
         ParseContext ctx{ scene_path, scene_dir, { scene_dir } };
+        if (node.is_mapping() && (node.contains("prefab") || node.contains("inherit_from"))) {
+            const fkyaml::node resolved = SceneInheritance::resolve_object(node, scene_path, [](const std::string& p) { return load_node_(p); });
+            return parse_object_(resolved, parent_transform, auto_transform, ctx);
+        }
         return parse_object_(node, parent_transform, auto_transform, ctx);
+    }
+
+    /**
+     * @brief The project's asset roots, searched for `prefab:` / `inherit_from` references
+     *        after the declaring file's folder (so a scene anywhere can say `objects/crate`).
+     */
+    static void set_search_roots(std::vector<std::string> roots) { SceneInheritance::set_search_roots(std::move(roots)); }
+
+    /**
+     * @brief Builds an instance of an object asset (`objects/crate`, or a path), with optional
+     *        overrides merged on top (`components:` / `children:` as in a scene entry). Not
+     *        started and unparented -- see Scene::instantiate() for the usual one-call spawn.
+     * @throws std::runtime_error if the asset can't be found or parsed.
+     */
+    static std::unique_ptr<SceneObject> instantiate(const std::string& ref, const fkyaml::node* overrides = nullptr,
+                                                    TransformComponent* parent_transform = nullptr) {
+        fkyaml::node obj = (overrides && overrides->is_mapping()) ? *overrides : fkyaml::node::mapping();
+        obj["prefab"] = fkyaml::node(ref);
+        const auto& roots = SceneInheritance::search_roots();
+        const std::string anchor = roots.empty() ? std::filesystem::current_path().string() : roots.front();
+        const std::string fake_path = (std::filesystem::path(anchor) / "__spawn__.yaml").string();
+        const fkyaml::node resolved = SceneInheritance::resolve_object(obj, fake_path, [](const std::string& p) { return load_node_(p); });
+        if (!resolved.contains("components") && !resolved.contains("children")) {
+            throw std::runtime_error("[SceneLoader] instantiate: object asset '" + ref + "' not found or empty");
+        }
+        ParseContext ctx{ fake_path, anchor, { anchor } };
+        return parse_object_(resolved, parent_transform, true, ctx);
+    }
+
+    /**
+     * @brief Spawns an object asset into a running scene: builds it (instantiate()), parents
+     *        it (root, or under `parent`), stamps it into the scene and calls start() on it.
+     *        Main thread only (parsers are not thread-safe); from a job, enqueue a lambda on
+     *        the scene's SceneCommandBuffer that calls this.
+     * @return The new object (owned by the scene).
+     */
+    static SceneObject* spawn(Scene& scene, const std::string& ref, SceneObject* parent = nullptr,
+                              const fkyaml::node* overrides = nullptr) {
+        TransformComponent* parent_tc = parent ? parent->get_transform() : nullptr;
+        auto obj = instantiate(ref, overrides, parent_tc);
+        SceneObject* raw = obj.get();
+        if (parent) parent->add_child(std::move(obj));
+        else scene.add_root_object(std::move(obj));
+        scene.adopt(*raw);
+        raw->start();
+        return raw;
     }
 
     /**

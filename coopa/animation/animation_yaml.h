@@ -64,7 +64,7 @@ inline void register_animation_components(coopa::asset::AssetManager& assets) {
                 // gfxcoopa's MeshRenderer/material texture loading) rather
                 // than pre-resolving via ParseContext::resolve() — this lets
                 // AssetManager's own AssetSource search roots participate too.
-                auto handle = assets.load_async<AnimationClip>(clip_path, ctx.scene_dir);
+                auto handle = assets.load_async<AnimationClip>(clip_path, ctx.base_dir());
                 AnimatorState* state = animator->add_state(name, std::move(handle));
 
                 if (state_node.contains("wrap")) {

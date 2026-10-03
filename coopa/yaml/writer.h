@@ -56,14 +56,15 @@ namespace detail {
 inline const std::vector<std::string>& leading_keys() {
     static const std::vector<std::string> keys = {
         "format", "version", "scene", "scene_name", "inherit_from", "auto_transform",
-        "name", "active", "type", "id", "remove", "base",
+        "name", "prefab", "active", "type", "id", "remove", "base",
     };
     return keys;
 }
 
 inline const std::vector<std::string>& trailing_keys() {
     static const std::vector<std::string> keys = {
-        "vertices", "normals", "uvs", "tangents", "colors", "weights", "joints", "joint_weights", "faces",
+        "material_slots", "vertices", "normals", "uvs", "tangents", "colors", "weights", "joints", "joint_weights", "faces",
+        "face_materials",
         "lods", "cull_screen_size",
         "components", "children", "root_objects",
     };
