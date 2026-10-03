@@ -127,6 +127,16 @@ public:
 
     /** @brief Stable name used by Scene::find_system()/remove_system() and logging. */
     virtual const char* system_name() const = 0;
+
+    /**
+     * @brief Whether this system still runs while its Scene is not simulating.
+     *
+     * An editor holds its scene in a non-simulating state (Scene::set_simulating(false)):
+     * gameplay, physics and behaviour walks stop, while systems that only keep what is
+     * drawn consistent with the authored data -- transform resolve, terrain meshing --
+     * keep running. Default false: a system is gameplay unless it says otherwise.
+     */
+    virtual bool runs_in_edit_mode() const { return false; }
 };
 
 /**

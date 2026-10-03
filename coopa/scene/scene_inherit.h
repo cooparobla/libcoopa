@@ -62,6 +62,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <coopa/yaml/document.h>
 
 namespace coopa {
 namespace scene {
@@ -129,10 +130,10 @@ private:
         std::filesystem::path p(raw_path);
         if (p.is_absolute()) return raw_path;
 
-        std::filesystem::path candidate = std::filesystem::path(declaring_dir) / raw_path;
+        std::filesystem::path candidate = coopa::yaml::resolve_variant(std::filesystem::path(declaring_dir) / raw_path);
         if (std::filesystem::exists(candidate)) return candidate.string();
 
-        candidate = std::filesystem::path(root_dir) / raw_path;
+        candidate = coopa::yaml::resolve_variant(std::filesystem::path(root_dir) / raw_path);
         if (std::filesystem::exists(candidate)) return candidate.string();
 
         return raw_path;

@@ -137,6 +137,7 @@ public:
           events_(std::move(other.events_)),
           systems_(std::move(other.systems_)),
           jobs_(other.jobs_),
+          simulating_(other.simulating_),
           frame_index_(other.frame_index_.load(std::memory_order_relaxed)),
           worker_commands_(std::move(other.worker_commands_))
     {
@@ -151,6 +152,7 @@ public:
         events_           = std::move(other.events_);
         systems_          = std::move(other.systems_);
         jobs_             = other.jobs_;
+        simulating_       = other.simulating_;
         frame_index_.store(other.frame_index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         worker_commands_  = std::move(other.worker_commands_);
         other.jobs_ = nullptr;
@@ -240,7 +242,8 @@ public:
         FrameContext ctx{delta_time, frame_index_.load(std::memory_order_relaxed), jobs_,
                          &commands_for(widx), widx};
         for (auto& entry : systems_) {
-            if (entry.first < static_cast<int>(UpdatePhase::LateBehaviour)) {
+            if (entry.first < static_cast<int>(UpdatePhase::LateBehaviour) &&
+                (simulating_ || entry.second->runs_in_edit_mode())) {
                 entry.second->execute(*this, ctx);
             }
         }
@@ -268,7 +271,8 @@ public:
         FrameContext ctx{delta_time, frame_index_.load(std::memory_order_relaxed), jobs_,
                          &commands_for(widx), widx};
         for (auto& entry : systems_) {
-            if (entry.first >= static_cast<int>(UpdatePhase::LateBehaviour)) {
+            if (entry.first >= static_cast<int>(UpdatePhase::LateBehaviour) &&
+                (simulating_ || entry.second->runs_in_edit_mode())) {
                 entry.second->execute(*this, ctx);
             }
         }
@@ -423,6 +427,19 @@ public:
 
     /** @brief Monotonically increasing frame counter, incremented once per late_update(). */
     uint64_t frame_index() const { return frame_index_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Turns simulation on (the default) or off.
+     *
+     * Off is an editor's "edit mode": update()/late_update() run only the systems whose
+     * ISceneSystem::runs_in_edit_mode() is true (transform resolve, terrain meshing), so
+     * physics, behaviour walks and animation stand still while the scene is still drawn
+     * and its deferred commands still flush.
+     */
+    void set_simulating(bool simulating) { simulating_ = simulating; }
+
+    /** @brief See set_simulating(). */
+    bool is_simulating() const { return simulating_; }
 
     // --- Generic queries ---
 
@@ -581,6 +598,7 @@ private:
     /** @brief Registered systems, kept sorted ascending by order; equal orders keep insertion order. */
     std::vector<std::pair<int, std::unique_ptr<ISceneSystem>>> systems_;
     coopa::job::JobEngine* jobs_ = nullptr; /**< Non-owning. See set_job_engine(). */
+    bool                   simulating_ = true; /**< See set_simulating(). */
     std::atomic<uint64_t>  frame_index_{0}; /**< Bumped once per late_update(); atomic so a worker job may read it. */
 
     /// @brief Per-worker deferred command buffers -- see commands_for()/flush_commands().

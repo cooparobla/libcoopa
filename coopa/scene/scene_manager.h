@@ -169,6 +169,28 @@ public:
     /** @brief Returns true if a scene is currently loaded/active. */
     bool has_scene() const { return active_index_ != kNoActive; }
 
+    /**
+     * @brief Makes an already-managed scene the primary one get_active_scene() returns.
+     * @return False if `scene` is not managed by this SceneManager.
+     */
+    bool set_active_scene(Scene* scene) {
+        for (size_t i = 0; i < scenes_.size(); ++i) {
+            if (scenes_[i].scene.get() == scene) {
+                active_index_ = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @brief True if `scene` participates in update()/late_update() (see set_scene_active()). */
+    bool is_scene_active(const Scene* scene) const {
+        for (const auto& e : scenes_) {
+            if (e.scene.get() == scene) return e.active;
+        }
+        return false;
+    }
+
     /** @brief Returns a reference to the active scene. @throws std::runtime_error if no scene is loaded. */
     Scene& get_active_scene() {
         if (active_index_ == kNoActive) throw std::runtime_error("[SceneManager] No active scene loaded.");

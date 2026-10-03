@@ -11,6 +11,7 @@
 #include <coopa/item/item_def.h>
 #include <coopa/item/item_id.h>
 #include <fkYAML/node.hpp>
+#include <coopa/yaml/document.h>
 #include <glm/glm.hpp>
 
 #include <fstream>
@@ -85,11 +86,7 @@ class ItemDatabaseLoader : public coopa::asset::TypedAssetLoader<ItemDatabase> {
 public:
     std::shared_ptr<ItemDatabase> decode_typed(const coopa::asset::AssetId& id,
                                                const coopa::asset::LoadContext& ctx) override {
-        std::ifstream ifs(ctx.resolved_path);
-        if (!ifs) {
-            throw std::runtime_error("[ItemDatabaseLoader] Failed to open '" + id.path() + "'");
-        }
-        fkyaml::node root = fkyaml::node::deserialize(ifs);
+        fkyaml::node root = coopa::yaml::load_document(ctx.resolved_path);
         auto db = std::make_shared<ItemDatabase>();
         parse_item_database(root, *db);
         return db;

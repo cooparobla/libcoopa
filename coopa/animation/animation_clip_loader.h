@@ -9,6 +9,7 @@
 #include <coopa/animation/animation_clip.h>
 #include <coopa/asset/asset_loader.h>
 #include <fkYAML/node.hpp>
+#include <coopa/yaml/document.h>
 #include <glm/glm.hpp>
 
 #include <fstream>
@@ -133,11 +134,7 @@ class AnimationClipLoader : public coopa::asset::TypedAssetLoader<AnimationClip>
 public:
     std::shared_ptr<AnimationClip> decode_typed(const coopa::asset::AssetId& id,
                                                 const coopa::asset::LoadContext& ctx) override {
-        std::ifstream ifs(ctx.resolved_path);
-        if (!ifs) {
-            throw std::runtime_error("[AnimationClipLoader] Failed to open '" + id.path() + "'");
-        }
-        fkyaml::node root = fkyaml::node::deserialize(ifs);
+        fkyaml::node root = coopa::yaml::load_document(ctx.resolved_path);
         return std::make_shared<AnimationClip>(parse_clip(root));
     }
 

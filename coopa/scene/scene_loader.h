@@ -38,10 +38,11 @@
  * one entry until this is fixed upstream; every scene file in this codebase
  * uses that form for exactly this reason.
  *
- * By default, YAML is parsed directly via fkYAML::node::deserialize(). Set a
- * document loader (set_document_loader()) to route through something else —
- * e.g. an application that wants encrypted/compressed .caml scene files can
- * plug in a caml-backed loader without SceneLoader depending on caml itself.
+ * By default, documents are read through coopa::yaml::load_document(), which
+ * accepts plain YAML and any encoded container whose decoder the application
+ * registered (toyengine registers caml's .caml format), and finds "x.caml"
+ * when a reference names "x.yaml". Set a document loader
+ * (set_document_loader()) to route through something else entirely.
  *
  * Before any of the above is parsed, every `inherit_from` reachable from the
  * document is expanded by SceneInheritance (see scene_inherit.h) into one
@@ -62,6 +63,7 @@
 #include <coopa/scene/components/transform_component.h>
 
 #include <fkYAML/node.hpp>
+#include <coopa/yaml/document.h>
 
 #include <string>
 #include <unordered_map>
@@ -170,12 +172,78 @@ public:
      * @throws std::runtime_error on parse errors or missing files.
      */
     static Scene load(const std::string& path) {
+        fkyaml::node root = SceneInheritance::resolve(
+            path, [](const std::string& p) { return load_node_(p); });
+        return build_(root, path);
+    }
+
+    /**
+     * @brief Builds a scene from an already-parsed (not yet inheritance-resolved) document.
+     *
+     * The in-memory twin of load(): an editor keeps the scene document it is editing as a
+     * node and rebuilds the live Scene from it without a round trip through disk. `path` is
+     * where the document lives (or will live) -- it anchors relative asset paths and
+     * `inherit_from` references exactly as load() would; base documents are still read from
+     * disk.
+     *
+     * @param root The scene document (`scene:` at its top level).
+     * @param path The document's file path, existing or not.
+     */
+    static Scene load_from_node(const fkyaml::node& root, const std::string& path) {
+        std::error_code ec;
+        const std::filesystem::path self = std::filesystem::weakly_canonical(path, ec);
+        fkyaml::node resolved = SceneInheritance::resolve(path, [&](const std::string& p) {
+            std::error_code ec2;
+            if (std::filesystem::weakly_canonical(p, ec2) == self || p == path) return root;
+            return load_node_(p);
+        });
+        return build_(resolved, path);
+    }
+
+    /**
+     * @brief Builds one object (and its subtree) from an already-resolved object node.
+     *
+     * For an editor rebuilding a single edited object in place. The returned object is not
+     * started and belongs to no scene; the caller parents it (Scene::add_root_object() +
+     * Scene::adopt(), or SceneObject::add_child()) and then calls start().
+     *
+     * @param node             The object node (`name`, `components`, `children`).
+     * @param parent_transform The new parent's TransformComponent, or null for a root object.
+     * @param scene_path       The owning scene file's path, for relative asset paths.
+     * @param auto_transform   As the scene's `auto_transform` key (default true).
+     */
+    static std::unique_ptr<SceneObject> build_object(const fkyaml::node& node,
+                                                     TransformComponent* parent_transform,
+                                                     const std::string& scene_path,
+                                                     bool auto_transform = true) {
+        const std::string scene_dir = std::filesystem::path(scene_path).parent_path().string();
+        ParseContext ctx{ scene_path, scene_dir, { scene_dir } };
+        return parse_object_(node, parent_transform, auto_transform, ctx);
+    }
+
+    /**
+     * @brief Signature for an object observer: called once per object built, after its
+     *        components and before its children, with the object node it came from.
+     */
+    using ObjectObserver = std::function<void(const fkyaml::node& node, SceneObject& obj)>;
+
+    /**
+     * @brief Installs (or, with an empty function, removes) the process-wide object observer.
+     *
+     * Lets a tool map document nodes to the live objects built from them -- e.g. an editor
+     * stamps a private id key into each object node and records id -> SceneObject*. Unknown
+     * keys are otherwise ignored by the loader, so the stamp changes nothing else.
+     */
+    static void set_object_observer(ObjectObserver fn) {
+        std::unique_lock<std::shared_mutex> lock(loader_mutex_());
+        object_observer_() = std::move(fn);
+    }
+
+private:
+    static Scene build_(const fkyaml::node& root, const std::string& path) {
         std::filesystem::path scene_path(path);
         std::filesystem::path scene_dir = scene_path.parent_path();
         ParseContext ctx{ path, scene_dir.string(), { scene_dir.string() } };
-
-        fkyaml::node root = SceneInheritance::resolve(
-            path, [](const std::string& p) { return load_node_(p); });
 
         std::string scene_name = "Scene";
         bool auto_transform = true;
@@ -204,6 +272,7 @@ public:
         return scene;
     }
 
+public:
     /**
      * @brief Registers a parser for a component's YAML tag/type name.
      *
@@ -287,6 +356,11 @@ private:
         return mutex;
     }
 
+    static ObjectObserver& object_observer_() {
+        static ObjectObserver observer;
+        return observer;
+    }
+
     /** @brief Loads and parses the root node, via the custom loader if one is installed. */
     static fkyaml::node load_node_(const std::string& path) {
         DocumentLoader loader_copy;
@@ -297,11 +371,11 @@ private:
         if (loader_copy) {
             return loader_copy(path);
         }
-        std::ifstream ifs(path);
-        if (!ifs) {
+        const std::filesystem::path resolved = coopa::yaml::resolve_variant(path);
+        if (!std::filesystem::exists(resolved)) {
             throw std::runtime_error("[SceneLoader] Failed to open scene file: " + path);
         }
-        return fkyaml::node::deserialize(ifs);
+        return coopa::yaml::load_document(resolved);
     }
 
     /**
@@ -338,6 +412,13 @@ private:
                 parse_component_(comp_node, *obj, comp_ctx);
             }
         }
+
+        ObjectObserver observer;
+        {
+            std::shared_lock<std::shared_mutex> lock(loader_mutex_());
+            observer = object_observer_();
+        }
+        if (observer) observer(node, *obj);
 
         if (node.contains("children")) {
             for (const auto& child_node : node.at("children")) {

@@ -10,10 +10,13 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#include <coopa/yaml/document.h>
 
 namespace coopa {
 namespace asset {
@@ -61,17 +64,20 @@ public:
      * @return The resolved path, or virtual_path unchanged if nothing matched.
      */
     std::string resolve(const std::string& virtual_path, const std::string& base_dir = "") const {
+        auto existing = [](const std::filesystem::path& candidate) -> std::optional<std::string> {
+            std::filesystem::path found = coopa::yaml::resolve_variant(candidate);
+            if (std::filesystem::exists(found)) return found.string();
+            return std::nullopt;
+        };
         std::filesystem::path p(virtual_path);
-        if (p.is_absolute() && std::filesystem::exists(p)) {
-            return virtual_path;
+        if (p.is_absolute()) {
+            if (auto found = existing(p)) return *found;
         }
         if (!base_dir.empty()) {
-            std::filesystem::path candidate = std::filesystem::path(base_dir) / virtual_path;
-            if (std::filesystem::exists(candidate)) return candidate.string();
+            if (auto found = existing(std::filesystem::path(base_dir) / virtual_path)) return *found;
         }
         for (const auto& root : search_roots_) {
-            std::filesystem::path candidate = std::filesystem::path(root) / virtual_path;
-            if (std::filesystem::exists(candidate)) return candidate.string();
+            if (auto found = existing(std::filesystem::path(root) / virtual_path)) return *found;
         }
         return virtual_path;
     }

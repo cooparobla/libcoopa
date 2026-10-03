@@ -16,6 +16,7 @@
 #include <type_traits> // For std::is_same_v
 
 #include <coopa/debug/logger.h>
+#include <coopa/yaml/document.h>
 
 /**
  * @namespace coopa
@@ -58,14 +59,14 @@ public:
     static YAMLMap load(const std::string& filepath) {
         YAMLMap config;
         
-        std::ifstream file(filepath, std::ios::in);
-        if (!file.is_open()) {
+        const std::filesystem::path resolved = coopa::yaml::resolve_variant(filepath);
+        if (!std::filesystem::exists(resolved)) {
             std::cerr << "YAMLMap: Error loading file '" << filepath << "'. Creating empty config." << std::endl;
             return config; 
         }
 
         try {
-            config.root_node_ = fkyaml::node::deserialize(file);
+            config.root_node_ = coopa::yaml::load_document(resolved);
         } catch (const std::exception& e) {
             std::cerr << "YAMLMap: Error parsing file '" << filepath << "': " << e.what() << std::endl;
             throw; 

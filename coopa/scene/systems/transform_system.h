@@ -53,6 +53,8 @@ namespace scene {
 class TransformSystem : public ISceneSystem {
 public:
     const char* system_name() const override { return "TransformResolve"; }
+    /// Keeps world matrices current for a non-simulating (editor) scene too.
+    bool runs_in_edit_mode() const override { return true; }
 
     void execute(Scene& scene, const FrameContext& ctx) override {
         auto& roots = scene.root_objects();
