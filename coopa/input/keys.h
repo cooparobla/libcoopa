@@ -130,6 +130,8 @@ enum class CursorShape {
     Arrow,
     IBeam,
     Hand,
+    ResizeH,   ///< Left-right resize (a vertical panel border).
+    ResizeV,   ///< Up-down resize (a horizontal panel border).
 };
 
 /// @brief Visibility/capture behavior of the OS cursor, independent of its shape.
