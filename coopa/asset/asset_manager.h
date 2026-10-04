@@ -420,6 +420,15 @@ public:
     /** @brief Enables/disables mtime-polling hot reload (checked inside update()). Off by default. */
     void set_hot_reload(bool enabled) { hot_reload_enabled_ = enabled; }
 
+    /**
+     * @brief Runs hot reload's change check now, regardless of set_hot_reload() and the poll
+     *        interval: every referenced, loaded asset whose file changed on disk is re-decoded
+     *        and re-published (old payloads retired with the usual grace period). For a tool
+     *        that just wrote an asset and needs every user -- render meshes, colliders -- current
+     *        before the next frame, not up to a poll interval later.
+     */
+    void reload_changed() { poll_for_reloads_(); }
+
     /** @brief Seconds between hot-reload polling passes. Default 1.0. */
     void set_poll_interval(float seconds) { poll_interval_ = seconds; }
 

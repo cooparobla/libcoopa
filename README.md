@@ -1,108 +1,234 @@
 # libcoopa
 
-`libcoopa` is a high-performance C++ header-only utility library providing core runtime structures for parallel execution, configuration management, diagnostic logging, and mathematical operations. 
+**A header-only C++20 runtime library: jobs, scenes, assets, coroutines and gameplay basics.**
 
-It is designed to be highly thread-safe and suitable for building multithreaded runtime systems.
+libcoopa is the shared base that the other coopa libraries build on. It has a work-stealing
+job system, a scene graph with an ordered per-frame system pipeline, a typed asset manager
+with async loading and hot reload, Unity-style coroutines and animation, and small gameplay
+models such as input maps, inventories and health bars. It has no graphics or windowing code,
+so it works in tools, servers and tests as well as games. It is developed on Linux and macOS.
 
-## Modules Overview
+The library is header-only. It depends on nothing outside the standard library except three
+vendored headers in `includes/`: [glm](https://github.com/g-truc/glm),
+[fkYAML](https://github.com/fktn-k/fkYAML) and
+[parallel-hashmap](https://github.com/greg7mdp/parallel-hashmap). It does not depend on any
+other coopa library. The others (for example the Vulkan renderer gfxcoopa and the UI toolkit
+uicoopa) depend on it and plug into its extension points. The game engine toyengine is one
+consumer.
 
-`libcoopa` is organized into twelve main modules:
+## Features
 
-### 1. [Utilities (`coopa/util/`)](file:///home/coopa/git/libcoopa/coopa/util/)
-Cross-platform helper utilities for math, file paths, strings, and unique IDs:
-- **[IdUtil](file:///home/coopa/git/libcoopa/coopa/util/id.h)**: Thread-safe atomic counter for generating unique runtime identifiers.
-- **[StringUtil](file:///home/coopa/git/libcoopa/coopa/util/string.h)**: Common header-only string operations like splitting, joining, case conversions, and substring replacement.
-- **[MathUtil & Mat4](file:///home/coopa/git/libcoopa/coopa/util/math.h)**: Matrix mathematics featuring a lightweight 4x4 matrix representation ([Mat4](file:///home/coopa/git/libcoopa/coopa/util/math.h)) optimized for column-major layouts, transformations, and interoperability with `glm::mat4`.
-- **[FileUtil](file:///home/coopa/git/libcoopa/coopa/util/file.h)**: Path resolvers for assets and project/root relative file locations.
+### Concurrency
+- **Job system** (`coopa/job/`). `JobEngine` runs jobs on worker threads with lock-free
+  Chase-Lev work-stealing deques and three priority levels. Handles come from a fixed pool,
+  so submitting a job does not allocate a handle on the heap. A job can depend on any number of other
+  handles; dependents are released when their dependencies finish, without polling.
+  `parallel_for()` splits a range into chunks. A worker that calls `wait_for()` keeps
+  running other jobs, so jobs can wait on jobs without deadlocking.
+- **Hazard-based scheduling.** `JobScheduler` works out dependencies for you from declared
+  reads and writes (read-after-write, write-after-read, write-after-write).
+- **Thread-safe containers.** `ParallelQueue`, `ParallelVector` and `ParallelMap` (over
+  `phmap`).
 
-### 2. [Collections (`coopa/collections/`)](file:///home/coopa/git/libcoopa/coopa/collections/)
-Structures for configuration parsing and structured serialization:
-- **[YAMLMap](file:///home/coopa/git/libcoopa/coopa/collections/yaml_map.h)**: A wrapper encapsulating `fkYAML` nodes to ease loading, mutating, querying, and serializing YAML configurations.
+### Scenes
+- **Scene graph** (`coopa/scene/`). `Scene` owns `SceneObject`s, which own `Component`s
+  with `start()`, `update()` and `late_update()`. `TransformComponent` wraps a hierarchical
+  transform with lazy world-matrix updates.
+- **Ordered system pipeline.** `Scene::update()` and `late_update()` run a list of
+  `ISceneSystem`s sorted by `UpdatePhase` (Behaviour, Routine, Animation, TransformResolve,
+  LateBehaviour) or by any integer order. A system can spread its work over a `JobEngine` and
+  queue structural changes in per-worker `SceneCommandBuffer`s.
+- **SceneManager.** Runs several scenes at once, one job per scene, when a `JobEngine` is
+  installed.
+- **YAML scenes.** `SceneLoader` reads scene files. Every component type except `Transform`
+  is parsed by a function you register with `register_component_parser()`. Objects and
+  whole scenes can `inherit_from` other files (with `prefab:` as a shorthand), merge
+  components by type, and `remove: true` entries.
 
-### 3. [Job System (`coopa/job/`)](file:///home/coopa/git/libcoopa/coopa/job/)
-A high-performance concurrent scheduling engine optimized for realtime/game-engine frame loops. Features lock-free work-stealing, zero-allocation job submission, and automatic hazard-based dependency resolution:
-- **[JobEngine](file:///home/coopa/git/libcoopa/coopa/job/engine.h)**: The execution manager. Spawns worker threads with lock-free Chase-Lev work-stealing deques, supports thread dedication by job type, and uses a spinning-then-sleeping strategy to minimize latency. Owns a pre-allocated `CounterPool` for zero-heap-allocation handle creation, and a `DependencyGraph` that resolves dependencies event-driven. `begin_frame()` / `end_frame()` reset per-frame diagnostic counters only.
-- **[JobScheduler](file:///home/coopa/git/libcoopa/coopa/job/scheduler.h)**: Dependency resolver that automatically calculates execution dependencies by analyzing data contention hazards: Read-After-Write (RAW), Write-After-Read (WAR), and Write-After-Write (WAW). Includes per-frame lifecycle to prevent unbounded tracking-state accumulation.
-- **[JobHandle](file:///home/coopa/git/libcoopa/coopa/job/handle.h)**: Lightweight trivially-copyable token (16 bytes) referencing a generation-tagged slot in the engine's pre-allocated `CounterPool`, for zero-copy, zero-allocation completion tracking. Slots are reclaimed individually, so a handle's lifetime is independent of any frame boundary.
-- **[Job](file:///home/coopa/git/libcoopa/coopa/job/job.h)**: Unit of work with a `TaskWrapper` (48-byte small-buffer-optimized callable). Carries no dependency storage of its own — a job with dependencies is parked in a `PendingNode` by the `DependencyGraph` until they are met.
-- **[DependencyGraph](file:///home/coopa/git/libcoopa/coopa/job/dependency_graph.h)**: Event-driven, unbounded-fan-in dependency resolution. Each dependent registers a waiter on its dependency's own lock-free stack, so completion fires dependents directly instead of anyone scanning or polling.
-- **[Platform](file:///home/coopa/git/libcoopa/coopa/job/platform.h)**: Compile-time platform detection (x86-64 vs ARM/Apple Silicon cache line sizes) and job system configuration constants.
-- **Concurrent Containers (`coopa/job/collections/`)**:
-  - **[WorkStealingDeque](file:///home/coopa/git/libcoopa/coopa/job/collections/work_stealing_deque.h)**: Lock-free Chase-Lev work-stealing deque. Owner pushes/pops from bottom (zero contention), thieves steal from top (single CAS). Cache-line-padded indices prevent false sharing.
-  - **[ParallelQueue](file:///home/coopa/git/libcoopa/coopa/job/collections/queue.h)**: Thread-safe FIFO queue.
-  - **[ParallelVector](file:///home/coopa/git/libcoopa/coopa/job/collections/vector.h)**: Thread-safe vector wrapper.
-  - **[ParallelMap](file:///home/coopa/git/libcoopa/coopa/job/collections/map.h)**: Thread-safe hash map wrapping `phmap`.
+### Assets and data
+- **Asset manager** (`coopa/asset/`). Register a loader per type, then `load()` or
+  `load_async()` by virtual path. Assets are cached and refcounted, and `AssetHandle`s stay
+  valid across hot reloads. Loaders decode off-thread and finalize on the main thread.
+  Hot reload checks file modification times. `create()` publishes runtime-built assets, and
+  idle eviction frees unused ones.
+- **YAML I/O** (`coopa/yaml/`, `coopa/collections/`). `read_text()` and `load_document()`
+  read plain YAML, or an encoded format through a decoder you register by magic bytes and
+  extension. The writer emits stable YAML with canonical key order and short flow-style
+  collections, so files survive a load-save round trip unchanged. `YAMLMap` is a simple
+  key-value wrapper for config files.
 
-### 4. [Diagnostics & Logging (`coopa/debug/`)](file:///home/coopa/git/libcoopa/coopa/debug/)
-Thread-safe logs and diagnostics capturing tools:
-- **[Logger](file:///home/coopa/git/libcoopa/coopa/debug/logger.h)**: Thread-safe synchronous console log printer formatting severity level, module tag, and timestamp with microsecond resolution.
-- **[DebugManager](file:///home/coopa/git/libcoopa/coopa/debug/manager.h)** & **[DebugBucket](file:///home/coopa/git/libcoopa/coopa/debug/bucket.h)**: Thread-safe queue buffers collecting parallel logs, sorting them chronologically, and flushing.
+### Gameplay
+- **Coroutines** (`coopa/routine/`). A `Routine` is a C++20 coroutine that yields
+  `next_frame()`, `frames(n)`, `seconds(s)`, `seconds_realtime(s)`, `wait_until(pred)` or
+  `wait_while(pred)`. It can also wait for a `JobHandle` (`wait_for`) or run a step on a
+  worker thread (`on_worker`) and resume on the main thread. Routines can nest, and
+  `RoutineScope` stops them when their owner is destroyed.
+- **Animation** (`coopa/animation/`). An `Animator` component plays named states with
+  crossfades. `AnimationClip`s hold keyframed tracks (linear and eased) and procedural tracks
+  (`orbit`, `sine`, `spin`, `constant`, or your own). Any component can expose animatable
+  properties through `AnimatedPropertyRegistry`.
+- **Input** (`coopa/input/`). `Input` holds keyboard and mouse state (levels, press and
+  release edges, held time, cursor deltas). `InputMap` binds named actions, axes and vectors,
+  with modifier chords. A windowing library feeds it and implements `IInputBackend`.
+- **Items** (`coopa/item/`). `ItemDatabase` (from C++ or YAML), `Inventory` with
+  move, merge, swap and split rules and change signals, and a `Hotbar` over its slots.
+- **Stats** (`coopa/stat/`). `Resource` is a clamped meter (health, stamina) with delayed
+  regeneration and `on_changed` / `on_depleted` signals. `StatBlock` groups them by name.
 
-### 5. [Events (`coopa/event/`)](file:///home/coopa/git/libcoopa/coopa/event/)
-Header-only multicast dispatch:
-- **[Signal](file:///home/coopa/git/libcoopa/coopa/event/signal.h)**: `Signal<Args...>` with RAII `Connection`/`ScopedConnection` tokens, safe re-entrant connect/disconnect during `emit()`.
-- **[EventBus](file:///home/coopa/git/libcoopa/coopa/event/event_bus.h)**: Named pub/sub over a dynamic `EventArgs` bag, with wildcard listeners.
+### Utilities
+- **Events** (`coopa/event/`). `Signal<Args...>` with RAII `Connection` and
+  `ScopedConnection` tokens; slots can connect and disconnect during `emit()`. `EventBus` adds
+  pub/sub by (object name, signal name), plus wildcard listeners by signal name.
+- **Logging** (`coopa/debug/`). A thread-safe `Logger` with level, tag and microsecond
+  timestamps, and queue-based collectors that sort logs from many threads before printing.
+- **Helpers** (`coopa/util/`). Unique IDs, string functions, a 4x4 matrix type that
+  converts to `glm::mat4`, transforms, frame timing and path resolution.
 
-### 6. [Scene (`coopa/scene/`)](file:///home/coopa/git/libcoopa/coopa/scene/)
-Scene graph, component model, an ordered per-frame system pipeline, and YAML scene loading — see the [module README](file:///home/coopa/git/libcoopa/coopa/scene/README.md):
-- **[SceneManager](file:///home/coopa/git/libcoopa/coopa/scene/scene_manager.h)**, **[Scene](file:///home/coopa/git/libcoopa/coopa/scene/scene.h)**, **[SceneObject](file:///home/coopa/git/libcoopa/coopa/scene/scene_object.h)**, **[Component](file:///home/coopa/git/libcoopa/coopa/scene/component.h)**.
-- **[ISceneSystem / UpdatePhase](file:///home/coopa/git/libcoopa/coopa/scene/scene_system.h)**: `Scene::update()`/`late_update()` run an ordered list of systems (the recursive `Component::update()`/`late_update()` walks are just the two built-ins) — the seam `coopa::anim::AnimationSystem` registers into, and where a future physics system would too. `Scene::set_job_engine()` lets a system dispatch its work as jobs on an engine that may be shared with any other subsystem.
-- **[SceneLoader](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)**: Parses YAML scenes, dispatching every non-Transform component to a parser registered from outside libcoopa (gfxcoopa, uicoopa, coopa::anim, ...).
+## Getting started
 
-### 7. [Asset (`coopa/asset/`)](file:///home/coopa/git/libcoopa/coopa/asset/)
-Generic, extensible asset system — see the [module README](file:///home/coopa/git/libcoopa/coopa/asset/README.md):
-- **[AssetManager](file:///home/coopa/git/libcoopa/coopa/asset/asset_manager.h)**: Loader registration, refcounted caching, synchronous and async loading (on a supplied or privately-owned `coopa::job::JobEngine`), mtime-polled hot reload, and shutdown.
-- **[AssetHandle](file:///home/coopa/git/libcoopa/coopa/asset/asset_handle.h)** & **[AssetSlot](file:///home/coopa/git/libcoopa/coopa/asset/asset_slot.h)**: Typed refcounted references into address-stable slots, so a hot reload never invalidates a handle already handed out.
-- **[IAssetLoader / TypedAssetLoader](file:///home/coopa/git/libcoopa/coopa/asset/asset_loader.h)**: The extension point downstream packages (gfxcoopa: mesh/texture/shader; uicoopa: sprite/font; coopa::anim: AnimationClip) register against, exactly as they already register scene components.
+### 1. Get the code
 
-### 8. [Animation (`coopa/animation/`)](file:///home/coopa/git/libcoopa/coopa/animation/)
-Unity-style scene animator — see the [module README](file:///home/coopa/git/libcoopa/coopa/animation/README.md):
-- **[Animator](file:///home/coopa/git/libcoopa/coopa/animation/animator.h)**: A component that plays named `AnimatorState`s (each an `AnimationClip`), crossfading between them, driving any number of `AnimatedProperty` bindings on any component type — including ones libcoopa never names (uicoopa's `RectTransform`, `Graphic::color`).
-- **[AnimationClip](file:///home/coopa/git/libcoopa/coopa/animation/animation_clip.h)**: Immutable, YAML-loadable animation data — keyframed tracks (linear + eased interpolation) and procedural tracks (formula-driven, e.g. `orbit`/`sine`/`spin`), both sharing one binding/blend path.
-- **[AnimatedPropertyRegistry](file:///home/coopa/git/libcoopa/coopa/animation/animated_property.h)**: The extension point that lets any component type register animatable fields, mirroring `SceneLoader::register_component_parser()`.
-- **[AnimationSystem](file:///home/coopa/git/libcoopa/coopa/animation/animation_system.h)**: The `ISceneSystem` that drives every `Animator` in a scene, batching evaluation across a `JobEngine` once the workload is large enough to be worth it.
-
-### 9. [Input (`coopa/input/`)](file:///home/coopa/git/libcoopa/coopa/input/)
-The complete keyboard/mouse vocabulary and state model, backend-agnostic — see the [module README](file:///home/coopa/git/libcoopa/coopa/input/README.md):
-- **[Input](file:///home/coopa/git/libcoopa/coopa/input/input.h)**: Owns all key/button level state, edges, held time, deltas, and discrete events; fed by a backend's `push_*()` calls (e.g. gfxcoopa's GLFW-backed `presentation::Window`) and queried directly by application code.
-- **[InputMap](file:///home/coopa/git/libcoopa/coopa/input/input_map.h)**: Named action/axis/vector bindings over keys and mouse buttons, with optional modifier chords, resolved against an `Input`.
-- **[IInputBackend](file:///home/coopa/git/libcoopa/coopa/input/input_backend.h)**: The interface a concrete windowing library implements so `Input`'s cursor/clipboard control calls have somewhere to go.
-- **[Key / MouseButton / Mods / ...](file:///home/coopa/git/libcoopa/coopa/input/keys.h)**: The dense, 0-based, backend-independent key/button vocabulary.
-
-### 10. [Item (`coopa/item/`)](file:///home/coopa/git/libcoopa/coopa/item/)
-The engine-agnostic model behind any slot-based inventory UI — see the [module README](file:///home/coopa/git/libcoopa/coopa/item/README.md):
-- **[ItemId / ItemDef / ItemDatabase](file:///home/coopa/git/libcoopa/coopa/item/item_database.h)**: Normalized, hashable item identity; the immutable per-kind definition (name/icon/max_stack/category/rarity/tint); and the `ItemId -> ItemDef` lookup table, definable from C++ or YAML side by side.
-- **[ItemDatabaseLoader](file:///home/coopa/git/libcoopa/coopa/item/item_database_loader.h)**: A `TypedAssetLoader<ItemDatabase>` parsing a YAML `items:` list, mirroring `coopa::anim::AnimationClipLoader`'s pure-CPU shape.
-- **[Inventory](file:///home/coopa/git/libcoopa/coopa/item/inventory.h)**: Fixed-capacity `ItemStack` storage with the authoritative move/merge/swap/split rules and change signals — the model a UI grid visualizes rather than owns.
-- **[Hotbar](file:///home/coopa/git/libcoopa/coopa/item/hotbar.h)**: A selectable window over an `Inventory`'s slots, e.g. a quick-slot bar.
-
-### 11. [Stat (`coopa/stat/`)](file:///home/coopa/git/libcoopa/coopa/stat/)
-Clamped, optionally-regenerating gameplay quantities (health, stamina, mana) — see the [module README](file:///home/coopa/git/libcoopa/coopa/stat/README.md):
-- **[Resource](file:///home/coopa/git/libcoopa/coopa/stat/resource.h)**: A single current/max meter with `damage`/`heal`/`tick`-driven delayed regen, `on_changed`/`on_depleted` signals.
-- **[StatBlock](file:///home/coopa/git/libcoopa/coopa/stat/stat_block.h)**: A named, pointer-stable registry of `Resource`s.
-
-### 12. [Routine (`coopa/routine/`)](file:///home/coopa/git/libcoopa/coopa/routine/)
-Unity-style coroutines on C++20 `<coroutine>` — see the [module README](file:///home/coopa/git/libcoopa/coopa/routine/README.md):
-- **[Routine](file:///home/coopa/git/libcoopa/coopa/routine/routine.h)**: The return type of a routine body. A move-only owner of one coroutine frame, so a stopped or abandoned routine unwinds its locals; a behaviour spanning frames is written as straight-line code instead of a state machine in `update()`.
-- **[Yield vocabulary](file:///home/coopa/git/libcoopa/coopa/routine/yield.h)**: `next_frame()`, `frames(n)`, `seconds(s)`, `seconds_realtime(s)`, `wait_until(pred)`, `wait_while(pred)` — plus the two Unity has no equivalent for: `wait_for(JobHandle)` and `on_worker(fn)`, which suspend a routine on `coopa::job` work without occupying a thread and resume it back on the tick thread.
-- **[RoutineRunner / RoutineHandle / RoutineScope](file:///home/coopa/git/libcoopa/coopa/routine/runner.h)**: The per-tick pump, a token that stays safe past its runner's lifetime, and the `ScopedConnection`-style RAII owner that stops a component's routines when the component dies. Nested routines (`co_yield other()`) stack exactly as Unity's nested enumerators do.
-- **[RoutineSystem](file:///home/coopa/git/libcoopa/coopa/routine/routine_system.h)**: The `ISceneSystem` at `UpdatePhase::Routine` (after `Component::update()`, before `late_update()`), with `set_time_scale()` for Unity's `Time.timeScale`, and the `start_routine()` / `stop_routines()` component helpers.
-
----
-
-## Building and Running Tests
-
-The library is built as part of the `trav` test runner target using CMake.
-
-### Build the Project
-Configure and compile using the custom compiler shortcut:
 ```bash
-cbuild
+git clone git@github.com:cooparobla/libcoopa.git
 ```
 
-### Run Unit Tests
-Run the test runner to execute the test suite (verifying all core modules) using:
-```bash
-cplay
+### 2. Add it to your CMake project
+
+You need CMake 3.20+ and a C++20 compiler. Add the library as a subdirectory and link the
+`coopa::lib` interface target. It sets up the include paths, the
+`GLM_FORCE_DEPTH_ZERO_TO_ONE` and `GLM_FORCE_RADIANS` defines, and links `Threads::Threads`.
+
+```cmake
+add_subdirectory(libs/libcoopa)
+target_link_libraries(my_app PRIVATE coopa::lib)
 ```
-The test suite source is located in [test.cpp](file:///home/coopa/git/libcoopa/test.cpp).
+
+Two options add debugging checks. Both are off by default:
+
+| Option | Effect |
+|---|---|
+| `COOPA_JOB_DIAGNOSTICS` | Per-type job counters and per-thread queue-depth snapshots on `JobEngine` |
+| `COOPA_SCENE_THREAD_CHECKS` | Asserts that each `Scene` is never used from two threads at once |
+
+### 3. Use it
+
+This program squares a million floats on every core, then runs a scene with one component
+that starts a coroutine:
+
+```cpp
+#include <coopa/job/engine.h>
+#include <coopa/job/parallel_for.h>
+#include <coopa/scene/scene.h>
+#include <coopa/routine/routine_system.h>
+#include <coopa/routine/yield.h>
+#include <cstdio>
+#include <memory>
+#include <vector>
+
+using namespace coopa;
+
+class Greeter : public scene::Component {
+public:
+    std::string type_name() const override { return "Greeter"; }
+    void start() override { routine::start_routine(*this, run()); }
+private:
+    routine::Routine run() {
+        co_yield routine::seconds(1.0f);
+        std::printf("one second later\n");
+    }
+};
+
+int main() {
+    job::JobEngine jobs;  // one worker per hardware thread
+
+    std::vector<float> values(1'000'000, 2.0f);
+    jobs.parallel_for_blocking(values.size(), 0, [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) values[i] *= values[i];
+    });
+
+    scene::Scene world("Hello");
+    world.set_job_engine(&jobs);
+    world.add_system(std::make_unique<routine::RoutineSystem>(), scene::UpdatePhase::Routine);
+    auto* obj = world.add_root_object(std::make_unique<scene::SceneObject>("greeter"));
+    obj->add_component<Greeter>();
+
+    world.start();
+    for (int frame = 0; frame < 90; ++frame) {   // 1.5 s at 60 Hz
+        world.update(1.0f / 60.0f);
+        world.late_update(1.0f / 60.0f);
+    }
+}
+```
+
+Each module folder has a README with more examples. Start with
+[scene](coopa/scene/README.md), [job](coopa/job/README.md) and
+[asset](coopa/asset/README.md).
+
+## Testing
+
+The repository builds one test executable, `libcoopa`, from [test.cpp](test.cpp). It covers
+every module and needs no window or GPU.
+
+```bash
+cmake -B build && cmake --build build -j
+./build/libcoopa
+```
+
+It prints one line per test and a summary, and exits non-zero if any test fails. The test
+build always turns on `COOPA_SCENE_THREAD_CHECKS`.
+
+## Project layout
+
+```
+coopa/
+├── job/          JobEngine, JobScheduler, handles, dependency graph, parallel_for
+│   └── collections/  work-stealing deque, ParallelQueue/Vector/Map
+├── scene/        Scene, SceneObject, Component, systems, SceneLoader, SceneManager
+├── asset/        AssetManager, handles, loaders, search roots
+├── animation/    Animator, AnimationClip, curves, procedural tracks, AnimationSystem
+├── routine/      Routine, yield instructions, RoutineRunner, RoutineSystem
+├── input/        Input, InputMap, key vocabulary, backend interface
+├── item/         ItemDatabase, Inventory, Hotbar
+├── stat/         Resource, StatBlock
+├── event/        Signal, EventBus
+├── yaml/         document reading and decoder registry, YAML writer
+├── collections/  YAMLMap
+├── debug/        Logger, DebugManager, DebugBucket
+└── util/         ids, strings, math, transforms, time, file paths
+includes/         vendored glm, fkYAML, parallel_hashmap
+configuration/    root_directory.h.in (generated into the build tree)
+test.cpp          the test suite
+plans/            design notes
+```
+
+## Notes
+
+- **Extension points.** libcoopa only knows about `Transform`. Other component types, asset
+  types and animatable properties are registered at startup by the code that defines them,
+  through `SceneLoader::register_component_parser()`, `AssetManager::register_loader()` and
+  `AnimatedPropertyRegistry`.
+- **Opt-in systems.** A new `Scene` only runs the Behaviour and LateBehaviour walks. Add
+  `RoutineSystem`, `AnimationSystem` or `TransformSystem` with `add_system()` if you need them.
+- **Threading rules.** A `Scene` must be used by one thread at a time; different scenes can
+  run in parallel. `Signal` is not thread-safe. `JobEngine` cannot be copied or moved, so
+  hold it in a `std::unique_ptr` if it lives in a container.
+- **`parallel_for`** is declared in `job/engine.h` but defined in `job/parallel_for.h`.
+  Include the second header when you call it.
+- **Root paths.** CMake writes `root_directory.h` with `ROOT_DIR` set to the *top-level*
+  project's source directory. `FileUtil` uses it to find files, and the environment variables
+  `LOGL_ROOT_PATH` and `LOGL_PROJ_PATH` override it at run time.
+- **YAML comments** are dropped on load (fkYAML does not keep them), so re-saving a file
+  with the writer removes its comments.
+- **Logging.** `JobEngine` logs its thread start-up and shutdown through `Logger`.
+
+## Documentation
+
+- Module READMEs: [job](coopa/job/README.md), [job collections](coopa/job/collections/README.md),
+  [scene](coopa/scene/README.md), [scene components](coopa/scene/components/README.md),
+  [asset](coopa/asset/README.md), [animation](coopa/animation/README.md),
+  [routine](coopa/routine/README.md), [input](coopa/input/README.md),
+  [item](coopa/item/README.md), [stat](coopa/stat/README.md),
+  [collections](coopa/collections/README.md), [debug](coopa/debug/README.md),
+  [util](coopa/util/README.md).
+- Every header has doc comments. `.coopadocs` configures `coopadocs build`, which generates
+  an HTML API reference into `.docs/`.
