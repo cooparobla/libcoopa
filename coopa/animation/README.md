@@ -115,6 +115,14 @@ walk) and `LateBehaviour` (400, the `Component::late_update()` walk) — see
 a typed `get`/`set`/`cast` triple. A downcast is resolved **once**, at an
 `Animator`'s bind time, and cached — there is no per-frame RTTI.
 
+Built in for `Transform`: `position`, `scale`, `rotation` (Euler degrees,
+per-channel and deliberately not shortest-path, so 0 -> 720 spins twice) and
+`rotation_quat` (x, y, z, w). A `rotation_quat` track interpolates channel by
+channel and the setter normalises — nlerp, the short way round as long as
+consecutive keys share a hemisphere (dot >= 0; the toyeditor's Timeline flips a
+key's sign when recording to keep it so). Rigs key rotations this way: no
+gimbal lock, no long way round.
+
 ```cpp
 // uicoopa/ui_yaml.h — registered from OUTSIDE libcoopa
 reg.register_vec<RectTransform, glm::vec2>("RectTransform", "anchored_position",

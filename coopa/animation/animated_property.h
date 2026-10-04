@@ -16,6 +16,7 @@
 #include <coopa/scene/component.h>
 #include <coopa/scene/components/transform_component.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -287,6 +288,28 @@ private:
             static_cast<coopa::scene::TransformComponent*>(t)->transform().set_rotation(glm::vec3(in[0], in[1], in[2]));
         };
         add(std::move(rotation));
+
+        // Quaternion rotation (x, y, z, w) -- what rigs key. Channels interpolate per
+        // component like every track, then the setter normalises: nlerp, which follows the
+        // shortest arc as long as consecutive keys share a hemisphere (dot >= 0) -- the
+        // toyeditor flips a key's sign when recording to keep it that way. No gimbal lock and
+        // no 350 -> 10 degree long way round, unlike the Euler "rotation" above.
+        AnimatedProperty rotation_quat;
+        rotation_quat.component_type = "Transform";
+        rotation_quat.name = "rotation_quat";
+        rotation_quat.component_count = 4;
+        rotation_quat.cast = cast_to_transform;
+        rotation_quat.get = [](void* t, float* out) {
+            const glm::quat q = static_cast<coopa::scene::TransformComponent*>(t)->transform().rotation_quat();
+            out[0] = q.x; out[1] = q.y; out[2] = q.z; out[3] = q.w;
+        };
+        rotation_quat.set = [](void* t, const float* in) {
+            glm::quat q(in[3], in[0], in[1], in[2]);   // glm: (w, x, y, z)
+            const float len = glm::length(q);
+            q = len > 1e-8f ? q / len : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            static_cast<coopa::scene::TransformComponent*>(t)->transform().set_rotation_quat(q);
+        };
+        add(std::move(rotation_quat));
 
         AnimatedProperty scale;
         scale.component_type = "Transform";
