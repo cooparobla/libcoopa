@@ -144,6 +144,13 @@ public:
             }
             std::filesystem::path candidate = std::filesystem::path(scene_dir) / relative;
             if (std::filesystem::exists(candidate)) return candidate.string();
+            // Last, the project's asset roots (set_search_roots()) -- the same fallback prefab
+            // references use, so `fonts/x.ttf` or `ui/themes/dark.yaml` written in a prefab
+            // that lives in another folder still finds the shared file.
+            for (const auto& root : SceneInheritance::search_roots()) {
+                std::filesystem::path in_root = std::filesystem::path(root) / relative;
+                if (std::filesystem::exists(in_root)) return in_root.string();
+            }
             return relative;
         }
     };

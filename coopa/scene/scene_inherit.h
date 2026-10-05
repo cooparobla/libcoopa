@@ -41,9 +41,9 @@
  *
  * Object assets (prefabs): `prefab: objects/crate` is the same reference as `inherit_from`,
  * written for reusable object files (`objects/<name>.yaml`, shape `object: {...}`). Two things
- * differ: the extension may be omitted, and the instance's own root Transform REPLACES the
- * prefab's (an instance is placed absolutely -- a prefab's root offset must not shift every
- * copy), while children and other components merge as above. References resolve against
+ * differ: the extension may be omitted, and the instance's own root Transform (or, for a UI
+ * prefab, RectTransform) REPLACES the prefab's (an instance is placed absolutely -- a prefab's
+ * root offset must not shift every copy), while children and other components merge as above. References resolve against
  * the declaring file's folder, the root scene's folder, then the project's asset roots
  * (set_search_roots), so `objects/crate` works from any scene.
  *
@@ -457,15 +457,19 @@ private:
         }
 
         if (have_base && is_prefab) {
-            // A prefab instance places itself: its own root Transform replaces the prefab's.
-            bool own_transform = false;
-            if (obj.contains("components") && obj.at("components").is_sequence()) {
-                for (const auto& c : obj.at("components")) own_transform |= component_tag_(c) == "Transform";
-            }
-            if (own_transform && merged_base.contains("components") && merged_base.at("components").is_sequence()) {
-                auto& seq = merged_base.at("components").as_seq();
-                seq.erase(std::remove_if(seq.begin(), seq.end(), [](const fkyaml::node& c) { return component_tag_(c) == "Transform"; }),
-                          seq.end());
+            // A prefab instance places itself: its own root Transform replaces the prefab's --
+            // and likewise its own RectTransform, a UI prefab's placement on its canvas.
+            for (const char* placement : {"Transform", "RectTransform"}) {
+                bool own = false;
+                if (obj.contains("components") && obj.at("components").is_sequence()) {
+                    for (const auto& c : obj.at("components")) own |= component_tag_(c) == placement;
+                }
+                if (own && merged_base.contains("components") && merged_base.at("components").is_sequence()) {
+                    auto& seq = merged_base.at("components").as_seq();
+                    seq.erase(std::remove_if(seq.begin(), seq.end(),
+                                             [placement](const fkyaml::node& c) { return component_tag_(c) == placement; }),
+                              seq.end());
+                }
             }
         }
         if (have_base) obj = merge_object_(merged_base, obj);
