@@ -71,6 +71,7 @@
 #include <utility>
 #include <vector>
 #include <coopa/yaml/document.h>
+#include <coopa/asset/asset_index.h>
 
 namespace coopa {
 namespace scene {
@@ -172,6 +173,8 @@ private:
             candidate = coopa::yaml::resolve_variant(std::filesystem::path(root) / raw_path);
             if (std::filesystem::exists(candidate)) return candidate.string();
         }
+        // By name: `objects/crate` finds objects/<tags>/crate.yaml (AssetIndex).
+        if (auto found = coopa::asset::AssetIndex::find_in(search_roots_(), raw_path)) return found->string();
         return raw_path;
     }
 

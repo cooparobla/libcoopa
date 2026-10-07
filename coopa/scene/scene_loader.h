@@ -151,6 +151,8 @@ public:
                 std::filesystem::path in_root = std::filesystem::path(root) / relative;
                 if (std::filesystem::exists(in_root)) return in_root.string();
             }
+            // Then by name: the asset may sit in tag folders under its type folder (AssetIndex).
+            if (auto found = coopa::asset::AssetIndex::find_in(SceneInheritance::search_roots(), relative)) return found->string();
             return relative;
         }
     };

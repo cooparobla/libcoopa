@@ -16,6 +16,7 @@
 #include <system_error>
 #include <vector>
 
+#include <coopa/asset/asset_index.h>
 #include <coopa/yaml/document.h>
 
 namespace coopa {
@@ -31,7 +32,10 @@ namespace asset {
  *      coopa::scene::SceneLoader::ParseContext::scene_dir.
  *   3. Each registered search root, in registration order — first
  *      `root + "/" + path` that exists wins.
- *   4. Falls through to the path unchanged (resolved relative to the
+ *   4. By NAME (AssetIndex): the same type folder and file name anywhere under each root, in
+ *      root order -- `materials/brick.yaml` finds `materials/metal/brick.yaml`, so an asset's
+ *      tag folders can change without breaking what refers to it.
+ *   5. Falls through to the path unchanged (resolved relative to the
  *      process's CWD by whatever opens it), matching the "resolve or fall
  *      back" behavior every ad-hoc resolver in this workspace already used
  *      (uicoopa's UIResourceCache::resolve_path_, gfxcoopa's mesh loader).
@@ -78,6 +82,9 @@ public:
         }
         for (const auto& root : search_roots_) {
             if (auto found = existing(std::filesystem::path(root) / virtual_path)) return *found;
+        }
+        if (!p.is_absolute()) {
+            if (auto found = AssetIndex::find_in(search_roots_, virtual_path)) return found->string();
         }
         return virtual_path;
     }
