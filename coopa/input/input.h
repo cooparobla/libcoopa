@@ -99,10 +99,9 @@ public:
     /// @brief Records a printable-text codepoint (UTF-32), independent of push_key().
     void push_char(uint32_t codepoint) { chars_.push_back(codepoint); }
 
-    /// @brief Records a mouse button transition. Event-driven (unlike the old
-    /// GLFW polling this replaces), so a press and release inside one frame
-    /// both register — both edges fire, unlike level-triggered polling which
-    /// would have missed the pair entirely.
+    /// @brief Records a mouse button transition. Event-driven, so a press and
+    /// release inside one frame both register — both edges fire, where
+    /// level-triggered polling would miss the pair entirely.
     void push_mouse_button(MouseButton button, KeyAction action, Mods mods) {
         mods_ = mods;
         button_events_.push_back(MouseButtonEvent{button, action, mods});

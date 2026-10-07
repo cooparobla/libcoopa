@@ -10,7 +10,7 @@ for inventories.
 
 ## File Breakdown
 
-### [`resource.h`](file:///home/coopa/git/libcoopa/coopa/stat/resource.h)
+### [`resource.h`](resource.h)
 
 `Resource` — `current`/`max` plus optional `regen_per_second` and `regen_delay` (how
 long after the last `damage()` before `tick(dt)` resumes regenerating — the "stamina
@@ -26,7 +26,7 @@ Publishes two signals a UI binds to instead of polling every frame:
 
 Move-only (holds `Signal` members).
 
-### [`stat_block.h`](file:///home/coopa/git/libcoopa/coopa/stat/stat_block.h)
+### [`stat_block.h`](stat_block.h)
 
 `StatBlock` — a named registry of `Resource`s (`resource("health")`,
 `resource("stamina")`, creating on first access). Backed by

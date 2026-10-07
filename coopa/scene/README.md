@@ -6,13 +6,13 @@ per-frame system pipeline (see "Update Phases" below). It is
 **dependency-free with respect to other repos**: nothing in this module
 includes gfxcoopa, caml, uicoopa, or any other sibling repo — only libcoopa's
 own vendored `fkYAML` and `glm`, plus libcoopa's own `coopa/event` (the scene
-event bus) and `coopa/job` (`Scene::set_job_engine()`'s frame-boundary
-ownership; see below). Every renderer-specific or UI-specific component (mesh
+event bus) and `coopa/job` (`Scene::set_job_engine()`; see below). Every renderer-specific or UI-specific component (mesh
 renderers, cameras, lights, GI/reflection probes, RectTransform, ...) lives
 outside libcoopa and is parsed via `SceneLoader::register_component_parser()`,
-never by this module directly. gfxcoopa's
-`engine::components::register_render_components()` and uicoopa's
-`register_ui_components()` are the two current registrants.
+never by this module directly. Registrants include gfxcoopa's
+`engine::components::register_render_components()`, uicoopa's
+`register_ui_components()`, physxcoopa's `register_physics_components()` and
+sfxcoopa's `register_sfx_components()`.
 
 ## Update Phases
 
@@ -24,10 +24,12 @@ never by this module directly. gfxcoopa's
 points are equivalent to a direct recursive walk of the `Component` tree.
 
 ```text
-UpdatePhase::Physics       = 100   // reserved; no implementation ships in libcoopa
-UpdatePhase::Behaviour     = 200   // built-in: the recursive Component::update() walk
-UpdatePhase::Animation     = 300   // coopa::anim::AnimationSystem (coopa/animation)
-UpdatePhase::LateBehaviour = 400   // built-in: the recursive Component::late_update() walk
+UpdatePhase::Physics          = 100   // reserved; no implementation ships in libcoopa
+UpdatePhase::Behaviour        = 200   // built-in: the recursive Component::update() walk
+UpdatePhase::Routine          = 250   // coopa::routine::RoutineSystem (coopa/routine)
+UpdatePhase::Animation        = 300   // coopa::anim::AnimationSystem (coopa/animation)
+UpdatePhase::TransformResolve = 350   // coopa::scene::TransformSystem (systems/transform_system.h)
+UpdatePhase::LateBehaviour    = 400   // built-in: the recursive Component::late_update() walk
 ```
 
 `Scene::update(dt)` runs every system with `order < LateBehaviour`;
@@ -36,19 +38,19 @@ split — not a split at `Behaviour` — is deliberate: it is the only cut
 consistent with every existing caller, including consumers that call only
 `update()` and never `late_update()` (so `Animation` still runs for them) and
 a contract test elsewhere in the tree asserting `update()` does not trigger
-`late_update()` work. Gaps of 100 let a consumer insert a system between
-built-ins (e.g. IK at 350) without renumbering anything.
+`late_update()` work. Only the two Behaviour walks are installed by default;
+Routine, Animation and TransformResolve systems are added with `add_system()`.
+Any integer order works, so a consumer can insert a system between built-ins
+(e.g. IK at 320) without renumbering anything.
 
 `Scene::set_job_engine(JobEngine*)` installs a non-owning `JobEngine` that
-`Scene` alone drives the frame boundary of — it calls `begin_frame()` at the
-top of `update()` (lazily closing the previous frame first, so a caller that
-only ever calls `update()` still gets exactly one open frame at a time) and
-`end_frame()` at the bottom of `late_update()`. A system must never call
-`begin_frame()`/`end_frame()` itself. With no engine installed (the default),
-every system runs inline and no threads are spawned. Never pass
-`coopa::asset::AssetManager`'s own internal `JobEngine` here — it is a
-separate instance with its own `CounterPool` and frame lifetime, driven by
-`AssetManager::update()`.
+every system sees as `FrameContext::jobs`. `Scene` never calls the engine's
+`begin_frame()`/`end_frame()`: job handles are reclaimed individually, so
+those calls only reset diagnostic counters, and the same engine can be shared
+by several scenes, `coopa::asset::AssetManager` and anything else.
+`SceneManager::begin_frame()`/`end_frame()` forward to the engine for apps
+that want the diagnostics. With no engine installed (the default), every
+system runs inline and no threads are spawned.
 
 ---
 
@@ -138,7 +140,7 @@ separate instance with its own `CounterPool` and frame lifetime, driven by
 
 ## File Breakdown
 
-### [`component.h`](file:///home/coopa/git/libcoopa/coopa/scene/component.h)
+### [`component.h`](component.h)
 
 Abstract base class for all scene components:
 - `owner`: Non-owning raw pointer to the host `SceneObject`.
@@ -146,7 +148,7 @@ Abstract base class for all scene components:
 - `virtual void update(float delta_time)`: Invoked every frame during scene update.
 - `virtual std::string type_name() const = 0`: Returns human-readable component type name.
 
-### [`scene.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene.h)
+### [`scene.h`](scene.h)
 
 Root container for a loaded scene. Owns all root-level `SceneObject` instances
 via `std::unique_ptr`, and knows nothing about any specific component type —
@@ -160,7 +162,7 @@ Renderer-facing code (blendy, gfxcoopa's GI system) builds these into a more
 convenient shape via gfxcoopa's `engine::components::SceneView` adapter rather
 than calling them directly.
 
-### [`scene_object.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_object.h)
+### [`scene_object.h`](scene_object.h)
 
 The core node in the scene tree (equivalent to Unity's `GameObject`):
 - Holds object name, active state flag, non-owning parent pointer, list of owned components, and list of owned child objects.
@@ -169,15 +171,43 @@ The core node in the scene tree (equivalent to Unity's `GameObject`):
 - Hierarchy API: `add_child(...)`, `detach_child(...)`, `set_parent(...)`, `find_descendant(name)`, `for_each_recursive(fn)`.
 - Life-cycle methods (`start()`, `update(dt)`) recurse through attached components and active children.
 
-### [`scene_manager.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_manager.h)
+### [`scene_manager.h`](scene_manager.h)
 
 High-level manager for scene lifecycle:
-- Wraps scene loading (`load_scene`) via `SceneLoader`. Default-constructible —
-  carries no GPU handles of its own.
-- Owns the currently active `Scene`.
-- Delegates frame updates (`update(delta_time)`) to the active scene.
+- Wraps scene loading via `SceneLoader`: `load_scene` (replaces every scene)
+  and `load_scene_additive`; `add_scene`/`remove_scene` take already-built
+  scenes. Default-constructible — carries no GPU handles of its own.
+- Owns zero or more `Scene`s, one of which is "active" (`get_active_scene()`,
+  and the target of `add_system()`); `set_scene_active()` pauses or resumes
+  any of them.
+- `update()`/`late_update()` run every active scene — one job per scene when a
+  `JobEngine` is installed via `set_job_engine()` and more than one scene is
+  active, serially otherwise.
 
-### [`scene_loader.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_loader.h)
+### [`scene_system.h`](scene_system.h)
+
+`UpdatePhase`, `FrameContext` (delta time, frame index, `jobs`, per-worker
+`commands`), the `ISceneSystem` interface, and the built-in
+`BehaviourSystem`/`LateBehaviourSystem` walks.
+
+### [`scene_commands.h`](scene_commands.h)
+
+`SceneCommandBuffer` — structural changes (add/remove objects and components)
+recorded by a system's worker jobs and applied serially on the owning thread
+by `Scene::flush_commands()`.
+
+### [`systems/transform_system.h`](systems/transform_system.h)
+
+`TransformSystem` — opt-in (`install_transform_system(scene)` or
+`add_system()`), at `UpdatePhase::TransformResolve`: resolves dirty world
+matrices top-down, in parallel across root subtrees when a `JobEngine` is
+installed.
+
+### [`config.h`](config.h)
+
+`SceneConfig` — a default scene path for applications that want one.
+
+### [`scene_loader.h`](scene_loader.h)
 
 Parser for YAML scene files:
 - Understands hierarchy plus the one component type this module defines:
@@ -195,7 +225,7 @@ Parser for YAML scene files:
 - Before any of this runs, `SceneInheritance::resolve()` expands every
   `inherit_from` in the raw document into one merged node (see below).
 
-### [`scene_inherit.h`](file:///home/coopa/git/libcoopa/coopa/scene/scene_inherit.h)
+### [`scene_inherit.h`](scene_inherit.h)
 
 Resolves `inherit_from` — a pure YAML-node merge pass with no knowledge of
 `Scene`/`SceneObject`/`Component`, run once by `SceneLoader::load()` before
@@ -226,6 +256,15 @@ otherwise its bare top-level mapping.
 
 Any component or child entry carrying `remove: true` deletes the matching
 base entry instead of merging.
+
+**Prefabs:** `prefab: objects/crate` is the same reference as `inherit_from`,
+written for reusable object files (`objects/<name>.yaml`, shape `object: {...}`).
+The extension may be omitted, and the instance's own root `Transform` (or, for a
+UI prefab, `RectTransform`) replaces the prefab's instead of merging, so every
+instance is placed absolutely. References resolve against the declaring file's
+folder, the root scene's folder, then the search roots (`set_search_roots()`),
+and finally by name through `coopa::asset::AssetIndex` — `objects/crate` also
+finds `objects/props/crate.yaml`.
 
 **Reserved keys** (read by the merge pass, otherwise inert to component
 parsers): `inherit_from`, `id`, `remove`, and `__source_dirs` — a per-node
@@ -263,7 +302,7 @@ scene:
 ## Component Submodule
 
 For detailed documentation on the two component types defined here, see the
-[Components Submodule README](file:///home/coopa/git/libcoopa/coopa/scene/components/README.md).
+[Components Submodule README](components/README.md).
 Renderer components live in gfxcoopa's `engine/components/`; UI components
 live in uicoopa's `uicoopa/`.
 

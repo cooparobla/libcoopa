@@ -50,14 +50,14 @@ pick-place, a console `give` command) triggered the change.
 
 ## File Breakdown
 
-### [`item_id.h`](file:///home/coopa/git/libcoopa/coopa/item/item_id.h)
+### [`item_id.h`](item_id.h)
 
 `ItemId::from_name()` normalizes an author-chosen short name (lowercase, trimmed) and
 hashes it (FNV-1a 64-bit), mirroring `coopa::asset::AssetId`'s shape. Two ids differing
 only by case or incidental whitespace resolve to the same identity, and `ItemId` is
 directly usable as an `unordered_map`/`unordered_set` key.
 
-### [`item_def.h`](file:///home/coopa/git/libcoopa/coopa/item/item_def.h)
+### [`item_def.h`](item_def.h)
 
 `ItemDef` — the immutable, shared description of one kind of item: `name`,
 `description`, `icon` (an `IconLibrary` name, resolved by the UI layer), `max_stack`,
@@ -66,12 +66,12 @@ directly usable as an `unordered_map`/`unordered_set` key.
 `parse_item_category()`/`parse_item_rarity()` degrade unrecognized strings to
 `Misc`/`Common` rather than throwing.
 
-### [`item_stack.h`](file:///home/coopa/git/libcoopa/coopa/item/item_stack.h)
+### [`item_stack.h`](item_stack.h)
 
 `ItemStack` — the *instance* data for one inventory slot: which `ItemId`, and how many.
 Deliberately minimal; everything else about an item lives on its shared `ItemDef`.
 
-### [`item_database.h`](file:///home/coopa/git/libcoopa/coopa/item/item_database.h)
+### [`item_database.h`](item_database.h)
 
 `ItemDatabase` — an `ItemId -> ItemDef` lookup table. Plain value type (copyable,
 movable, no `coopa::event::Signal` member) so it can be handed around as a
@@ -79,7 +79,7 @@ movable, no `coopa::event::Signal` member) so it can be handed around as a
 (`define()`) and YAML-defined (`item_database_loader.h`'s `parse_item_database()`,
 which merges into an existing instance) entries coexist freely.
 
-### [`item_database_loader.h`](file:///home/coopa/git/libcoopa/coopa/item/item_database_loader.h)
+### [`item_database_loader.h`](item_database_loader.h)
 
 `ItemDatabaseLoader` — a `coopa::asset::TypedAssetLoader<ItemDatabase>` that parses a
 YAML `items:` list, mirroring `coopa::anim::AnimationClipLoader`'s pure-CPU decode/
@@ -87,7 +87,7 @@ pass-through-finalize shape. `parse_item_def()`/`parse_item_database()` are publ
 functions so tests (and any tool) can parse a fixture directly without going through
 `AssetManager`.
 
-### [`inventory.h`](file:///home/coopa/git/libcoopa/coopa/item/inventory.h)
+### [`inventory.h`](inventory.h)
 
 `Inventory` — fixed-capacity `ItemStack` storage, the authoritative three-way transfer
 rule (`move_or_merge()`: move into an empty slot, merge same-item stacks up to the
@@ -96,7 +96,7 @@ rule (`move_or_merge()`: move into an empty slot, merge same-item stacks up to t
 `on_slot_changed(int, const ItemStack&)` and `on_slots_swapped(int, int)` — the seam a
 UI binding subscribes to instead of polling. Move-only (holds `Signal` members).
 
-### [`hotbar.h`](file:///home/coopa/git/libcoopa/coopa/item/hotbar.h)
+### [`hotbar.h`](hotbar.h)
 
 `Hotbar` — tracks which of a contiguous window of an `Inventory`'s slots is selected
 (wrapping `next()`/`prev()`, direct `select()`), publishing `on_selection_changed` only

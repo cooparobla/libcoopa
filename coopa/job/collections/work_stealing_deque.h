@@ -21,7 +21,7 @@
  * under sustained concurrent push()/steal() pressure (e.g. capacity 4 under
  * a tight push loop) can shrink that window enough to observe the race. See
  * test_job_engine_deque_overflow_falls_back_to_global_queue in test.cpp for
- * the concrete tripwire this was found with.
+ * a test that exercises this.
  */
 
 #ifndef COOPA_JOB_WORK_STEALING_DEQUE_H
@@ -122,12 +122,11 @@ public:
         // happens-before edge expressed entirely through atomic operations.
         // ThreadSanitizer does not model standalone atomic_thread_fence
         // calls (it warns "not supported with -fsanitize=thread" and
-        // ignores them for its happens-before tracking), so the earlier
-        // fence-based version of this function produced false-positive
-        // race reports on push()/steal() despite being correctly
-        // synchronized per the C++ memory model -- expressing the same
-        // ordering via the atomic operations themselves avoids that blind
-        // spot entirely, independent of any particular sanitizer's coverage.
+        // ignores them for its happens-before tracking), so a fence-based
+        // push() would produce false-positive race reports on push()/steal()
+        // despite being correctly synchronized per the C++ memory model --
+        // expressing the ordering via the atomic operations themselves avoids
+        // that blind spot, independent of any particular sanitizer's coverage.
         bottom_.store(b + 1, std::memory_order_release);
 
         return true;

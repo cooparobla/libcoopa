@@ -1,5 +1,7 @@
 # Job System Performance Optimization for Realtime Applications
 
+> **Status: done.** Handles come from a fixed `CounterPool` (in `handle.h`, not a separate `pool.h`), workers use Chase-Lev deques, dependencies resolve event-driven via `dependency_graph.h`, `JobScheduler` clears its persistent hazard handles in `begin_frame()`, and per-type counters are a fixed `std::array` behind `COOPA_JOB_DIAGNOSTICS`. File links below point at an old checkout path.
+
 A comprehensive analysis and optimization plan for the `coopa/job/` module to make it production-ready for game engines and realtime applications.
 
 ---

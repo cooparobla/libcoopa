@@ -1,5 +1,7 @@
 # Implementation Plan - Generate libcoopa Module Tests
 
+> **Status: done.** The suite lives in `test.cpp` at the repository root (not `coopa/test.cpp`) and now covers every module; see the top-level README's Testing section.
+
 **Date**: 2026-08-03
 **Goal**: Generate a robust test suite in `coopa/test.cpp` to verify all libcoopa modules.
 

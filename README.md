@@ -49,6 +49,8 @@ consumer.
 - **Asset manager** (`coopa/asset/`). Register a loader per type, then `load()` or
   `load_async()` by virtual path. Assets are cached and refcounted, and `AssetHandle`s stay
   valid across hot reloads. Loaders decode off-thread and finalize on the main thread.
+  A reference that misses its exact path is found by type folder and file name
+  (`materials/brick` finds `materials/metal/brick.yaml`), so assets can be re-filed.
   Hot reload checks file modification times. `create()` publishes runtime-built assets, and
   idle eviction frees unused ones.
 - **YAML I/O** (`coopa/yaml/`, `coopa/collections/`). `read_text()` and `load_document()`
@@ -184,7 +186,7 @@ coopa/
 ├── job/          JobEngine, JobScheduler, handles, dependency graph, parallel_for
 │   └── collections/  work-stealing deque, ParallelQueue/Vector/Map
 ├── scene/        Scene, SceneObject, Component, systems, SceneLoader, SceneManager
-├── asset/        AssetManager, handles, loaders, search roots
+├── asset/        AssetManager, handles, loaders, search roots, name index
 ├── animation/    Animator, AnimationClip, curves, procedural tracks, AnimationSystem
 ├── routine/      Routine, yield instructions, RoutineRunner, RoutineSystem
 ├── input/        Input, InputMap, key vocabulary, backend interface

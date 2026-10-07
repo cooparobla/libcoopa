@@ -45,7 +45,8 @@
  * prefab, RectTransform) REPLACES the prefab's (an instance is placed absolutely -- a prefab's
  * root offset must not shift every copy), while children and other components merge as above. References resolve against
  * the declaring file's folder, the root scene's folder, then the project's asset roots
- * (set_search_roots), so `objects/crate` works from any scene.
+ * (set_search_roots), then by name under those roots (coopa::asset::AssetIndex, so
+ * `objects/crate` also finds `objects/<tags>/crate.yaml`); `objects/crate` works from any scene.
  *
  * Reserved keys, stripped or left behind as internal bookkeeping: `id` and
  * `remove` are only ever read by the merge pass; `__source_dirs` is a

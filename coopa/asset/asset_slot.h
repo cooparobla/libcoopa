@@ -28,9 +28,8 @@ namespace detail {
  * for as long as its refcount keeps the slot alive. Hot reload swaps
  * `payload` in place and increments `revision`, so outstanding handles
  * observe the new payload without ever needing to be reissued; this
- * indirection is the reason AssetHandle beats a raw shared_ptr<T>, which
- * every asset cache in this workspace (gfxcoopa's mesh_cache,
- * uicoopa::UIResourceCache) used until now.
+ * indirection is the reason AssetHandle is used instead of a raw
+ * shared_ptr<T>, which would have to be reissued on every reload.
  *
  * Main-thread only: like every GPU-owning type in this workspace (Device,
  * Allocator, CommandPool, ...), an AssetSlot is read and written exclusively

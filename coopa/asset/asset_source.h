@@ -36,9 +36,7 @@ namespace asset {
  *      root order -- `materials/brick.yaml` finds `materials/metal/brick.yaml`, so an asset's
  *      tag folders can change without breaking what refers to it.
  *   5. Falls through to the path unchanged (resolved relative to the
- *      process's CWD by whatever opens it), matching the "resolve or fall
- *      back" behavior every ad-hoc resolver in this workspace already used
- *      (uicoopa's UIResourceCache::resolve_path_, gfxcoopa's mesh loader).
+ *      process's CWD by whatever opens it).
  *
  * Resolution is deliberately self-contained: a virtual path is resolved
  * against this source's own base directory, with no dependency on process-wide

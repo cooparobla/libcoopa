@@ -42,8 +42,8 @@ namespace anim {
  *   3. apply_()    — serial, main thread: writes the accumulated result onto
  *                    every binding's target Component.
  *
- * NEVER calls JobEngine::begin_frame()/end_frame() — Scene alone drives that
- * (now diagnostics-only) boundary. This system only ever calls
+ * Never calls JobEngine::begin_frame()/end_frame() (diagnostics-only; see
+ * coopa/job/handle.h). This system only ever calls
  * parallel_for_blocking() on ctx.jobs, which allocates and closes its own
  * JobHandle within one execute() call.
  */

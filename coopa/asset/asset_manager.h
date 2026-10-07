@@ -70,8 +70,7 @@ public:
      * instead.
      *
      * @param engine Engine to submit decode() jobs on. If nullptr, this
-     *   AssetManager constructs and owns a private fallback engine instead
-     *   (matching every prior revision's default behavior).
+     *   AssetManager constructs and owns a private fallback engine instead.
      * @param fallback_io_threads Worker threads for the private fallback
      *   engine. Ignored if `engine` is non-null.
      */
@@ -523,7 +522,7 @@ private:
     /// @brief Distinct JobType tag for asset IO jobs (never collides with an app's own JobEngine job types).
     static constexpr coopa::job::JobType k_asset_io_job_type = 0xA55E7000u;
 
-    /// @brief Grace period (frames) a superseded payload is kept alive before actual destruction, so in-flight GPU work isn't yanked out from under it. Applies to every eviction path — hot reload, create() re-publish, unload(), garbage_collect(), and idle eviction — not just reload, despite the name's origin.
+    /// @brief Grace period (frames) a superseded payload is kept alive before actual destruction, so in-flight GPU work isn't yanked out from under it. Applies to every eviction path — hot reload, create() re-publish, unload(), garbage_collect(), and idle eviction — not just hot reload.
     static constexpr int k_payload_grace_frames = 3;
 
     detail::AssetSlot* find_or_create_slot_(const AssetId& id, std::type_index type) {

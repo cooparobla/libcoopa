@@ -17,6 +17,12 @@ The `util` module provides cross-platform helpers for algebra matrices, paths re
 ### 4. Thread-Safe ID Generators (`id.h`)
 - **`IdUtil`**: A static thread-safe counter using `std::atomic<unsigned int>` to generate unique runtime identifiers.
 
+### 5. Transforms (`transform.h`)
+- **`coopa::util::Transform`**: Hierarchical position / rotation (Euler degrees or quaternion) / scale with parent-child links, dirty-flag propagation and a lazily recomputed world matrix. `TransformComponent` in `coopa/scene/components/` wraps it.
+
+### 6. Frame Timing (`time.h`)
+- **`coopa::util::Time`**: High-resolution frame timer: call `update()` once per frame, then read the delta time, total elapsed time and frame count.
+
 ## Basic Example
 
 ```cpp

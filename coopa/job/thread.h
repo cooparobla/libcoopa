@@ -122,8 +122,8 @@ private:
     unsigned int id_;           /**< Unique worker thread ID. */
     std::thread worker_thread_; /**< Underlying std::thread. */
     std::atomic<bool> stop_flag_; /**< Cooperative stop signal. */
-    std::mutex mutex_;          /**< Per-thread mutex (passed to callback for compatibility). */
-    std::condition_variable cv_; /**< Per-thread CV (passed to callback for compatibility). */
+    std::mutex mutex_;          /**< Per-thread mutex passed to the loop callback (JobEngine's loop ignores it and sleeps on its own shared CV). */
+    std::condition_variable cv_; /**< Per-thread CV passed to the loop callback and notified by signal_stop() (unused by JobEngine's loop). */
     std::function<void(unsigned int, std::atomic<bool>&, std::mutex&, std::condition_variable&)> thread_loop_func_;
     coopa::debug::Logger* logger_; /**< Pointer to the shared logger instance (non-owning). */
 };

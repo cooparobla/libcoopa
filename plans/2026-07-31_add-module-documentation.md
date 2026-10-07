@@ -1,5 +1,7 @@
 # Implementation Plan: Add Comments, Docstrings, and README Files to Coopa Modules
 
+> **Status: done.** Every header has Doxygen comments and most module folders have a README (`coopa/event/` and `coopa/yaml/` are documented in their headers and the top-level README only).
+
 ## Introduction
 This plan outlines the approach to adding proper Doxygen-style comments and docstrings to all headers in the `coopa` library and creating detailed README documentation for each module directory. All documentation will adhere to the rules in `AGENTS.md` (e.g. standard Doxygen tags for C++ declarations, Google Style docstrings for Python if any, etc.).
 

@@ -33,7 +33,7 @@ graph TD
 6. **[`JobEngine`](./engine.h)**
    - Core parallel manager, built on per-thread lock-free Chase-Lev work-stealing deques. Workers use a spin-then-sleep strategy (configurable spin count) to minimize CV syscall overhead. Flat `std::array` lookup for thread dedications and type counts. Cache-line-padded atomics prevent false sharing. `create_handle()` allocates handles without touching the heap. `begin_frame()`/`end_frame()` reset per-frame diagnostic counters only, and compile to nothing unless `COOPA_JOB_DIAGNOSTICS` is on.
 7. **[`JobScheduler`](./scheduler.h)**
-   - Graph scheduler detecting RAW, WAR, and WAW hazards across enqueued jobs to auto-calculate dependencies. Per-frame `begin_frame()` / `end_frame()` clears persistent tracking maps to prevent unbounded memory growth. Uses `unordered_set` for O(1) reader-is-also-writer checks.
+   - Graph scheduler detecting RAW, WAR, and WAW hazards across enqueued jobs to auto-calculate dependencies. `begin_frame()` clears the persistent hazard-tracking maps so they never grow without bound; `end_frame()` drops any queued main-thread jobs that were never run, resolving their handles so dependents are not left waiting. Uses `unordered_set` for O(1) reader-is-also-writer checks.
 8. **[`WorkStealingDeque`](./collections/work_stealing_deque.h)**
    - Lock-free Chase-Lev deque. Owner pushes/pops from the bottom (no synchronization), thieves steal from the top (single CAS). Fixed capacity, cache-line-padded top/bottom indices.
 

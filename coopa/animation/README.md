@@ -275,12 +275,11 @@ For scaling evaluation across many `Animator`s onto a `coopa::job::JobEngine`:
 
 ```cpp
 coopa::job::JobEngine engine(std::thread::hardware_concurrency());
-scene.set_job_engine(&engine); // Scene alone owns begin_frame()/end_frame() from here on
+scene.set_job_engine(&engine); // AnimationSystem evaluates large batches on its workers
 ```
 
-Never pass `coopa::asset::AssetManager`'s own internal `JobEngine` here — it
-is a separate instance with its own `CounterPool` and frame lifetime, driven
-by `AssetManager::update()`.
+The same engine can also be handed to `coopa::asset::AssetManager`; job
+handles are reclaimed individually, so sharing it needs no coordination.
 
 ---
 

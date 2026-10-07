@@ -42,8 +42,8 @@ namespace scene {
  * Scene) fans out across independent root subtrees -- see Transform's
  * thread-safety doc for why get_world_matrix()/recompute() are NOT
  * themselves safe to call concurrently on transforms that might share a
- * parent chain, and why Transform::world_matrix() (a pure read, added
- * alongside this system) exists for readers -- e.g. a render-list build --
+ * parent chain, and why Transform::world_matrix() (a pure read) exists for
+ * readers -- e.g. a render-list build --
  * that run after this system every frame.
  *
  * Not auto-installed by Scene (unlike BehaviourSystem/LateBehaviourSystem):
