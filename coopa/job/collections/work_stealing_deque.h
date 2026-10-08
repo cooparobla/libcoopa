@@ -10,18 +10,13 @@
  * This implementation uses a fixed-capacity circular buffer (no dynamic
  * resizing) for deterministic memory behavior in realtime applications.
  *
- * @warning Capacity should stay reasonably large relative to how hard any
- * single deque is hammered concurrently (defaults here are in the
- * thousands). A thief's steal() reserves a slot via a CAS on top_ and only
- * *then* reads out of it; the owner is free to wrap the ring buffer around
- * and overwrite that same physical slot with a new push() the moment its own
- * capacity check (based on top_) allows it. Classic Chase-Lev relies on that
- * reuse only happening after the thief's read has had time to complete --
- * true in essentially all real usage, but an artificially tiny capacity
- * under sustained concurrent push()/steal() pressure (e.g. capacity 4 under
- * a tight push loop) can shrink that window enough to observe the race. See
- * test_job_engine_deque_overflow_falls_back_to_global_queue in test.cpp for
- * a test that exercises this.
+ * A thief's steal() reserves a slot via a CAS on top_ and only *then* moves the
+ * item out (moving first would race the other claimants on a non-trivial T).
+ * Between the two it can be preempted, while the owner pushes a full lap and
+ * wraps around onto that same slot -- so every slot carries a `busy` flag the
+ * reader clears only after its move, and push() treats a still-busy slot as
+ * full (its caller falls back to the global queue). Without it a preempted
+ * thief could read a newer item, running one job twice and another never.
  */
 
 #ifndef COOPA_JOB_WORK_STEALING_DEQUE_H
@@ -114,7 +109,15 @@ public:
             return false; // Full — fixed capacity, no resize.
         }
 
-        buffer_[b & mask_].data = std::move(item);
+        // A thief that won this slot one lap ago may still be moving its item out (it reads
+        // after its CAS, and can be preempted in between). Never overwrite it: report full,
+        // and the caller falls back to its overflow path (JobEngine: the global queue).
+        Slot& slot = buffer_[b & mask_];
+        if (slot.busy.load(std::memory_order_acquire)) {
+            return false;
+        }
+        slot.data = std::move(item);
+        slot.busy.store(true, std::memory_order_relaxed);
 
         // Release store (not a relaxed store behind a separate release
         // fence): a thief's acquire load of bottom_ in steal() pairs
@@ -159,6 +162,7 @@ public:
             // ever targets buffer_[top_ & mask_], which is a different slot
             // than buffer_[b & mask_] here, so moving out immediately is safe.
             out_item = std::move(buffer_[b & mask_].data);
+            buffer_[b & mask_].busy.store(false, std::memory_order_relaxed);
             return true;
         } else if (t == b) {
             // Exactly one element left — a concurrent steal() may be racing
@@ -169,18 +173,28 @@ public:
             // move nulls out the source's callable) that is a genuine data
             // race that can leave one side holding a corrupted, no-op value
             // while still reporting success.
-            bool won = top_.compare_exchange_strong(t, t + 1,
+            // `expected`, not `t`: a failed compare_exchange overwrites its expected argument
+            // with the current top_ (t + 1, the thief's increment), and restoring bottom_ from
+            // that would leave it at t + 2 -- one past the real end, resurrecting the slot just
+            // consumed as a phantom element that is then popped or stolen a second time (a job
+            // run twice, its handle's counter driven below zero).
+            int64_t expected = t;
+            bool won = top_.compare_exchange_strong(expected, t + 1,
                     std::memory_order_seq_cst, std::memory_order_relaxed);
-            bottom_.store(t + 1, std::memory_order_relaxed);
+            // Release, not relaxed: a thief that reads this bottom_ value must also see every
+            // item the owner pushed before it. A relaxed store starts no release sequence, so a
+            // thief acquiring it could read a stale slot (one job run twice, another never).
+            bottom_.store(t + 1, std::memory_order_release);
             if (!won) {
                 // Lost the race — thief took it. Do not touch the slot.
                 return false;
             }
             out_item = std::move(buffer_[b & mask_].data);
+            buffer_[b & mask_].busy.store(false, std::memory_order_relaxed);
             return true;
         } else {
-            // Empty.
-            bottom_.store(t, std::memory_order_relaxed);
+            // Empty. Release for the same reason as the last-element path above.
+            bottom_.store(t, std::memory_order_release);
             return false;
         }
     }
@@ -217,6 +231,9 @@ public:
                 return false;
             }
             out_item = std::move(buffer_[t & mask_].data);
+            // Release: the owner's push() acquires this before reusing the slot, so the move-out
+            // above is complete before anything overwrites it.
+            buffer_[t & mask_].busy.store(false, std::memory_order_release);
             return true;
         }
 
@@ -267,6 +284,9 @@ private:
      */
     struct Slot {
         T data;
+        /** @brief Holds an item not yet moved out. A thief clears it only after its read, so
+         *         push() can tell a slot whose last thief is still reading -- see push(). */
+        std::atomic<bool> busy{false};
     };
 
     std::size_t capacity_; /**< Fixed capacity (power of 2). */

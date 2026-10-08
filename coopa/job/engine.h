@@ -312,8 +312,12 @@ public:
 
     /// @brief parallel_for() followed by wait_for() and close() on the resulting handle.
     template<typename F>
+    /// @param help_down_to Lowest priority the waiting thread will run while it waits -- see
+    ///        wait_for(handle, help_down_to). The chunks themselves run at `priority`, which must
+    ///        be at or above it.
     void parallel_for_blocking(size_t count, size_t grain, F&& body,
-                               JobType type = 0, Priority priority = Priority::Normal);
+                               JobType type = 0, Priority priority = Priority::Normal,
+                               Priority help_down_to = Priority::Low);
 
     // --- Waiting ---
 
@@ -325,11 +329,18 @@ public:
      * rather than as a steal-only guest -- this is what makes it safe for a
      * running job to wait on another job without deadlocking. Any other
      * calling thread participates as a guest (global queues + stealing only).
+     *
+     * @param help_down_to Lowest priority of the jobs the waiting thread will run while it
+     *        waits. The default (Low) helps with anything. A frame-critical wait passes Normal,
+     *        so it never picks up a long Low-priority background job (asset decode, a navmesh
+     *        tile, a flow-field slice) and stalls the frame on work nobody needed this frame.
+     *        Only restrict it when the awaited jobs themselves run at that priority or above --
+     *        otherwise the wait relies on other threads to run them.
      */
-    void wait_for(const JobHandle& handle) {
+    void wait_for(const JobHandle& handle, Priority help_down_to = Priority::Low) {
         uint32_t me = worker_index();
         while (!handle.is_complete()) {
-            if (!try_execute_a_job(me)) std::this_thread::yield();
+            if (!try_execute_a_job(me, help_down_to)) std::this_thread::yield();
         }
     }
 
@@ -502,12 +513,15 @@ private:
      * @param worker_id This engine's worker index for the calling thread, or
      *        k_main_thread_index for a guest (no own deque -- steps 1-2 are
      *        skipped, leaving only the global queues and stealing).
+     * @param lowest Lowest priority to take (see wait_for()). Anything above Low also skips
+     *        the dedicated queues, whose jobs carry no priority of their own here.
      */
-    bool try_execute_a_job(uint32_t worker_id) {
+    bool try_execute_a_job(uint32_t worker_id, Priority lowest = Priority::Low) {
         Job job;
+        const size_t levels = static_cast<size_t>(lowest) + 1;
 
         if (worker_id < num_threads_) {
-            if (any_dedications_.load(std::memory_order_acquire)) {
+            if (lowest == Priority::Low && any_dedications_.load(std::memory_order_acquire)) {
                 for (JobType t = 0; t < k_max_job_types; ++t) {
                     if (thread_dedications_[t].load(std::memory_order_relaxed) != worker_id) continue;
                     if (dedicated_queues_[t].try_pop(job)) {
@@ -517,7 +531,8 @@ private:
                     }
                 }
             }
-            for (auto& dq : per_thread_deques_[worker_id]) {
+            for (size_t p = 0; p < levels; ++p) {
+                auto& dq = per_thread_deques_[worker_id][p];
                 if (dq->pop(job)) {
                     runnable_jobs_count_.fetch_sub(1, std::memory_order_relaxed);
                     execute_job_(job);
@@ -526,8 +541,8 @@ private:
             }
         }
 
-        for (auto& gq : global_queues_) {
-            if (gq.try_pop(job)) {
+        for (size_t p = 0; p < levels; ++p) {
+            if (global_queues_[p].try_pop(job)) {
                 runnable_jobs_count_.fetch_sub(1, std::memory_order_relaxed);
                 execute_job_(job);
                 return true;
@@ -539,7 +554,8 @@ private:
             for (uint32_t off = 0; off < num_threads_; ++off) {
                 uint32_t victim = (start + off) % num_threads_;
                 if (victim == worker_id) continue;
-                for (auto& dq : per_thread_deques_[victim]) {
+                for (size_t p = 0; p < levels; ++p) {
+                    auto& dq = per_thread_deques_[victim][p];
                     if (dq->steal(job)) {
                         runnable_jobs_count_.fetch_sub(1, std::memory_order_relaxed);
                         execute_job_(job);

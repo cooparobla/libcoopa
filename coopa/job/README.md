@@ -101,6 +101,28 @@ void direct_submit() {
 }
 ```
 
+### Keeping background work out of frame-critical waits
+
+A thread blocked in `wait_for()` (or `parallel_for_blocking()`) helps by running queued jobs.
+By default it takes any job, so a frame waiting on 0.2 ms of crowd steering can pick up a
+10 ms background build and stall the frame. Two rules prevent that:
+
+- **Submit background work at `Priority::Low`, in short jobs.** Slice anything long into
+  chained jobs that each resubmit the next (`ctx.engine->submit(..., ctx.group)`), so any thread
+  that does pick one up loses only a fraction of a millisecond.
+- **Wait with a help floor.** `wait_for(handle, Priority::Normal)` and
+  `parallel_for_blocking(n, grain, body, type, Priority::Normal, Priority::Normal)` never run a
+  `Low` job while waiting. Restrict a wait only when the awaited jobs run at the floor or above;
+  otherwise the wait depends on other threads to run them.
+
+```cpp
+// Frame work: Normal chunks, and the main thread only helps with Normal+ while it waits.
+engine.parallel_for_blocking(agents.size(), 64, step_agents, 0,
+                             coopa::job::Priority::Normal, coopa::job::Priority::Normal);
+// Background work: Low, and sliced.
+engine.submit(BuildSlice{state}, 0, handle, nullptr, 0u, coopa::job::Priority::Low);
+```
+
 ### Sharing one engine across subsystems
 
 A single `JobEngine` can be shared freely by any number of long-lived

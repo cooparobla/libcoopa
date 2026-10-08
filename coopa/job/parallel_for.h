@@ -61,9 +61,11 @@ JobHandle JobEngine::parallel_for(size_t count, size_t grain, F&& body,
 
 template<typename F>
 void JobEngine::parallel_for_blocking(size_t count, size_t grain, F&& body,
-                                        JobType type, Priority priority) {
+                                        JobType type, Priority priority, Priority help_down_to) {
     JobHandle handle = parallel_for(count, grain, std::forward<F>(body), type, priority);
-    wait_for(handle);
+    // Never restrict below the chunks' own priority: the waiter must be able to run them.
+    if (static_cast<uint8_t>(help_down_to) < static_cast<uint8_t>(priority)) help_down_to = priority;
+    wait_for(handle, help_down_to);
     handle.close();
 }
 

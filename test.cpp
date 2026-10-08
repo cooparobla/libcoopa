@@ -971,6 +971,94 @@ void test_job_engine_priority_ordering_single_worker() {
     high.close();
 }
 
+/**
+ * A frame-critical wait restricted to Normal must not pick up a queued Low-priority job (a long
+ * background build would stall the frame), while the default wait still helps with anything.
+ * The only worker is held on a gate, so every job here is run by the waiting main thread or not
+ * at all.
+ */
+void test_job_engine_wait_help_floor_skips_low_priority() {
+    coopa::job::JobEngine engine(1);
+    std::atomic<bool> gate_open{false};
+    coopa::job::JobHandle gate = engine.create_handle();
+    engine.submit([&gate_open]() {
+        while (!gate_open.load(std::memory_order_acquire)) std::this_thread::yield();
+    }, 0, gate);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20)); // let the worker take the gate
+
+    std::atomic<bool> low_ran{false}, normal_ran{false};
+    coopa::job::JobHandle low = engine.create_handle();
+    coopa::job::JobHandle normal = engine.create_handle();
+    engine.submit([&]() { low_ran = true; }, 0, low, nullptr, 0u, coopa::job::Priority::Low);
+    engine.submit([&]() { normal_ran = true; }, 0, normal, nullptr, 0u, coopa::job::Priority::Normal);
+
+    engine.wait_for(normal, coopa::job::Priority::Normal);
+    ASSERT_TRUE(normal_ran.load());
+    ASSERT_TRUE(!low_ran.load());   // the restricted wait left the Low job alone
+
+    std::atomic<int> chunks{0};
+    engine.parallel_for_blocking(8, 1, [&](size_t b, size_t e) { chunks += static_cast<int>(e - b); },
+                                 0, coopa::job::Priority::Normal, coopa::job::Priority::Normal);
+    ASSERT_EQ(chunks.load(), 8);
+    ASSERT_TRUE(!low_ran.load());
+
+    engine.wait_for(low);           // default: helps with anything, so it runs it itself
+    ASSERT_TRUE(low_ran.load());
+
+    gate_open.store(true, std::memory_order_release);
+    engine.wait_for(gate);
+    gate.close();
+    low.close();
+    normal.close();
+}
+
+/**
+ * Every item is consumed exactly once while the owner pushes and pops and four thieves steal,
+ * including under full-ring pressure (the owner keeps it near capacity, so it wraps constantly).
+ * Regression for two bugs that ran jobs twice and lost others: pop()'s last-element path
+ * restoring bottom_ from the CAS-clobbered `t` (a phantom element), and a preempted thief whose
+ * slot the owner overwrote after a lap (fixed by the per-slot busy flag).
+ */
+void test_work_stealing_deque_consumes_each_item_exactly_once() {
+    for (int pressure = 0; pressure < 2; ++pressure) {
+        const int n = 400000;
+        std::vector<std::atomic<uint8_t>> seen(n);
+        coopa::job::WorkStealingDeque<int> dq(64);
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> thieves;
+        for (int k = 0; k < 4; ++k) {
+            thieves.emplace_back([&]() {
+                int v;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    if (dq.steal(v)) seen[static_cast<size_t>(v)].fetch_add(1);
+                }
+            });
+        }
+        int next = 0;
+        while (next < n) {
+            if (pressure == 1 || dq.size_approx() < 16) {
+                for (int i = 0; i < 1 + next % 7 && next < n; ++i) {
+                    int x = next;
+                    if (dq.push(std::move(x))) ++next;
+                }
+            }
+            int v;
+            for (int i = 0; i < next % 3; ++i) {
+                if (dq.pop(v)) seen[static_cast<size_t>(v)].fetch_add(1);
+            }
+        }
+        int v;
+        while (dq.pop(v)) seen[static_cast<size_t>(v)].fetch_add(1);
+        while (!dq.empty_approx()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        stop = true;
+        for (auto& th : thieves) th.join();
+        int wrong = 0;
+        for (int i = 0; i < n; ++i) wrong += seen[static_cast<size_t>(i)].load() != 1;
+        ASSERT_EQ(wrong, 0);
+    }
+}
+
 void test_job_handle_survives_begin_end_frame() {
     coopa::job::JobEngine engine(2);
     coopa::job::JobHandle handle = engine.create_handle();
@@ -4629,6 +4717,8 @@ int main() {
     RUN_TEST(test_job_engine_parallel_for_covers_range_exactly_once);
     RUN_TEST(test_job_engine_cancel_skips_body_but_releases_counter);
     RUN_TEST(test_job_engine_priority_ordering_single_worker);
+    RUN_TEST(test_job_engine_wait_help_floor_skips_low_priority);
+    RUN_TEST(test_work_stealing_deque_consumes_each_item_exactly_once);
     RUN_TEST(test_job_handle_survives_begin_end_frame);
     RUN_TEST(test_job_engine_shared_across_frames_and_subsystems);
     RUN_TEST(test_debug_logging);
