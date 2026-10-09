@@ -186,6 +186,96 @@ never wrapped and `wrap:` is ignored, since there's nothing to wrap against.
 
 ---
 
+## Events
+
+A clip may carry `events:` -- named markers on its timeline (`AnimationEvent { time, name,
+string_value, float_value }`, sorted by time at parse). `Animator::advance_layer_()` collects
+every event the playhead crossed this frame, run by run (`for_each_sample_run_()` splits raw time
+into the monotonic stretches of sample time it covers), and they are emitted at the end of
+`advance_()`:
+
+- through `Animator::on_event` (`Signal<const AnimationEvent&>`), and
+- on the scene `EventBus` as `(owner name, "anim_event")`, args `name`, `string`, `float`,
+  `state`, `time` -- so a reactor or any component can listen without a pointer to the Animator.
+
+Firing rules (exact, tested): a forward run fires `[from, to)`, a backward run (`speed < 0`, or a
+ping-pong's return leg) `(to, from]`. So a looping clip fires an event at `0` once per cycle; a
+ping-pong fires each endpoint once per visit and interior events both ways; an event exactly at
+the end of a loop / once clip fires when the playhead reaches it; a once clip fires nothing after
+it has clamped. A big step that crosses several cycles fires each crossed event once per cycle,
+in order. **During a crossfade only the target (current) state fires**, so a clip crossfading out
+never double-fires with the one coming in. Events are dispatched after the layer state is
+settled, so a handler may `play()` / `crossfade()` the same Animator.
+
+## Root motion
+
+```yaml
+clip:
+  root_motion: { object: pelvis, translation: xy, rotation: none }   # translation xy|xyz|none, rotation yaw|none
+```
+
+The root bone's keyframed `position` / `position.<channels>` tracks (and, with `rotation: yaw`, its
+`rotation_quat` track's yaw about +Z) are sampled at the start and end of every run of sample time
+the frame covered: a loop wrap contributes `(end - prev) + (new - start)`, each further cycle a
+whole cycle's travel. Each layer's delta is blended by crossfade weight, so fading from a walk to
+an idle ramps the travel down. The result is `Animator::root_motion_delta()` (`RootMotionDelta {
+translation, yaw_deg }`, in the owner's local frame), and the extracted channels are held at their
+clip-start value on the bone (`hold_root_()` in `evaluate_()`), so the mesh stays over its owner.
+Extraction always happens when a clip declares `root_motion`; what consumes it is up to
+`Animator::apply_root_motion`:
+
+- off (default): nothing moves -- gameplay may read `root_motion_delta()`;
+- on: the delta goes to the first component on the owner implementing `IRootMotionReceiver`
+  (`root_motion.h`) -- e.g. toyengine's `CharacterController`, which accepts it while
+  `use_root_motion` is on and moves by it through its collide-and-slide motor -- or, when there is
+  none or it declines, straight onto the owner's Transform.
+
+Only keyframed root tracks are extracted (procedural ones are ignored).
+
+## IK
+
+`ik.h` is the math, scene-free: `solve_two_bone()` (law of cosines; the middle joint goes in the
+plane of root, target and pole, on the pole's side; `soft_reach()` eases the last `softness` of the
+chain's length so a knee never pops straight), `look_at_delta()` (clamped to `max_angle`, keeping
+the bone's up axis from rolling) and the world/local rotation helpers.
+
+`ik_components.h` wraps it:
+
+```yaml
+- type: TwoBoneIK
+  upper: shoulder                      # bone paths, relative to this object (like a track's object)
+  lower: shoulder/elbow
+  end: shoulder/elbow/hand
+  target: reach_target                 # or set_target_position() from code
+  pole: elbow_pole                     # optional
+  weight: 1.0
+  soft_limit: 0.02
+- type: LookAtIK
+  bone: neck/head                      # empty = this object
+  target: look_target
+  forward_axis: {x: 0, y: 1, z: 0}
+  up_axis: {x: 0, y: 0, z: 1}
+  max_angle: 70                        # degrees from the animated facing
+  weight: 1.0
+  smoothing: 0.1                       # seconds; 0 snaps
+```
+
+`IkSystem` (`ik_system.h`, `install_ik_system()`, order **320** -- between Animation 300 and
+TransformResolve 350) gathers them with one scene walk per frame (spawned rigs need no refresh)
+and runs `IkDriver::ik_pre_solve()` (drivers such as toyengine's `FootIK` set targets there), every
+`TwoBoneIK`, every `LookAtIK`, then `IkDriver::ik_post_solve()`. Solvers read the live pose through
+`get_world_matrix()`, which re-walks any parent chain dirtied by the Animator or an earlier solve.
+
+IK overrides the animated pose. A bone no clip animates would feed last frame's IK output back in
+as this frame's input, so each solved bone remembers what it wrote (`IkPoseGuard`) and restores the
+pre-IK rotation when it finds that value untouched -- weight 0 always returns exactly the unsolved
+pose, and clamps (look-at `max_angle`) are always relative to the animated pose. A driver that reads
+the animated pose before choosing targets calls `TwoBoneIK::restore_input()` first.
+
+`register_animation_components()` also registers the `TwoBoneIK` / `LookAtIK` parsers.
+
+---
+
 ## YAML schema
 
 A clip is a standalone file (`type:`/flat-mapping form, never `!Tag` block
@@ -197,6 +287,9 @@ clip:
   name: banner_idle
   wrap: loop            # loop | once | pingpong
   length: 2.4           # optional for keyframed clips; REQUIRED if every track is procedural
+  events:               # optional -- see "Events"
+    - { time: 0.6, name: footstep, string: left, float: 1.0 }
+  root_motion: { object: pelvis, translation: xy, rotation: none }   # optional -- see "Root motion"
   tracks:
     - object: ""                     # "" or omitted = the Animator's own owner;
                                       # "A/B/C" walks descendants segment-by-segment;
@@ -235,6 +328,7 @@ An `Animator` component references one or more clips by name:
   auto_play: idle
   speed: 1.0
   default_crossfade: 0.15   # informational; crossfade() always takes an explicit duration
+  apply_root_motion: false  # move the owner by the clips' root motion (see "Root motion")
   states:
     - name: intro
       clip: ../animations/banner_intro.yaml
@@ -291,5 +385,11 @@ dedup/no-clobber, wrap modes, crossfade blending, name/path resolution,
 lazy-bind-when-initially-inactive, rotation non-wrapping, YAML loading
 including a malformed-file failure path, procedural-vs-keyframed blending,
 the orbit evaluator against its closed-form formula, and a
-serial-vs-forced-parallel bit-identical check). The `coopa::scene` phase
+serial-vs-forced-parallel bit-identical check), plus events (exact fire counts across loop,
+ping-pong, once, multi-cycle steps and crossfades; a handler crossfading mid-dispatch), root motion
+(deltas over a loop boundary, a multi-cycle step, crossfade ramp-down, yaw extraction, the
+`IRootMotionReceiver` hand-off and its fallback), two-bone IK (reach, pole plane and side, soft
+limit, stability over frames, weight 0 restoring the pose) and look-at clamping / smoothing.
+libcoopa has no ctest entry in the engine build: configure `libs/libcoopa` on its own and run its
+`libcoopa` executable. The `coopa::scene` phase
 pipeline itself is covered separately, under `scene_pipeline_test`.

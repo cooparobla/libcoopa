@@ -8,6 +8,7 @@
 
 #include <coopa/animation/animation_clip_loader.h>
 #include <coopa/animation/animator.h>
+#include <coopa/animation/ik_components.h>
 #include <coopa/asset/asset_manager.h>
 #include <coopa/scene/scene_loader.h>
 
@@ -16,6 +17,52 @@
 
 namespace coopa {
 namespace anim {
+
+/**
+ * @brief Registers the "TwoBoneIK" and "LookAtIK" scene component parsers (see
+ *        ik_components.h for the keys). Called by register_animation_components(); the solver
+ *        system itself is installed separately (install_ik_system(), ik_system.h).
+ */
+inline void register_ik_components() {
+    auto read_str = [](const fkyaml::node& n, const char* key, std::string& out) {
+        if (n.contains(key)) out = n.at(key).get_value<std::string>();
+    };
+    auto read_float = [](const fkyaml::node& n, const char* key, float& out) {
+        if (n.contains(key)) out = n.at(key).get_value<float>();
+    };
+    auto read_vec3 = [](const fkyaml::node& n, const char* key, glm::vec3& out) {
+        if (!n.contains(key)) return;
+        float v[4];
+        parse_value4(n.at(key), v);
+        out = glm::vec3(v[0], v[1], v[2]);
+    };
+
+    coopa::scene::SceneLoader::register_component_parser(
+        "TwoBoneIK",
+        [=](const fkyaml::node& node, coopa::scene::SceneObject& obj, const coopa::scene::SceneLoader::ParseContext&) {
+            auto* ik = obj.add_component<TwoBoneIK>();
+            read_str(node, "upper", ik->upper);
+            read_str(node, "lower", ik->lower);
+            read_str(node, "end", ik->end);
+            read_str(node, "target", ik->target);
+            read_str(node, "pole", ik->pole);
+            read_float(node, "weight", ik->weight);
+            read_float(node, "soft_limit", ik->soft_limit);
+        });
+
+    coopa::scene::SceneLoader::register_component_parser(
+        "LookAtIK",
+        [=](const fkyaml::node& node, coopa::scene::SceneObject& obj, const coopa::scene::SceneLoader::ParseContext&) {
+            auto* ik = obj.add_component<LookAtIK>();
+            read_str(node, "bone", ik->bone);
+            read_str(node, "target", ik->target);
+            read_vec3(node, "forward_axis", ik->forward_axis);
+            read_vec3(node, "up_axis", ik->up_axis);
+            read_float(node, "max_angle", ik->max_angle);
+            read_float(node, "weight", ik->weight);
+            read_float(node, "smoothing", ik->smoothing);
+        });
+}
 
 /**
  * @brief Registers the AnimationClip asset loader and the "Animator" scene
@@ -52,6 +99,9 @@ inline void register_animation_components(coopa::asset::AssetManager& assets) {
             if (node.contains("default_crossfade")) {
                 animator->default_crossfade = node.at("default_crossfade").get_value<float>();
             }
+            if (node.contains("apply_root_motion")) {
+                animator->apply_root_motion = node.at("apply_root_motion").get_value<bool>();
+            }
 
             if (!node.contains("states")) return;
             for (const auto& state_node : node.at("states")) {
@@ -76,6 +126,8 @@ inline void register_animation_components(coopa::asset::AssetManager& assets) {
                 }
             }
         });
+
+    register_ik_components();
 }
 
 } // namespace anim

@@ -9,13 +9,20 @@
 #include <coopa/animation/animated_property.h>
 #include <coopa/animation/animation_clip.h>
 #include <coopa/animation/procedural_track.h>
+#include <coopa/animation/root_motion.h>
 #include <coopa/asset/asset_handle.h>
+#include <coopa/event/event_bus.h>
 #include <coopa/event/signal.h>
 #include <coopa/scene/component.h>
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_object.h>
+#include <coopa/scene/components/transform_component.h>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -85,7 +92,19 @@ struct AnimatorState {
  */
 class Animator : public coopa::scene::Component {
 public:
+    Animator() { bump_generation_(); }
+    ~Animator() override { bump_generation_(); }
+
     std::string type_name() const override { return "Animator"; }
+
+    /**
+     * @brief Process-wide count of Animators created or destroyed so far.
+     *
+     * AnimationSystem compares it each frame against the value at its last gather, so an
+     * Animator spawned at runtime (SceneLoader::spawn(), Engine::spawn(), a scene built while
+     * another runs) animates -- and a destroyed one is dropped -- without a manual refresh().
+     */
+    static uint64_t generation() { return generation_counter_().load(std::memory_order_acquire); }
 
     /** @brief Name of the state to play automatically once bound. Set before or after start(). */
     std::string auto_play;
@@ -101,6 +120,27 @@ public:
 
     /** @brief Fired exactly once per play()/crossfade() when a WrapMode::Once state reaches its end. */
     coopa::event::Signal<const std::string&> on_state_finished;
+
+    /**
+     * @brief Fired for every clip event the current state's playhead crosses (see
+     *        AnimationClip::events). Ordered by playback time within a frame; emitted at the end
+     *        of the Animation phase's advance step, so a handler may safely play()/crossfade().
+     *
+     * Each event is also posted to the scene EventBus as (owner name, "anim_event") with args
+     * `name`, `string`, `float`, `state` and `time`. While crossfading only the target (current)
+     * state fires, so an event never fires twice from the outgoing and incoming clips.
+     */
+    coopa::event::Signal<const AnimationEvent&> on_event;
+
+    /**
+     * @brief Move the owner by the playing clips' root motion (see AnimationClip::root_motion).
+     *
+     * Off: the delta is still extracted (root_motion_delta()) and the root bone still held in
+     * place, but nothing moves the owner -- gameplay code may read and apply it. On: the delta
+     * goes to an IRootMotionReceiver on the owner if one accepts it (a CharacterController with
+     * use_root_motion, which then collides), else straight onto the owner's Transform.
+     */
+    bool apply_root_motion = false;
 
     /**
      * @brief Binds and starts auto_play, if set.
@@ -206,6 +246,18 @@ public:
     void stop() { playing_ = false; }
 
     /**
+     * @brief Stops AND drops the current state, so nothing is applied at all until the next
+     *        play()/crossfade(). Unlike stop() -- which keeps re-applying the frozen pose every
+     *        frame -- this hands the animated properties to someone else (a ragdoll's physics).
+     */
+    void clear() {
+        current_ = Layer{};
+        previous_ = Layer{};
+        crossfading_ = false;
+        playing_ = false;
+    }
+
+    /**
      * @brief Seeks the current state to `time` and applies its pose immediately,
      *        without advancing playback or firing on_state_finished.
      */
@@ -239,6 +291,9 @@ public:
     }
 
     bool is_playing() const { return playing_ && current_.state != nullptr; }
+
+    /** @brief This frame's root motion, blended across a crossfade by layer weight (owner-local). */
+    const RootMotionDelta& root_motion_delta() const { return root_delta_; }
 
     const std::string& current_state() const {
         static const std::string empty;
@@ -279,6 +334,13 @@ public:
     }
 
 private:
+    static std::atomic<uint64_t>& generation_counter_() {
+        static std::atomic<uint64_t> counter{0};
+        return counter;
+    }
+    static void bump_generation_() { generation_counter_().fetch_add(1, std::memory_order_acq_rel); }
+
+private:
     friend class AnimationSystem;
 
     static constexpr size_t kInvalidIndex = static_cast<size_t>(-1);
@@ -298,6 +360,8 @@ private:
         const ProceduralEvaluator* evaluator     = nullptr; ///< Valid only for procedural tracks.
         coopa::scene::SceneObject* proc_target_object = nullptr; ///< Valid only when procedural.target_object is set and resolved.
         ProceduralInputs           inputs; ///< Snapshotted on the main thread each frame in advance_()/sample_at().
+        uint8_t                    root_channels = 0;     ///< Position channels extracted as root motion (bit c = channel c).
+        bool                       root_yaw      = false; ///< This rotation_quat track's yaw is extracted as root motion.
     };
 
     /** @brief One playing instance of a state: its own time cursor and crossfade weight. */
@@ -350,11 +414,11 @@ private:
         sb.bound_revision = state.revision();
         sb.track_refs.resize(clip->tracks.size());
         for (size_t i = 0; i < clip->tracks.size(); ++i) {
-            rebind_track_(clip->tracks[i], sb.track_refs[i]);
+            rebind_track_(*clip, clip->tracks[i], sb.track_refs[i]);
         }
     }
 
-    void rebind_track_(const AnimationTrack& track, TrackRef& ref) {
+    void rebind_track_(const AnimationClip& clip, const AnimationTrack& track, TrackRef& ref) {
         coopa::scene::SceneObject* target_obj = resolve_object_(track.object_path);
         if (!target_obj) {
             std::cerr << "[Animator] '" << (owner ? owner->name() : std::string("?"))
@@ -383,6 +447,19 @@ private:
         uint8_t valid = static_cast<uint8_t>((1u << prop->component_count) - 1);
         ref.channel_mask = suffix_mask & valid;
         ref.binding_index = find_or_add_binding_(target_obj, comp, prop, casted);
+
+        // Root-motion source: a keyframed Transform position / rotation_quat track on the clip's
+        // root_motion.object. Procedural tracks are never extracted.
+        if (clip.root_motion.enabled() && track.kind == TrackKind::Keyframed &&
+            track.component_type == "Transform" && target_obj == resolve_object_(clip.root_motion.object)) {
+            if (prop->name == "position") {
+                const uint8_t want = clip.root_motion.translation == RootMotionTranslation::XYZ ? 0x07
+                                   : clip.root_motion.translation == RootMotionTranslation::XY  ? 0x03 : 0x00;
+                ref.root_channels = ref.channel_mask & want;
+            } else if (prop->name == "rotation_quat" && clip.root_motion.yaw && ref.channel_mask == 0x0F) {
+                ref.root_yaw = true;
+            }
+        }
 
         if (track.kind == TrackKind::Procedural) {
             ref.evaluator = ProceduralTrackRegistry::instance().find(track.procedural.type);
@@ -460,19 +537,152 @@ private:
         }
     }
 
-    void advance_layer_(Layer& layer, float dt) {
-        if (!layer.state) return;
+    /**
+     * @brief Splits raw playback time [t0 -> t1] into the monotonic runs of SAMPLE time it covers,
+     *        in playback order, calling f(from, to) for each (from > to while sampling backwards:
+     *        negative speed, or the return leg of a ping-pong).
+     *
+     * Loop: one run per clip cycle crossed. PingPong: odd cycles are mirrored (x -> length - x).
+     * Once: one run, clamped to [0, length]. length <= 0 (an infinite clip): one unwrapped run.
+     */
+    template<typename F>
+    static void for_each_sample_run_(float t0, float t1, float length, WrapMode wrap, F&& f) {
+        if (t0 == t1) return;
+        if (length <= 0.0f) { f(t0, t1); return; }
+        if (wrap == WrapMode::Once) {
+            const float a = std::clamp(t0, 0.0f, length), b = std::clamp(t1, 0.0f, length);
+            if (a != b) f(a, b);
+            return;
+        }
+        const bool forward = t1 > t0;
+        const float lo_t = forward ? t0 : t1, hi_t = forward ? t1 : t0;
+        long long k_min = static_cast<long long>(std::floor(lo_t / length));
+        long long k_max = static_cast<long long>(std::ceil(hi_t / length)) - 1;
+        constexpr long long k_max_runs = 1024;   // a runaway dt only ever visits the newest cycles
+        if (k_max - k_min >= k_max_runs) {
+            if (forward) k_min = k_max - (k_max_runs - 1);
+            else k_max = k_min + (k_max_runs - 1);
+        }
+        for (long long i = 0; i <= k_max - k_min; ++i) {
+            const long long k = forward ? k_min + i : k_max - i;
+            const float base = static_cast<float>(k) * length;
+            const float lo = std::max(lo_t - base, 0.0f), hi = std::min(hi_t - base, length);
+            if (!(hi > lo)) continue;
+            float from = forward ? lo : hi, to = forward ? hi : lo;
+            if (wrap == WrapMode::PingPong && (k & 1)) { from = length - from; to = length - to; }
+            f(from, to);
+        }
+    }
+
+    /**
+     * @brief Queues every clip event a sample-time run crosses. Forward runs take [from, to),
+     *        backward runs (to, from] -- so each endpoint of a ping-pong fires once per visit and
+     *        an event exactly at the clip's end fires when a forward Loop/Once run reaches it.
+     */
+    void collect_events_(const AnimationClip& clip, WrapMode wrap, float from, float to, const std::string& state) {
+        const float len = clip.effective_length();
+        const size_t first = pending_events_.size();
+        for (const AnimationEvent& ev : clip.events) {
+            bool hit;
+            if (to > from) hit = (ev.time >= from && ev.time < to) ||
+                                 (wrap != WrapMode::PingPong && len > 0.0f && to >= len && ev.time >= len && from < len);
+            else hit = ev.time > to && ev.time <= from;
+            if (hit) pending_events_.push_back(PendingEvent{&ev, &state});
+        }
+        // Events are sorted ascending; a backward run visits them latest-first.
+        if (to < from) std::reverse(pending_events_.begin() + static_cast<std::ptrdiff_t>(first), pending_events_.end());
+    }
+
+    /** @brief The root bone's extracted channels at sample time `s`: position (unextracted channels 0) and yaw (degrees). */
+    void sample_root_(const AnimationClip& clip, const StateBinding& sb, float s, glm::vec3& pos, float& yaw_deg) const {
+        pos = glm::vec3(0.0f);
+        yaw_deg = 0.0f;
+        for (size_t i = 0; i < clip.tracks.size() && i < sb.track_refs.size(); ++i) {
+            const TrackRef& ref = sb.track_refs[i];
+            if (!ref.root_channels && !ref.root_yaw) continue;
+            const uint8_t active_count = popcount4_(ref.channel_mask);
+            float tmp[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            clip.tracks[i].curve.sample(s, active_count, tmp);
+            if (ref.root_yaw) {
+                yaw_deg = yaw_of_(tmp);
+                continue;
+            }
+            uint8_t k = 0;
+            for (uint8_t c = 0; c < 3; ++c) {
+                if (!(ref.channel_mask & (1u << c))) continue;
+                if (ref.root_channels & (1u << c)) pos[c] = tmp[k];
+                ++k;
+            }
+        }
+    }
+
+    /** @brief Yaw (degrees about +Z) of an xyzw quaternion; scale-invariant, since a keyframed
+     *         quaternion track interpolates componentwise and isn't unit between keys. */
+    static float yaw_of_(const float* q) {
+        const float x = q[0], y = q[1], z = q[2], w = q[3];
+        return glm::degrees(std::atan2(2.0f * (w * z + x * y), w * w + x * x - y * y - z * z));
+    }
+
+    /** @brief The root motion a sample-time run moves through, expressed in the frame the run started in. */
+    RootMotionDelta root_run_delta_(const AnimationClip& clip, const StateBinding& sb, float from, float to) const {
+        glm::vec3 p0, p1;
+        float y0, y1;
+        sample_root_(clip, sb, from, p0, y0);
+        sample_root_(clip, sb, to, p1, y1);
+        RootMotionDelta d;
+        d.yaw_deg = std::remainder(y1 - y0, 360.0f);
+        d.translation = p1 - p0;
+        if (y0 != 0.0f) {   // translate in the facing the run started with, not the clip's frame
+            const float r = glm::radians(-y0), c = std::cos(r), sn = std::sin(r);
+            d.translation = glm::vec3(c * d.translation.x - sn * d.translation.y,
+                                      sn * d.translation.x + c * d.translation.y, d.translation.z);
+        }
+        return d;
+    }
+
+    /**
+     * @brief Advances one layer's clock; queues its crossed events (when `fire_events`) and
+     *        returns the root motion it moved through this frame.
+     */
+    RootMotionDelta advance_layer_(Layer& layer, float dt, bool fire_events) {
+        RootMotionDelta delta;
+        if (!layer.state) return delta;
         const AnimationClip* clip = layer.state->resolve();
-        if (!clip) return;
+        if (!clip) return delta;
+        const float t0 = layer.time;
         layer.time += dt * speed_ * layer.state->speed;
+        const float length = clip->effective_length();
+        const WrapMode wrap = layer.state->effective_wrap(*clip);
         bool just_finished = false;
-        layer.sample_time = wrap_time_(layer.time, clip->effective_length(), layer.state->effective_wrap(*clip), just_finished);
+        layer.sample_time = wrap_time_(layer.time, length, wrap, just_finished);
+
+        const bool want_events = fire_events && !clip->events.empty();
+        const StateBinding* sb = nullptr;
+        if (clip->root_motion.enabled()) {
+            auto it = state_bindings_.find(layer.state);
+            if (it != state_bindings_.end()) sb = &it->second;
+        }
+        if (want_events || sb) {
+            for_each_sample_run_(t0, layer.time, length, wrap, [&](float from, float to) {
+                if (want_events) collect_events_(*clip, wrap, from, to, layer.state->name);
+                if (sb) {
+                    const RootMotionDelta d = root_run_delta_(*clip, *sb, from, to);
+                    // Successive runs chain: rotate each into the facing accumulated so far.
+                    const float r = glm::radians(delta.yaw_deg), c = std::cos(r), sn = std::sin(r);
+                    delta.translation += glm::vec3(c * d.translation.x - sn * d.translation.y,
+                                                   sn * d.translation.x + c * d.translation.y, d.translation.z);
+                    delta.yaw_deg += d.yaw_deg;
+                }
+            });
+        }
+
         if (just_finished && !layer.finished_fired) {
             layer.finished_fired = true;
             on_state_finished.emit(layer.state->name);
         } else if (!just_finished) {
             layer.finished_fired = false;
         }
+        return delta;
     }
 
     void snapshot_procedural_inputs_(AnimatorState* state) {
@@ -516,23 +726,50 @@ private:
         if (!bound_) rebind();
         ensure_state_bound_(current_.state);
         if (crossfading_) ensure_state_bound_(previous_.state);
+        pending_events_.clear();
+        root_delta_ = RootMotionDelta{};
         if (playing_) {
-            advance_layer_(current_, dt);
+            const RootMotionDelta cur = advance_layer_(current_, dt, true);
+            RootMotionDelta prev;
             if (crossfading_) {
-                advance_layer_(previous_, dt);
+                prev = advance_layer_(previous_, dt, false);   // only the target state fires events
                 crossfade_elapsed_ += dt;
                 float t = crossfade_duration_ > 0.0f ? std::min(1.0f, crossfade_elapsed_ / crossfade_duration_) : 1.0f;
                 current_.weight = t;
                 previous_.weight = 1.0f - t;
+                root_delta_.translation = cur.translation * t + prev.translation * (1.0f - t);
+                root_delta_.yaw_deg = cur.yaw_deg * t + prev.yaw_deg * (1.0f - t);
                 if (t >= 1.0f) {
                     crossfading_ = false;
                     previous_ = Layer{};
                     current_.weight = 1.0f;
                 }
+            } else {
+                root_delta_ = cur;
             }
         }
         snapshot_procedural_inputs_(current_.state);
         if (crossfading_) snapshot_procedural_inputs_(previous_.state);
+        dispatch_events_();
+    }
+
+    /** @brief Emits the events advance_() queued, after all playback state is settled. */
+    void dispatch_events_() {
+        if (pending_events_.empty()) return;
+        // Copy out first: a handler may play()/crossfade() (or even advance) this Animator.
+        std::vector<PendingEvent> events;
+        events.swap(pending_events_);
+        for (const PendingEvent& pe : events) {
+            const AnimationEvent ev = *pe.event;   // the clip may hot-reload under a handler
+            const std::string state = *pe.state;
+            on_event.emit(ev);
+            if (scene && owner) {
+                coopa::event::EventArgs args;
+                args.set("name", ev.name).set("string", ev.string_value).set("float", ev.float_value)
+                    .set("state", state).set("time", ev.time);
+                scene->events().emit(owner->name(), "anim_event", args);
+            }
+        }
     }
 
     /**
@@ -591,6 +828,7 @@ private:
             float tmp[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             if (track.kind == TrackKind::Keyframed) {
                 track.curve.sample(layer.sample_time, active_count, tmp);
+                if (ref.root_channels || ref.root_yaw) hold_root_(track, ref, active_count, tmp);
             } else if (ref.evaluator) {
                 (*ref.evaluator)(track.procedural.params, ref.inputs, layer.sample_time, active_count, tmp);
             } else {
@@ -606,6 +844,48 @@ private:
                 weight[c] += layer.weight;
                 ++k;
             }
+        }
+    }
+
+    /**
+     * @brief Holds a root-motion track's extracted channels at their clip-start value (the travel
+     *        is handed to the owner instead). Worker-safe: const clip data only.
+     */
+    static void hold_root_(const AnimationTrack& track, const TrackRef& ref, uint8_t active_count, float* tmp) {
+        float start[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        track.curve.sample(0.0f, active_count, start);
+        if (ref.root_yaw) {
+            const float dyaw = glm::radians(yaw_of_(start) - yaw_of_(tmp));
+            const glm::quat q = glm::angleAxis(dyaw, glm::vec3(0.0f, 0.0f, 1.0f)) * glm::quat(tmp[3], tmp[0], tmp[1], tmp[2]);
+            tmp[0] = q.x; tmp[1] = q.y; tmp[2] = q.z; tmp[3] = q.w;
+            return;
+        }
+        uint8_t k = 0;
+        for (uint8_t c = 0; c < 4; ++c) {
+            if (!(ref.channel_mask & (1u << c))) continue;
+            if (ref.root_channels & (1u << c)) tmp[k] = start[k];
+            ++k;
+        }
+    }
+
+    /** @brief Hands this frame's root motion to a receiver on the owner, or moves the owner's Transform. Main thread. */
+    void apply_root_motion_() {
+        if (!apply_root_motion || !owner || root_delta_.is_zero()) return;
+        for (const auto& comp : owner->components()) {
+            if (auto* receiver = dynamic_cast<IRootMotionReceiver*>(comp.get())) {
+                if (receiver->consume_root_motion(root_delta_.translation, root_delta_.yaw_deg)) return;
+                break;
+            }
+        }
+        auto* tc = owner->get_transform();
+        if (!tc) return;
+        coopa::util::Transform& t = tc->transform();
+        t.set_position(t.position() + t.rotation_quat() * root_delta_.translation);
+        if (root_delta_.yaw_deg != 0.0f) {
+            // Euler ZYX: Z is outermost, so adding to it turns about the parent's +Z.
+            glm::vec3 r = t.rotation_degrees();
+            r.z += root_delta_.yaw_deg;
+            t.set_rotation(r);
         }
     }
 
@@ -649,6 +929,14 @@ private:
     bool  playing_ = false;
     bool  bound_   = false;
     float speed_   = 1.0f;
+
+    /** @brief An event crossed this frame, emitted by dispatch_events_() once advance_() is done. */
+    struct PendingEvent {
+        const AnimationEvent* event = nullptr;
+        const std::string*    state = nullptr;
+    };
+    std::vector<PendingEvent> pending_events_;
+    RootMotionDelta           root_delta_;
 };
 
 } // namespace anim

@@ -57,6 +57,9 @@
 #include <coopa/animation/animation_system.h>
 #include <coopa/animation/animation_clip_loader.h>
 #include <coopa/animation/animation_yaml.h>
+#include <coopa/animation/ik.h>
+#include <coopa/animation/ik_system.h>
+#include <map>
 #include <coopa/input/keys.h>
 #include <coopa/input/input.h>
 #include <coopa/input/input_map.h>
@@ -1817,9 +1820,11 @@ namespace scene_inherit_test {
 class TestTagComponent : public coopa::scene::Component {
 public:
     std::string type_name() const override { return "TestTag"; }
+    void start() override { started = true; }
     std::string id;
     std::string label;
     std::string extra;
+    bool started = false;
 };
 
 // A second test-only component whose sole job is to prove ctx.resolve()
@@ -3282,6 +3287,443 @@ void test_animation_clip_loader_yaml() {
     // comment; good/bad are still live handles here.
 }
 
+// ---------------------------------------------------------
+// Animation events, root motion and IK
+// ---------------------------------------------------------
+
+namespace anim_p4_test {
+
+using namespace coopa::anim;
+using namespace coopa::scene;
+
+/** @brief Adds a child with a Transform at `pos`, linking the transforms (add_child doesn't). */
+SceneObject* add_bone(SceneObject* parent, const std::string& name, const glm::vec3& pos) {
+    auto obj = std::make_unique<SceneObject>(name);
+    auto* tc = obj->add_component<TransformComponent>();
+    tc->transform().set_position(pos);
+    tc->set_parent_transform(&parent->get_transform()->transform());
+    return parent->add_child(std::move(obj));
+}
+
+/** @brief A clip of `length` with one flat track (so it has bindings) and the given events. */
+std::shared_ptr<AnimationClip> event_clip(float length, WrapMode wrap, const std::vector<std::pair<float, std::string>>& events) {
+    auto clip = std::make_shared<AnimationClip>();
+    clip->wrap = wrap;
+    clip->set_explicit_length(length);
+    AnimationTrack t;
+    t.property = "position.x";
+    t.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    t.curve.add_key(Keyframe{length, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    t.curve.sort_keys();
+    clip->tracks.push_back(t);
+    for (const auto& e : events) {
+        AnimationEvent ev;
+        ev.time = e.first;
+        ev.name = e.second;
+        clip->events.push_back(ev);
+    }
+    clip->sort_events();
+    return clip;
+}
+
+struct EventCounter {
+    std::map<std::string, int> counts;
+    std::vector<std::string> order;
+};
+
+void step(Scene& scene, float dt, int frames) {
+    for (int i = 0; i < frames; ++i) {
+        scene.update(dt);
+        scene.late_update(dt);
+    }
+}
+
+} // namespace anim_p4_test
+
+void test_animation_events_loop_exact_counts() {
+    using namespace anim_p4_test;
+    Scene scene("EventsLoop");
+    auto obj = std::make_unique<SceneObject>("Rig");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+    animator->add_state("s", event_clip(1.0f, WrapMode::Loop, {{0.0f, "start"}, {0.5f, "mid"}}));
+    animator->auto_play = "s";
+
+    EventCounter signal_counts, bus_counts;
+    animator->on_event.connect([&](const AnimationEvent& e) { ++signal_counts.counts[e.name]; signal_counts.order.push_back(e.name); });
+    scene.events().on("Rig", "anim_event", [&](const coopa::event::EventArgs& a) {
+        ++bus_counts.counts[a.get<std::string>("name", "")];
+        ASSERT_EQ(a.get<std::string>("state", ""), std::string("s"));
+    });
+
+    install_animation_system(scene);
+    scene.start();
+    step(scene, 0.125f, 24);   // t = 3.0 exactly: three full cycles
+
+    ASSERT_EQ(signal_counts.counts["start"], 3);
+    ASSERT_EQ(signal_counts.counts["mid"], 3);
+    ASSERT_EQ(bus_counts.counts["start"], 3);
+    ASSERT_EQ(bus_counts.counts["mid"], 3);
+    ASSERT_EQ(signal_counts.order.front(), std::string("start"));
+
+    // One big step crossing two loop boundaries fires each event once per cycle crossed, in order.
+    signal_counts = EventCounter{};
+    step(scene, 2.0f, 1);   // 3.0 -> 5.0
+    ASSERT_EQ(signal_counts.counts["start"], 2);
+    ASSERT_EQ(signal_counts.counts["mid"], 2);
+    ASSERT_EQ(signal_counts.order.size(), static_cast<size_t>(4));
+    ASSERT_EQ(signal_counts.order[0], std::string("start"));
+    ASSERT_EQ(signal_counts.order[1], std::string("mid"));
+    ASSERT_EQ(signal_counts.order[2], std::string("start"));
+}
+
+void test_animation_events_pingpong_and_once() {
+    using namespace anim_p4_test;
+    {
+        Scene scene("EventsPingPong");
+        auto obj = std::make_unique<SceneObject>("Rig");
+        obj->add_component<TransformComponent>();
+        auto* animator = obj->add_component<Animator>();
+        scene.add_root_object(std::move(obj));
+        animator->add_state("s", event_clip(1.0f, WrapMode::PingPong, {{0.0f, "lo"}, {0.5f, "mid"}, {1.0f, "hi"}}));
+        animator->auto_play = "s";
+        std::map<std::string, int> counts;
+        animator->on_event.connect([&](const AnimationEvent& e) { ++counts[e.name]; });
+        install_animation_system(scene);
+        scene.start();
+        step(scene, 0.125f, 32);   // t = 4.0: two full there-and-back periods
+        // Endpoints fire once per visit (0 at t=0,2; 1 at t=1,3); the midpoint both ways.
+        ASSERT_EQ(counts["lo"], 2);
+        ASSERT_EQ(counts["hi"], 2);
+        ASSERT_EQ(counts["mid"], 4);
+    }
+    {
+        Scene scene("EventsOnce");
+        auto obj = std::make_unique<SceneObject>("Rig");
+        obj->add_component<TransformComponent>();
+        auto* animator = obj->add_component<Animator>();
+        scene.add_root_object(std::move(obj));
+        animator->add_state("s", event_clip(1.0f, WrapMode::Once, {{0.25f, "a"}, {1.0f, "end"}}));
+        animator->auto_play = "s";
+        std::map<std::string, int> counts;
+        int finished = 0;
+        animator->on_event.connect([&](const AnimationEvent& e) { ++counts[e.name]; });
+        animator->on_state_finished.connect([&](const std::string&) { ++finished; });
+        install_animation_system(scene);
+        scene.start();
+        step(scene, 0.3f, 10);   // clamps at the end; held there for 2 more seconds
+        ASSERT_EQ(counts["a"], 1);
+        ASSERT_EQ(counts["end"], 1);
+        ASSERT_EQ(finished, 1);
+    }
+}
+
+void test_animation_events_crossfade_only_target_fires() {
+    using namespace anim_p4_test;
+    Scene scene("EventsCrossfade");
+    auto obj = std::make_unique<SceneObject>("Rig");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    scene.add_root_object(std::move(obj));
+    animator->add_state("A", event_clip(1.0f, WrapMode::Loop, {{0.5f, "a"}}));
+    animator->add_state("B", event_clip(1.0f, WrapMode::Loop, {{0.25f, "b"}}));
+    animator->auto_play = "A";
+    std::map<std::string, int> counts;
+    animator->on_event.connect([&](const AnimationEvent& e) { ++counts[e.name]; });
+    install_animation_system(scene);
+    scene.start();
+    step(scene, 0.125f, 2);          // A: 0 -> 0.25, nothing crossed
+    ASSERT_EQ(counts["a"], 0);
+    animator->crossfade("B", 0.5f);
+    step(scene, 0.125f, 4);          // A 0.25 -> 0.75 (crosses 0.5, silent), B 0 -> 0.5 (fires b)
+    ASSERT_EQ(counts["a"], 0);
+    ASSERT_EQ(counts["b"], 1);
+    step(scene, 0.125f, 8);          // B 0.5 -> 1.5: b once more
+    ASSERT_EQ(counts["a"], 0);
+    ASSERT_EQ(counts["b"], 2);
+
+    // A handler may crossfade from inside the event without corrupting playback.
+    bool switched = false;
+    animator->on_event.connect([&](const AnimationEvent& e) {
+        if (e.name == "b" && !switched) { switched = true; animator->crossfade("A", 0.25f); }
+    });
+    step(scene, 0.125f, 8);
+    ASSERT_TRUE(switched);
+    ASSERT_EQ(animator->current_state(), std::string("A"));
+}
+
+void test_animation_clip_events_root_motion_yaml() {
+    using namespace coopa::anim;
+    fkyaml::node root = fkyaml::node::deserialize(std::string(
+        "clip:\n"
+        "  name: walk\n"
+        "  length: 1.0\n"
+        "  root_motion: {object: hips, translation: xy, rotation: yaw}\n"
+        "  events:\n"
+        "    - {time: 0.5, name: footstep, string: right, float: 0.7}\n"
+        "    - {time: 0.0, name: footstep, string: left}\n"
+        "  tracks: []\n"));
+    AnimationClip clip = parse_clip(root);
+    ASSERT_EQ(clip.events.size(), static_cast<size_t>(2));
+    ASSERT_EQ(clip.events[0].string_value, std::string("left"));    // sorted by time
+    ASSERT_EQ(clip.events[1].name, std::string("footstep"));
+    ASSERT_TRUE(std::abs(clip.events[1].float_value - 0.7f) < 1e-6f);
+    ASSERT_EQ(clip.root_motion.object, std::string("hips"));
+    ASSERT_TRUE(clip.root_motion.translation == RootMotionTranslation::XY);
+    ASSERT_TRUE(clip.root_motion.yaw);
+    ASSERT_TRUE(clip.root_motion.enabled());
+}
+
+void test_animation_root_motion_across_loop_boundary() {
+    using namespace anim_p4_test;
+    Scene scene("RootMotion");
+    auto obj = std::make_unique<SceneObject>("Rig");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    SceneObject* rig = scene.add_root_object(std::move(obj));
+    SceneObject* hips = add_bone(rig, "hips", {0.0f, 0.0f, 1.0f});
+
+    // Walk: hips travel 0 -> 2 along +Y per 1 s cycle and bob in Z (z stays on the bone: xy mode).
+    auto walk = std::make_shared<AnimationClip>();
+    walk->wrap = WrapMode::Loop;
+    walk->set_explicit_length(1.0f);
+    walk->root_motion.object = "hips";
+    walk->root_motion.translation = RootMotionTranslation::XY;
+    AnimationTrack ty;
+    ty.object_path = "hips";
+    ty.property = "position.y";
+    ty.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    ty.curve.add_key(Keyframe{1.0f, {2.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    ty.curve.sort_keys();
+    walk->tracks.push_back(ty);
+    AnimationTrack tz;
+    tz.object_path = "hips";
+    tz.property = "position.z";
+    tz.curve.add_key(Keyframe{0.0f, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tz.curve.add_key(Keyframe{0.5f, {1.2f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tz.curve.add_key(Keyframe{1.0f, {1.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+    tz.curve.sort_keys();
+    walk->tracks.push_back(tz);
+    animator->add_state("walk", walk);
+    animator->add_state("idle", event_clip(1.0f, WrapMode::Loop, {}));   // no root motion
+    animator->auto_play = "walk";
+    animator->apply_root_motion = true;
+
+    install_animation_system(scene);
+    scene.start();
+    step(scene, 0.375f, 2);   // t = 0.75
+    ASSERT_TRUE(std::abs(animator->root_motion_delta().translation.y - 0.75f) < 1e-4f);
+    step(scene, 0.375f, 1);   // 0.75 -> 1.125 crosses the loop: (2 - 1.5) + (0.25 - 0) = 0.75
+    ASSERT_TRUE(std::abs(animator->root_motion_delta().translation.y - 0.75f) < 1e-4f);
+    step(scene, 0.375f, 1);   // t = 1.5: 1.5 cycles = 3 m
+    const glm::vec3 rig_pos = rig->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(rig_pos.y - 3.0f) < 1e-4f);
+    ASSERT_TRUE(std::abs(rig_pos.x) < 1e-5f && std::abs(rig_pos.z) < 1e-5f);
+    const glm::vec3 hips_pos = hips->get_transform()->transform().position();
+    ASSERT_TRUE(std::abs(hips_pos.y) < 1e-5f);              // extracted channel held at the clip start
+    ASSERT_TRUE(std::abs(hips_pos.z - 1.2f) < 1e-4f);       // z not extracted (xy): still animated
+
+    // A big step over two boundaries still integrates exactly: 2.5 s = 5 m.
+    step(scene, 2.5f, 1);
+    ASSERT_TRUE(std::abs(rig->get_transform()->transform().position().y - 8.0f) < 1e-3f);
+
+    // Crossfading out to a clip without root motion ramps the delta down by weight.
+    animator->crossfade("idle", 0.5f);
+    float last = 1e9f;
+    for (int i = 0; i < 4; ++i) {
+        step(scene, 0.125f, 1);
+        const float w = std::min(1.0f, 0.125f * (i + 1) / 0.5f);
+        const float d = animator->root_motion_delta().translation.y;
+        ASSERT_TRUE(std::abs(d - (1.0f - w) * 0.25f) < 1e-4f);   // walk moves 0.25 per 0.125 s
+        ASSERT_TRUE(d <= last);
+        last = d;
+    }
+    ASSERT_TRUE(std::abs(animator->root_motion_delta().translation.y) < 1e-6f);
+}
+
+void test_animation_root_motion_yaw_and_receiver() {
+    using namespace anim_p4_test;
+
+    /** @brief Consumes root motion when enabled, like toyengine's CharacterController. */
+    class Receiver : public Component, public IRootMotionReceiver {
+    public:
+        std::string type_name() const override { return "Receiver"; }
+        bool accept = true;
+        glm::vec3 total{0.0f};
+        float yaw = 0.0f;
+        bool consume_root_motion(const glm::vec3& d, float y) override {
+            if (!accept) return false;
+            total += d;
+            yaw += y;
+            return true;
+        }
+    };
+
+    Scene scene("RootMotionYaw");
+    auto obj = std::make_unique<SceneObject>("Rig");
+    obj->add_component<TransformComponent>();
+    auto* animator = obj->add_component<Animator>();
+    auto* receiver = obj->add_component<Receiver>();
+    SceneObject* rig = scene.add_root_object(std::move(obj));
+    SceneObject* hips = add_bone(rig, "hips", {0.0f, 0.0f, 1.0f});
+
+    // A turn: hips yaw 0 -> 90 degrees over 1 s, no travel.
+    auto turn = std::make_shared<AnimationClip>();
+    turn->wrap = WrapMode::Once;
+    turn->set_explicit_length(1.0f);
+    turn->root_motion.object = "hips";
+    turn->root_motion.translation = RootMotionTranslation::None;
+    turn->root_motion.yaw = true;
+    AnimationTrack tr;
+    tr.object_path = "hips";
+    tr.property = "rotation_quat";
+    const glm::quat q0(1.0f, 0.0f, 0.0f, 0.0f);
+    const glm::quat q1 = glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    tr.curve.add_key(Keyframe{0.0f, {q0.x, q0.y, q0.z, q0.w}, Interpolation::Linear});
+    tr.curve.add_key(Keyframe{1.0f, {q1.x, q1.y, q1.z, q1.w}, Interpolation::Linear});
+    tr.curve.sort_keys();
+    turn->tracks.push_back(tr);
+    animator->add_state("turn", turn);
+    animator->auto_play = "turn";
+    animator->apply_root_motion = true;
+
+    install_animation_system(scene);
+    scene.start();
+    step(scene, 0.25f, 2);
+    // Receiver took it; the Transform didn't move.
+    ASSERT_TRUE(std::abs(receiver->yaw - 45.0f) < 0.5f);
+    ASSERT_TRUE(std::abs(rig->get_transform()->transform().rotation_degrees().z) < 1e-5f);
+    // The bone's yaw is held at the clip start.
+    const glm::quat hq = hips->get_transform()->transform().rotation_quat();
+    ASSERT_TRUE(std::abs(std::abs(hq.w) - 1.0f) < 1e-4f);
+
+    // A receiver that declines leaves the Animator to turn the Transform itself.
+    receiver->accept = false;
+    step(scene, 0.25f, 4);   // to the end (clamped): the remaining 45 degrees
+    ASSERT_TRUE(std::abs(rig->get_transform()->transform().rotation_degrees().z - 45.0f) < 0.5f);
+    ASSERT_TRUE(std::abs(receiver->yaw - 45.0f) < 0.5f);
+}
+
+void test_ik_two_bone_reach_and_pole() {
+    using namespace anim_p4_test;
+    using namespace coopa::anim::ik;
+
+    // Pure math first: target in reach, pole toward +Y.
+    {
+        const glm::vec3 a(0.0f), b(0.0f, 0.0f, -1.0f), c(0.0f, 0.0f, -2.0f);
+        const glm::vec3 target(0.5f, 0.3f, -1.2f), pole(0.0f, 3.0f, -1.0f);
+        const TwoBoneResult r = solve_two_bone(a, b, c, target, pole, true, 0.0f);
+        ASSERT_TRUE(r.reached);
+        ASSERT_TRUE(glm::length(r.end - target) < 1e-4f);
+        ASSERT_TRUE(std::abs(glm::length(r.mid - a) - 1.0f) < 1e-4f);
+        ASSERT_TRUE(std::abs(glm::length(r.end - r.mid) - 1.0f) < 1e-4f);
+        // Rotations reproduce the solved joints.
+        const glm::vec3 mid = a + r.upper_delta * (b - a);
+        const glm::vec3 end = mid + r.lower_delta * (r.upper_delta * (c - b));
+        ASSERT_TRUE(glm::length(mid - r.mid) < 1e-4f);
+        ASSERT_TRUE(glm::length(end - target) < 1e-4f);
+        // Mid joint lies in the (a, target, pole) plane, on the pole's side of the reach line.
+        const glm::vec3 n = glm::normalize(glm::cross(target - a, pole - a));
+        ASSERT_TRUE(std::abs(glm::dot(r.mid - a, n)) < 1e-4f);
+        const glm::vec3 dir = glm::normalize(target - a);
+        glm::vec3 mid_off = (r.mid - a) - dir * glm::dot(r.mid - a, dir);
+        glm::vec3 pole_off = (pole - a) - dir * glm::dot(pole - a, dir);
+        ASSERT_TRUE(glm::dot(mid_off, pole_off) > 0.0f);
+
+        // Out of reach: fully extended toward it, no NaNs; the soft limit stops short of straight.
+        const TwoBoneResult far = solve_two_bone(a, b, c, glm::vec3(0.0f, 5.0f, 0.0f), pole, true, 0.05f);
+        ASSERT_TRUE(!far.reached);
+        ASSERT_TRUE(std::isfinite(far.mid.x) && std::isfinite(far.end.y));
+        ASSERT_TRUE(far.end.y > 1.85f && far.end.y < 2.0f);
+    }
+
+    // Through the components and IkSystem, with an un-animated chain over several frames.
+    Scene scene("TwoBoneIK");
+    auto root_obj = std::make_unique<SceneObject>("Rig");
+    root_obj->add_component<TransformComponent>();
+    auto* ikc = root_obj->add_component<TwoBoneIK>();
+    SceneObject* rig = scene.add_root_object(std::move(root_obj));
+    rig->get_transform()->transform().set_rotation(glm::vec3(0.0f, 0.0f, 30.0f));   // parent rotation exercises to_local_delta
+    rig->get_transform()->transform().set_position(glm::vec3(1.0f, 2.0f, 3.0f));
+    SceneObject* upper = add_bone(rig, "upper", {0.0f, 0.0f, 0.0f});
+    SceneObject* lower = add_bone(upper, "lower", {0.0f, 0.0f, -1.0f});
+    SceneObject* end = add_bone(lower, "end", {0.0f, 0.0f, -1.0f});
+    auto tgt = std::make_unique<SceneObject>("target");
+    tgt->add_component<TransformComponent>()->transform().set_position(glm::vec3(1.6f, 2.4f, 1.7f));
+    scene.add_root_object(std::move(tgt));
+    auto pole_obj = std::make_unique<SceneObject>("pole");
+    pole_obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(1.0f, 6.0f, 2.0f));
+    scene.add_root_object(std::move(pole_obj));
+    ikc->upper = "upper";
+    ikc->lower = "upper/lower";
+    ikc->end = "upper/lower/end";
+    ikc->target = "target";
+    ikc->pole = "pole";
+    ikc->soft_limit = 0.0f;
+    install_ik_system(scene);
+    scene.start();
+    const glm::vec3 target_p(1.6f, 2.4f, 1.7f);
+    for (int frame = 0; frame < 4; ++frame) {
+        step(scene, 1.0f / 60.0f, 1);
+        const glm::vec3 e = glm::vec3(end->get_transform()->get_world_matrix()[3]);
+        ASSERT_TRUE(glm::length(e - target_p) < 1e-3f);   // stable: no drift frame to frame
+    }
+    const glm::vec3 m = glm::vec3(lower->get_transform()->get_world_matrix()[3]);
+    ASSERT_TRUE(m.y > 2.0f);   // elbow bent toward the +Y pole
+
+    // Weight 0 restores the un-animated input pose exactly.
+    ikc->weight = 0.0f;
+    step(scene, 1.0f / 60.0f, 1);
+    const glm::vec3 e0 = glm::vec3(end->get_transform()->get_world_matrix()[3]);
+    ASSERT_TRUE(glm::length(e0 - glm::vec3(1.0f, 2.0f, 1.0f)) < 1e-4f);
+}
+
+void test_ik_look_at_clamps() {
+    using namespace anim_p4_test;
+    Scene scene("LookAtIK");
+    auto root_obj = std::make_unique<SceneObject>("Rig");
+    root_obj->add_component<TransformComponent>();
+    SceneObject* rig = scene.add_root_object(std::move(root_obj));
+    SceneObject* head = add_bone(rig, "head", {0.0f, 0.0f, 1.6f});
+    auto* look = head->add_component<LookAtIK>();
+    look->max_angle = 60.0f;
+    look->set_target_position(glm::vec3(-3.0f, -3.0f, 1.6f));   // 135 degrees off +Y
+    install_ik_system(scene);
+    scene.start();
+
+    auto forward = [&]() {
+        const glm::quat r = coopa::anim::ik::rotation_of(head->get_transform()->get_world_matrix());
+        return glm::normalize(r * glm::vec3(0.0f, 1.0f, 0.0f));
+    };
+    for (int i = 0; i < 5; ++i) {
+        step(scene, 1.0f / 60.0f, 1);
+        const glm::vec3 f = forward();
+        const float ang = glm::degrees(std::acos(std::clamp(f.y, -1.0f, 1.0f)));
+        ASSERT_TRUE(std::abs(ang - 60.0f) < 0.1f);   // clamped, and not accumulating
+        ASSERT_TRUE(f.x < 0.0f);                       // toward the target's side
+        ASSERT_TRUE(std::abs(f.z) < 1e-3f);            // in the horizontal plane
+    }
+    // Up axis kept: no roll introduced by a level turn.
+    const glm::quat r = coopa::anim::ik::rotation_of(head->get_transform()->get_world_matrix());
+    ASSERT_TRUE((r * glm::vec3(0.0f, 0.0f, 1.0f)).z > 0.999f);
+
+    // In range: looks straight at it.
+    look->set_target_position(glm::vec3(1.0f, 2.0f, 2.6f));
+    step(scene, 1.0f / 60.0f, 1);
+    const glm::vec3 want = glm::normalize(glm::vec3(1.0f, 2.0f, 1.0f));
+    ASSERT_TRUE(glm::length(forward() - want) < 1e-3f);
+
+    // Smoothing approaches the target gradually.
+    look->smoothing = 0.2f;
+    look->set_target_position(glm::vec3(-1.0f, 2.0f, 1.6f));
+    step(scene, 1.0f / 60.0f, 1);
+    const glm::vec3 want2 = glm::normalize(glm::vec3(-1.0f, 2.0f, 0.0f));
+    ASSERT_TRUE(glm::length(forward() - want2) > 0.05f);
+    step(scene, 1.0f / 60.0f, 120);
+    ASSERT_TRUE(glm::length(forward() - want2) < 1e-2f);
+}
+
 void test_animator_scene_yaml_registration() {
     using namespace animation_test;
     using namespace coopa::anim;
@@ -4680,6 +5122,118 @@ void test_routine_component_helpers_start_and_stop() {
     ASSERT_EQ(system->runner().active_count(), static_cast<size_t>(0));
 }
 
+// An Animator built into a running scene after the AnimationSystem's first gather (a runtime
+// spawn) animates without refresh(), and a destroyed one is dropped without being touched.
+void test_animation_system_picks_up_spawned_animators() {
+    using namespace coopa::anim;
+    using namespace coopa::scene;
+
+    auto make_clip = []() {
+        auto clip = std::make_shared<AnimationClip>();
+        clip->wrap = WrapMode::Loop;
+        clip->set_explicit_length(1.0f);
+        AnimationTrack track;
+        track.property = "position";
+        track.curve.add_key(Keyframe{0.0f, {0.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.add_key(Keyframe{1.0f, {10.0f, 0.0f, 0.0f, 1.0f}, Interpolation::Linear});
+        track.curve.sort_keys();
+        clip->tracks.push_back(track);
+        return clip;
+    };
+    auto make_rig = [&](const std::string& name) {
+        auto obj = std::make_unique<SceneObject>(name);
+        obj->add_component<TransformComponent>();
+        auto* animator = obj->add_component<Animator>();
+        animator->add_state("move", make_clip());
+        animator->auto_play = "move";
+        return obj;
+    };
+
+    Scene scene("Spawned");
+    scene.add_root_object(make_rig("First"));
+    AnimationSystem* sys = install_animation_system(scene);
+    scene.start();
+    scene.update(0.25f);
+    scene.late_update(0.25f);
+    ASSERT_EQ(sys->animator_count(), static_cast<size_t>(1));
+
+    // Spawned the way SceneLoader::spawn() does it: parented, adopted, started.
+    SceneObject* spawned = scene.add_root_object(make_rig("Spawned"));
+    scene.adopt(*spawned);
+    spawned->start();
+    scene.update(0.5f);
+    scene.late_update(0.5f);
+    ASSERT_EQ(sys->animator_count(), static_cast<size_t>(2));
+    const float x = scene.find_object("Spawned")->get_transform()->transform().position().x;
+    ASSERT_TRUE(std::abs(x - 5.0f) < 1e-4f);
+
+    // Destroyed: dropped on the next frame (a stale pointer here would be a use-after-free).
+    ASSERT_TRUE(scene.remove_root_object(scene.find_object("First")));
+    scene.update(0.25f);
+    scene.late_update(0.25f);
+    ASSERT_EQ(sys->animator_count(), static_cast<size_t>(1));
+    const float x2 = scene.find_object("Spawned")->get_transform()->transform().position().x;
+    ASSERT_TRUE(std::abs(x2 - 7.5f) < 1e-4f);
+}
+
+// read_document_async() resolves on a worker; Builder builds root objects in steps, without
+// starting them, and take() hands over an unstarted scene when LoadOptions::start is off.
+void test_scene_loader_async_read_and_incremental_build() {
+    using namespace scene_inherit_test;
+    write_file("async_build", "prefab.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components:\n"
+        "    - type: TestTag\n"
+        "      label: from-prefab\n");
+    std::string scene_path = write_file("async_build", "scene.yaml",
+        "scene:\n"
+        "  scene_name: AsyncBuild\n"
+        "  root_objects:\n"
+        "    - name: A\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          label: a\n"
+        "    - name: B\n"
+        "      inherit_from: prefab.yaml\n"
+        "    - name: C\n"
+        "      components:\n"
+        "        - type: TestTag\n"
+        "          label: c\n");
+
+    coopa::job::JobEngine jobs(2);
+    auto read = coopa::scene::SceneLoader::read_document_async(scene_path, &jobs);
+    for (int i = 0; i < 20000 && !read->ready(); ++i) std::this_thread::sleep_for(std::chrono::microseconds(100));
+    ASSERT_TRUE(read->ready());
+    ASSERT_TRUE(!read->failed());
+
+    coopa::scene::SceneLoader::Builder builder(read->document(), scene_path, {.start = false});
+    ASSERT_EQ(builder.total(), static_cast<size_t>(3));
+    ASSERT_TRUE(!builder.step(0.0));   // a zero budget still builds one root object
+    ASSERT_EQ(builder.built(), static_cast<size_t>(1));
+    ASSERT_TRUE(!builder.step(0.0));
+    ASSERT_TRUE(builder.step(0.0));
+    ASSERT_TRUE(builder.done());
+    std::unique_ptr<coopa::scene::Scene> scene = builder.take();
+    ASSERT_EQ(scene->name(), std::string("AsyncBuild"));
+    coopa::scene::SceneObject* b = scene->find_object("B");
+    ASSERT_TRUE(b != nullptr);
+    ASSERT_EQ(find_tags(*b)[0]->label, std::string("from-prefab"));   // inheritance resolved off-thread
+    ASSERT_TRUE(!find_tags(*b)[0]->started);
+    scene->start();
+    ASSERT_TRUE(find_tags(*b)[0]->started);
+
+    // load() with start on (the default) is unchanged; a missing file fails the async read.
+    coopa::scene::Scene started = coopa::scene::SceneLoader::load(scene_path);
+    ASSERT_TRUE(find_tags(*started.find_object("A"))[0]->started);
+    coopa::scene::Scene unstarted = coopa::scene::SceneLoader::load(scene_path, {.start = false});
+    ASSERT_TRUE(!find_tags(*unstarted.find_object("A"))[0]->started);
+    auto missing = coopa::scene::SceneLoader::read_document_async(scene_path + ".missing.yaml", &jobs);
+    for (int i = 0; i < 20000 && !missing->ready(); ++i) std::this_thread::sleep_for(std::chrono::microseconds(100));
+    ASSERT_TRUE(missing->failed());
+    ASSERT_TRUE(!missing->error().empty());
+}
+
 int main() {
     std::cout << "===========================================" << std::endl;
     std::cout << "         Running libcoopa Test Suite       " << std::endl;
@@ -4799,6 +5353,8 @@ int main() {
     RUN_TEST(test_animation_property_registry);
     RUN_TEST(test_animator_plays_clip_on_transform);
     RUN_TEST(test_animator_channel_mask_preserves_other_channels);
+    RUN_TEST(test_animation_system_picks_up_spawned_animators);
+    RUN_TEST(test_scene_loader_async_read_and_incremental_build);
     RUN_TEST(test_animator_dedups_bindings_no_clobber);
     RUN_TEST(test_animator_wrap_modes);
     RUN_TEST(test_animator_crossfade_blends);
@@ -4809,6 +5365,14 @@ int main() {
     RUN_TEST(test_animation_system_parallel_matches_serial);
     RUN_TEST(test_procedural_orbit_matches_closed_form);
     RUN_TEST(test_procedural_crossfade_against_keyframed);
+    RUN_TEST(test_animation_events_loop_exact_counts);
+    RUN_TEST(test_animation_events_pingpong_and_once);
+    RUN_TEST(test_animation_events_crossfade_only_target_fires);
+    RUN_TEST(test_animation_clip_events_root_motion_yaml);
+    RUN_TEST(test_animation_root_motion_across_loop_boundary);
+    RUN_TEST(test_animation_root_motion_yaw_and_receiver);
+    RUN_TEST(test_ik_two_bone_reach_and_pole);
+    RUN_TEST(test_ik_look_at_clamps);
     // Run last: registers the "Animator" SceneLoader parser with a closure
     // capturing a local AssetManager, and tears both down at the end.
     RUN_TEST(test_animator_scene_yaml_registration);

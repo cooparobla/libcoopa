@@ -116,6 +116,26 @@ inline AnimationClip parse_clip(const fkyaml::node& root) {
             clip.tracks.push_back(parse_track(track_node));
         }
     }
+    if (node.contains("events") && node.at("events").is_sequence()) {
+        for (const auto& ev_node : node.at("events")) {
+            if (!ev_node.is_mapping()) continue;
+            AnimationEvent ev;
+            if (ev_node.contains("time")) ev.time = ev_node.at("time").get_value<float>();
+            if (ev_node.contains("name")) ev.name = ev_node.at("name").get_value<std::string>();
+            if (ev_node.contains("string")) ev.string_value = ev_node.at("string").get_value<std::string>();
+            if (ev_node.contains("float")) ev.float_value = ev_node.at("float").get_value<float>();
+            clip.events.push_back(std::move(ev));
+        }
+        clip.sort_events();
+    }
+    if (node.contains("root_motion") && node.at("root_motion").is_mapping()) {
+        const auto& rm = node.at("root_motion");
+        if (rm.contains("object")) clip.root_motion.object = rm.at("object").get_value<std::string>();
+        if (rm.contains("translation")) {
+            clip.root_motion.translation = parse_root_motion_translation(rm.at("translation").get_value<std::string>());
+        }
+        if (rm.contains("rotation")) clip.root_motion.yaw = rm.at("rotation").get_value<std::string>() == "yaw";
+    }
     return clip;
 }
 

@@ -70,6 +70,57 @@ struct AnimationTrack {
 };
 
 /**
+ * @struct AnimationEvent
+ * @brief A named marker on a clip's timeline, fired by an Animator when its playhead crosses `time`.
+ *
+ * Delivered through Animator::on_event and posted to the scene EventBus as signal
+ * "anim_event" (object = the Animator's owner name; args name / string / float / state).
+ * The payload fields are free-form: a footstep might carry `string_value: left`.
+ */
+struct AnimationEvent {
+    float       time = 0.0f;   ///< Seconds into the clip, in [0, length].
+    std::string name;
+    std::string string_value;
+    float       float_value = 0.0f;
+};
+
+/**
+ * @enum RootMotionTranslation
+ * @brief Which channels of the root bone's position a clip hands over as root motion.
+ */
+enum class RootMotionTranslation : uint8_t {
+    None, ///< Translation stays on the bone.
+    XY,   ///< Ground-plane travel (the engine is Z-up); vertical bob stays on the bone.
+    XYZ,  ///< All three channels.
+};
+
+/** @brief Parses a RootMotionTranslation ("xy" / "xyz" / "none"). Defaults to XY. */
+inline RootMotionTranslation parse_root_motion_translation(const std::string& s) {
+    if (s == "none") return RootMotionTranslation::None;
+    if (s == "xyz") return RootMotionTranslation::XYZ;
+    return RootMotionTranslation::XY;
+}
+
+/**
+ * @struct RootMotionSpec
+ * @brief A clip's `root_motion:` block: which bone's travel is extracted as root motion.
+ *
+ * The root bone's keyframed `position` (or `position.<channels>`) and `rotation_quat` tracks
+ * are sampled at the previous and new playback times every frame; the difference is the
+ * Animator's root_motion_delta(), and the extracted channels are held at their clip-start
+ * value on the bone (so the mesh stays over its owner while the owner travels).
+ */
+struct RootMotionSpec {
+    std::string           object;                                   ///< Bone path, resolved like a track's object_path. Empty = disabled.
+    RootMotionTranslation translation = RootMotionTranslation::XY;
+    bool                  yaw = false;                              ///< Extract rotation about +Z (`rotation: yaw`).
+
+    bool enabled() const {
+        return !object.empty() && (translation != RootMotionTranslation::None || yaw);
+    }
+};
+
+/**
  * @class AnimationClip
  * @brief Immutable, shareable animation data — the payload behind AssetHandle<AnimationClip>.
  *
@@ -84,6 +135,14 @@ public:
     std::string            name;
     WrapMode                wrap = WrapMode::Loop;
     std::vector<AnimationTrack> tracks;
+    std::vector<AnimationEvent> events;      ///< Sorted by time (see sort_events()).
+    RootMotionSpec              root_motion;
+
+    /** @brief Orders events by time (stable, so same-time events keep authoring order). */
+    void sort_events() {
+        std::stable_sort(events.begin(), events.end(),
+                         [](const AnimationEvent& a, const AnimationEvent& b) { return a.time < b.time; });
+    }
 
     /**
      * @brief Sets an explicit length (e.g. from the clip's `length:` YAML field).

@@ -63,8 +63,12 @@
 #include <coopa/scene/components/transform_component.h>
 
 #include <fkYAML/node.hpp>
+#include <coopa/job/engine.h>
 #include <coopa/yaml/document.h>
 
+#include <atomic>
+#include <chrono>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <memory>
@@ -77,6 +81,16 @@
 
 namespace coopa {
 namespace scene {
+
+/**
+ * @brief How SceneLoader builds a scene from its document (SceneLoader::LoadOptions).
+ */
+struct SceneLoaderOptions {
+    /// Call Scene::start() once every object is built (the default, and what load() has always
+    /// done). Off builds the scene unstarted: the caller installs its systems and starts it
+    /// later -- an async load activates the scene frames after building it.
+    bool start = true;
+};
 
 /**
  * @class SceneLoader
@@ -188,11 +202,181 @@ public:
      * @return Fully constructed Scene.
      * @throws std::runtime_error on parse errors or missing files.
      */
-    static Scene load(const std::string& path) {
-        fkyaml::node root = SceneInheritance::resolve(
-            path, [](const std::string& p) { return load_node_(p); });
-        return build_(root, path);
+    static Scene load(const std::string& path) { return load(path, LoadOptions{}); }
+
+    /** @brief How a scene is built from its document -- see SceneLoaderOptions. */
+    using LoadOptions = SceneLoaderOptions;
+
+    /** @brief load(), with LoadOptions (e.g. `{.start = false}` for an unstarted scene). */
+    static Scene load(const std::string& path, const LoadOptions& options) {
+        return build_(read_document(path), path, options);
     }
+
+    /**
+     * @brief Reads a scene file and expands every `inherit_from` / `prefab` reference into one
+     *        fully-merged document -- everything load() does before it builds objects.
+     *
+     * Pure document work (file reads, the registered decoders, fkYAML, SceneInheritance), so it
+     * is safe on a worker thread -- unless a custom document loader (set_document_loader()) is
+     * installed that is not. Component parsers are never run here.
+     *
+     * @throws std::runtime_error on a missing file or a parse error.
+     */
+    static fkyaml::node read_document(const std::string& path) {
+        return SceneInheritance::resolve(path, [](const std::string& p) { return load_node_(p); });
+    }
+
+    /**
+     * @brief The result of read_document_async(): poll ready() each frame, then read
+     *        document() (or error() when failed()). Shared with the job that fills it.
+     */
+    class DocumentRead {
+    public:
+        /// True once the read has finished, successfully or not.
+        bool ready() const { return done_.load(std::memory_order_acquire); }
+        /// True when ready() and the read threw; error() says why.
+        bool failed() const { return ready() && failed_; }
+        const std::string& error() const { return error_; }
+        /// The resolved document (read_document()'s result). Only valid once ready() && !failed().
+        const fkyaml::node& document() const { return document_; }
+        /// The scene file it was read from.
+        const std::string& path() const { return path_; }
+
+    private:
+        friend class SceneLoader;
+        std::string       path_;
+        fkyaml::node      document_;
+        std::string       error_;
+        bool              failed_ = false;
+        std::atomic<bool> done_{false};
+
+        void run_() {
+            try {
+                document_ = read_document(path_);
+            } catch (const std::exception& e) {
+                failed_ = true;
+                error_  = e.what();
+            }
+            done_.store(true, std::memory_order_release);
+        }
+    };
+
+    /**
+     * @brief read_document() on a job: the file read, decode and inheritance expansion run on
+     *        `jobs`' workers (Low priority, like asset decodes) while the caller keeps ticking.
+     *
+     * With no JobEngine the read happens inline and the result comes back already ready().
+     * The returned object stays valid however long the job takes; dropping it early is safe
+     * (the job finishes into its own copy and nothing reads it).
+     */
+    static std::shared_ptr<DocumentRead> read_document_async(const std::string& path, coopa::job::JobEngine* jobs) {
+        auto read = std::make_shared<DocumentRead>();
+        read->path_ = path;
+        if (!jobs) {
+            read->run_();
+            return read;
+        }
+        coopa::job::JobHandle handle = jobs->create_handle();
+        if (!handle.is_valid()) {   // handle pool exhausted: read inline rather than fail
+            read->run_();
+            return read;
+        }
+        jobs->submit([read]() { read->run_(); }, k_document_job_type, handle, nullptr, 0u, coopa::job::Priority::Low);
+        // Completion is tracked by DocumentRead::ready(), so the handle can be closed right away;
+        // its slot is reclaimed when the job finishes (see coopa/job/handle.h).
+        handle.close();
+        return read;
+    }
+
+    /**
+     * @class Builder
+     * @brief Builds a Scene from a resolved document a few root objects at a time, so a large
+     *        scene can be constructed across several frames while another one keeps running.
+     *
+     * Component parsers run here, so this is main-thread work, like load(). Each step() builds
+     * whole root objects (children included) until its time budget is spent -- always at least
+     * one, so every call makes progress. The scene is not started unless LoadOptions::start
+     * is set, and then only when take() hands it over.
+     *
+     * @code
+     * SceneLoader::Builder b(SceneLoader::read_document(path), path, {.start = false});
+     * while (!b.step(4.0)) render_a_frame();
+     * std::unique_ptr<Scene> scene = b.take();
+     * @endcode
+     */
+    class Builder {
+    public:
+        /**
+         * @param document A resolved scene document (read_document() / DocumentRead::document()).
+         * @param path     The scene file's path, for relative asset paths.
+         * @param options  LoadOptions; `start` is applied by take().
+         */
+        Builder(fkyaml::node document, std::string path, LoadOptions options = {})
+            : document_(std::move(document)), path_(std::move(path)), options_(options),
+              ctx_{ path_, std::filesystem::path(path_).parent_path().string(),
+                    { std::filesystem::path(path_).parent_path().string() } }
+        {
+            std::string scene_name = "Scene";
+            if (document_.contains("scene")) {
+                const auto& scene_node = document_.at("scene");
+                if (scene_node.contains("scene_name")) scene_name = scene_node.at("scene_name").get_value<std::string>();
+                if (scene_node.contains("auto_transform")) auto_transform_ = scene_node.at("auto_transform").get_value<bool>();
+                if (scene_node.contains("root_objects") && scene_node.at("root_objects").is_sequence()) {
+                    total_ = scene_node.at("root_objects").size();
+                }
+            }
+            scene_ = std::make_unique<Scene>(scene_name);
+        }
+
+        /**
+         * @brief Builds root objects until `budget_ms` of wall time has passed (at least one).
+         * @return True once every root object is built (done()).
+         * @throws whatever a component parser throws; the builder is then unusable.
+         */
+        bool step(double budget_ms) {
+            if (done()) return true;
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto& roots = document_.at("scene").at("root_objects");
+            do {
+                scene_->add_root_object(parse_object_(roots[built_], nullptr, auto_transform_, ctx_));
+                ++built_;
+            } while (!done() && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() < budget_ms);
+            return done();
+        }
+
+        /** @brief Builds everything that is left in one go. */
+        void finish() { step(std::numeric_limits<double>::infinity()); }
+
+        bool   done() const  { return built_ >= total_; }
+        /// Root objects built so far, of total().
+        size_t built() const { return built_; }
+        size_t total() const { return total_; }
+        /// built() / total(), 1 for an empty scene.
+        float  progress() const { return total_ == 0 ? 1.0f : static_cast<float>(built_) / static_cast<float>(total_); }
+
+        /// The scene being built (not yet started), for a caller that wants to look at it early.
+        Scene* scene() const { return scene_.get(); }
+
+        /**
+         * @brief Hands over the built scene, starting it first if LoadOptions::start is set.
+         *        Builds whatever is left if called before done(). Call once.
+         */
+        std::unique_ptr<Scene> take() {
+            if (!done()) finish();
+            if (options_.start && scene_) scene_->start();
+            return std::move(scene_);
+        }
+
+    private:
+        fkyaml::node           document_;
+        std::string            path_;
+        LoadOptions            options_;
+        ParseContext           ctx_;
+        std::unique_ptr<Scene> scene_;
+        bool                   auto_transform_ = true;
+        size_t                 total_ = 0;
+        size_t                 built_ = 0;
+    };
 
     /**
      * @brief Builds a scene from an already-parsed (not yet inheritance-resolved) document.
@@ -214,7 +398,7 @@ public:
             if (std::filesystem::weakly_canonical(p, ec2) == self || p == path) return root;
             return load_node_(p);
         });
-        return build_(resolved, path);
+        return build_(resolved, path, LoadOptions{});
     }
 
     /**
@@ -307,37 +491,15 @@ public:
     }
 
 private:
-    static Scene build_(const fkyaml::node& root, const std::string& path) {
-        std::filesystem::path scene_path(path);
-        std::filesystem::path scene_dir = scene_path.parent_path();
-        ParseContext ctx{ path, scene_dir.string(), { scene_dir.string() } };
-
-        std::string scene_name = "Scene";
-        bool auto_transform = true;
-        if (root.contains("scene")) {
-            const auto& scene_node = root.at("scene");
-            if (scene_node.contains("scene_name")) {
-                scene_name = scene_node.at("scene_name").get_value<std::string>();
-            }
-            if (scene_node.contains("auto_transform")) {
-                auto_transform = scene_node.at("auto_transform").get_value<bool>();
-            }
-        }
-
-        Scene scene(scene_name);
-
-        if (!root.contains("scene") || !root.at("scene").contains("root_objects")) {
-            return scene; // Empty scene is valid.
-        }
-
-        for (const auto& obj_node : root.at("scene").at("root_objects")) {
-            auto obj = parse_object_(obj_node, nullptr, auto_transform, ctx);
-            scene.add_root_object(std::move(obj));
-        }
-
-        scene.start();
-        return scene;
+    static Scene build_(const fkyaml::node& root, const std::string& path, const LoadOptions& options) {
+        Builder builder(root, path, options);
+        builder.finish();
+        return std::move(*builder.take());
     }
+
+    /// Job type for read_document_async()'s jobs: >= k_max_job_types, so like the asset IO jobs
+    /// it opts out of thread dedication and the diagnostics counters.
+    static constexpr coopa::job::JobType k_document_job_type = 0x5CE0D0C0u;
 
 public:
     /**

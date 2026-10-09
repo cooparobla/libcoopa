@@ -40,7 +40,8 @@ namespace anim {
  *                    touches no Component, only const clip data and a
  *                    caller-owned scratch buffer.
  *   3. apply_()    — serial, main thread: writes the accumulated result onto
- *                    every binding's target Component.
+ *                    every binding's target Component, then hands the frame's root
+ *                    motion to the owner (Animator::apply_root_motion).
  *
  * Never calls JobEngine::begin_frame()/end_frame() (diagnostics-only; see
  * coopa/job/handle.h). This system only ever calls
@@ -54,8 +55,13 @@ public:
     void on_attach(coopa::scene::Scene&) override { dirty_ = true; }
 
     void execute(coopa::scene::Scene& scene, const coopa::scene::FrameContext& ctx) override {
-        if (dirty_) {
+        // Re-gather when told to, or when any Animator was created or destroyed since the last
+        // gather (Animator::generation()): a rig spawned at runtime starts animating on its own,
+        // and a destroyed one is never touched again. One atomic load per frame otherwise.
+        const uint64_t generation = Animator::generation();
+        if (dirty_ || generation != gathered_generation_) {
             animators_ = scene.get_components<Animator>();
+            gathered_generation_ = generation;
             dirty_ = false;
         }
 
@@ -81,6 +87,7 @@ public:
 
         for (size_t i = 0; i < animators_.size(); ++i) {
             animators_[i]->apply_(scratch_.data() + offsets_[i]);
+            animators_[i]->apply_root_motion_();
         }
     }
 
@@ -97,7 +104,11 @@ public:
     /** @brief How many Animators' worth of evaluate_() calls go into one job. Default 32. */
     void set_chunk_size(size_t animators) { chunk_size_ = animators > 0 ? animators : 1; }
 
-    /** @brief Re-gathers the Animator list. Call after adding/removing Animators or toggling set_active(). */
+    /**
+     * @brief Re-gathers the Animator list next frame. Animators created or destroyed anywhere
+     *        are picked up automatically (see execute()); call this after toggling an
+     *        animated object's set_active(), which the automatic check does not see.
+     */
     void refresh() { dirty_ = true; }
 
     size_t animator_count() const { return animators_.size(); }
@@ -149,6 +160,7 @@ private:
     size_t                 parallel_threshold_ = 256;
     size_t                 chunk_size_         = 32;
     bool                   dirty_              = true;
+    uint64_t               gathered_generation_ = 0;
 };
 
 /**

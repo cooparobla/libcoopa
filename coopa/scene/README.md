@@ -224,6 +224,12 @@ Parser for YAML scene files:
   declared them — see Scene Inheritance below.
 - Before any of this runs, `SceneInheritance::resolve()` expands every
   `inherit_from` in the raw document into one merged node (see below).
+- Async loading in pieces: `read_document(path)` is that document step on its
+  own (pure fkYAML + file reads, worker-safe), `read_document_async(path, jobs)`
+  runs it on a JobEngine job and returns a `DocumentRead` to poll, and
+  `SceneLoader::Builder` builds the resolved document a few root objects per
+  `step(budget_ms)` on the main thread. `LoadOptions{.start = false}` (also on
+  `load(path, options)`) builds a scene without calling `start()`.
 
 ### [`scene_inherit.h`](scene_inherit.h)
 

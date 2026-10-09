@@ -19,6 +19,7 @@
 #include <coopa/job/handle.h>
 
 #include <memory>
+#include <chrono>
 #include <string>
 #include <typeindex>
 #include <unordered_map>
@@ -445,12 +446,24 @@ public:
      * might reference a previous frame's assets has been submitted.
      *
      * @param delta_time Frame delta time in seconds; only used for hot-reload poll timing.
+     * @param finalize_budget_ms Caps the main-thread finalize() time this call spends (GPU
+     *        uploads, mostly): once it is used up, the remaining decoded loads wait for the next
+     *        update(). At least one load is finalized per call, so loading always progresses.
+     *        Negative (the default) finalizes everything that is ready.
      */
-    void update(float delta_time = 0.0f) {
+    void update(float delta_time = 0.0f, float finalize_budget_ms = -1.0f) {
+        const bool budgeted = finalize_budget_ms >= 0.0f;
+        const auto t0 = budgeted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        bool finalized_any = false;
         for (auto it = pending_.begin(); it != pending_.end();) {
+            if (budgeted && finalized_any &&
+                std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count() >= finalize_budget_ms) {
+                break;
+            }
             if (it->second.handle.is_complete()) {
                 complete_pending_(it->second);
                 it = pending_.erase(it);
+                finalized_any = true;
             } else {
                 ++it;
             }
