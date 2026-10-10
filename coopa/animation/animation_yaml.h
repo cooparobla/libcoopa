@@ -12,6 +12,7 @@
 #include <coopa/asset/asset_manager.h>
 #include <coopa/scene/scene_loader.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -19,7 +20,7 @@ namespace coopa {
 namespace anim {
 
 /**
- * @brief Registers the "TwoBoneIK" and "LookAtIK" scene component parsers (see
+ * @brief Registers the "TwoBoneIK", "ChainIK" and "LookAtIK" scene component parsers (see
  *        ik_components.h for the keys). Called by register_animation_components(); the solver
  *        system itself is installed separately (install_ik_system(), ik_system.h).
  */
@@ -29,6 +30,12 @@ inline void register_ik_components() {
     };
     auto read_float = [](const fkyaml::node& n, const char* key, float& out) {
         if (n.contains(key)) out = n.at(key).get_value<float>();
+    };
+    auto read_bool = [](const fkyaml::node& n, const char* key, bool& out) {
+        if (n.contains(key)) out = n.at(key).get_value<bool>();
+    };
+    auto read_int = [](const fkyaml::node& n, const char* key, int& out) {
+        if (n.contains(key)) out = static_cast<int>(n.at(key).get_value<int64_t>());
     };
     auto read_vec3 = [](const fkyaml::node& n, const char* key, glm::vec3& out) {
         if (!n.contains(key)) return;
@@ -48,6 +55,22 @@ inline void register_ik_components() {
             read_str(node, "pole", ik->pole);
             read_float(node, "weight", ik->weight);
             read_float(node, "soft_limit", ik->soft_limit);
+            read_bool(node, "match_target_rotation", ik->match_target_rotation);
+            read_int(node, "priority", ik->priority);
+        });
+
+    coopa::scene::SceneLoader::register_component_parser(
+        "ChainIK",
+        [=](const fkyaml::node& node, coopa::scene::SceneObject& obj, const coopa::scene::SceneLoader::ParseContext&) {
+            auto* ik = obj.add_component<ChainIK>();
+            read_str(node, "root", ik->root);
+            read_str(node, "tip", ik->tip);
+            read_str(node, "target", ik->target);
+            read_float(node, "weight", ik->weight);
+            read_int(node, "iterations", ik->iterations);
+            read_float(node, "tolerance", ik->tolerance);
+            read_bool(node, "match_target_rotation", ik->match_target_rotation);
+            read_int(node, "priority", ik->priority);
         });
 
     coopa::scene::SceneLoader::register_component_parser(
@@ -61,6 +84,7 @@ inline void register_ik_components() {
             read_float(node, "max_angle", ik->max_angle);
             read_float(node, "weight", ik->weight);
             read_float(node, "smoothing", ik->smoothing);
+            read_int(node, "priority", ik->priority);
         });
 }
 

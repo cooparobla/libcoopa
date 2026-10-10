@@ -236,8 +236,10 @@ Only keyframed root tracks are extracted (procedural ones are ignored).
 
 `ik.h` is the math, scene-free: `solve_two_bone()` (law of cosines; the middle joint goes in the
 plane of root, target and pole, on the pole's side; `soft_reach()` eases the last `softness` of the
-chain's length so a knee never pops straight), `look_at_delta()` (clamped to `max_angle`, keeping
-the bone's up axis from rolling) and the world/local rotation helpers.
+chain's length so a knee never pops straight), `solve_chain()` (FABRIK over any number of joints:
+the root stays, every segment keeps its length, and from the input pose each joint moves the least
+it can), `look_at_delta()` (clamped to `max_angle`, keeping the bone's up axis from rolling) and the
+world/local rotation helpers.
 
 `ik_components.h` wraps it:
 
@@ -250,6 +252,14 @@ the bone's up axis from rolling) and the world/local rotation helpers.
   pole: elbow_pole                     # optional
   weight: 1.0
   soft_limit: 0.02
+  match_target_rotation: false         # true: the end bone also takes the target's rotation
+- type: ChainIK                        # a chain of any length: a spine, a neck, a tail
+  root: spine                          # the chain is root and its descendants down to tip
+  tip: spine/chest/neck                # its origin reaches the target
+  target: chest_target
+  iterations: 10                       # FABRIK passes at most
+  tolerance: 0.001
+  match_target_rotation: true          # the tip also takes the target's rotation
 - type: LookAtIK
   bone: neck/head                      # empty = this object
   target: look_target
@@ -263,8 +273,19 @@ the bone's up axis from rolling) and the world/local rotation helpers.
 `IkSystem` (`ik_system.h`, `install_ik_system()`, order **320** -- between Animation 300 and
 TransformResolve 350) gathers them with one scene walk per frame (spawned rigs need no refresh)
 and runs `IkDriver::ik_pre_solve()` (drivers such as toyengine's `FootIK` set targets there), every
-`TwoBoneIK`, every `LookAtIK`, then `IkDriver::ik_post_solve()`. Solvers read the live pose through
+solver, then `IkDriver::ik_post_solve()`. Solvers run by `priority` (any solver; lower first,
+default 0); equal priorities run every `ChainIK`, then every `TwoBoneIK`, then every `LookAtIK`, each
+in scene pre-order -- a spine settles before the arms hanging from it, and a head turn rides on
+both (`IkSystem::solve_order()` lists the frame's order). Solvers read the live pose through
 `get_world_matrix()`, which re-walks any parent chain dirtied by the Animator or an earlier solve.
+
+**A fully IK rig** is the same components at weight 1 with every limb and the spine driven: the
+Animator keys only target empties, and IK poses every bone from them. Hang the targets the way the
+bones they stand for hang -- foot targets and knee poles from the rig's root (a planted foot stays
+put), hand / chest / look targets from the pelvis (a lowered pelvis carries them) -- and set
+`match_target_rotation` where a bone's own orientation matters (hands, feet, the chest). toyengine's
+`objects/characters/mannequin_ik` is the worked example (`tools/gen_mannequin.py` bakes its target
+clips from the keyframed mannequin's, so the two move alike).
 
 IK overrides the animated pose. A bone no clip animates would feed last frame's IK output back in
 as this frame's input, so each solved bone remembers what it wrote (`IkPoseGuard`) and restores the
@@ -272,7 +293,7 @@ pre-IK rotation when it finds that value untouched -- weight 0 always returns ex
 pose, and clamps (look-at `max_angle`) are always relative to the animated pose. A driver that reads
 the animated pose before choosing targets calls `TwoBoneIK::restore_input()` first.
 
-`register_animation_components()` also registers the `TwoBoneIK` / `LookAtIK` parsers.
+`register_animation_components()` also registers the `TwoBoneIK` / `ChainIK` / `LookAtIK` parsers.
 
 ---
 

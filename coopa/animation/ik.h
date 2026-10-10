@@ -1,8 +1,9 @@
 /**
  * @file ik.h
  * @brief Inverse-kinematics math: an analytic two-bone solver with a pole vector and a soft
- *        reach limit, and a clamped look-at. Pure glm -- no scene types -- so it is testable on
- *        its own; ik_components.h wraps it as TwoBoneIK / LookAtIK components.
+ *        reach limit, a FABRIK solver for chains of any length, and a clamped look-at. Pure
+ *        glm -- no scene types -- so it is testable on its own; ik_components.h wraps it as
+ *        TwoBoneIK / ChainIK / LookAtIK components.
  *
  * Everything here works on WORLD-space joint positions and returns WORLD-space rotation deltas
  * (pre-multiplied onto a bone's world rotation). to_local_delta() turns one into the new local
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace coopa {
 namespace anim {
@@ -142,6 +144,55 @@ inline TwoBoneResult solve_two_bone(const glm::vec3& a, const glm::vec3& b, cons
     const glm::vec3 c_after = a + r.upper_delta * (c - a);   // the end, carried by the upper swing
     r.lower_delta = rotation_between(glm::normalize(c_after - r.mid), glm::normalize(r.end - r.mid));
     return r;
+}
+
+/**
+ * @brief FABRIK (forward-and-backward reaching IK) over a chain of any length.
+ *
+ * @param joints World positions of the chain's joints, root first, the end effector last. On
+ *        return, the solved positions: the root stays where it was, every segment keeps its
+ *        length, and the end lies on the target -- or, out of reach, the chain points straight
+ *        at it.
+ * @param target Where the end effector should go.
+ * @param iterations Forward/backward passes at most.
+ * @param tolerance Stop once the end is this close to the target (world units).
+ * @return Whether the end reached the target within `tolerance`.
+ *
+ * Starting from the input pose, FABRIK moves each joint the least it can, so a chain keeps the
+ * bend it was animated with wherever the target leaves a choice -- a spine that leans forward
+ * stays leaning forward rather than snapping to some canonical shape.
+ */
+inline bool solve_chain(std::vector<glm::vec3>& joints, const glm::vec3& target, int iterations = 10,
+                        float tolerance = 1e-3f) {
+    const size_t n = joints.size();
+    if (n < 2) return false;
+    std::vector<float> len(n - 1);
+    float total = 0.0f;
+    for (size_t i = 0; i + 1 < n; ++i) {
+        len[i] = glm::length(joints[i + 1] - joints[i]);
+        total += len[i];
+    }
+    const glm::vec3 root = joints[0];
+    if (glm::length(target - root) >= total) {
+        // Out of reach: straighten toward the target.
+        glm::vec3 dir = target - root;
+        dir = glm::dot(dir, dir) > 1e-12f ? glm::normalize(dir) : glm::vec3(0.0f, 0.0f, 1.0f);
+        for (size_t i = 0; i + 1 < n; ++i) joints[i + 1] = joints[i] + dir * len[i];
+        return false;
+    }
+    auto place = [](const glm::vec3& from, const glm::vec3& toward, float l) {
+        const glm::vec3 d = toward - from;
+        const float dl = glm::length(d);
+        return dl > 1e-9f ? from + d * (l / dl) : from;
+    };
+    for (int it = 0; it < std::max(iterations, 1); ++it) {
+        if (glm::length(joints[n - 1] - target) <= tolerance) return true;
+        joints[n - 1] = target;                                       // backward: end to root
+        for (size_t i = n - 1; i-- > 0;) joints[i] = place(joints[i + 1], joints[i], len[i]);
+        joints[0] = root;                                             // forward: root to end
+        for (size_t i = 0; i + 1 < n; ++i) joints[i + 1] = place(joints[i], joints[i + 1], len[i]);
+    }
+    return glm::length(joints[n - 1] - target) <= tolerance;
 }
 
 /**

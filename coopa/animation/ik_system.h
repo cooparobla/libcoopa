@@ -1,15 +1,16 @@
 /**
  * @file ik_system.h
- * @brief IkSystem: solves every TwoBoneIK / LookAtIK in the scene each frame, between the
+ * @brief IkSystem: solves every ChainIK / TwoBoneIK / LookAtIK in the scene each frame, between the
  *        Animation phase (300, which writes the animated pose) and TransformResolve (350, which
  *        resolves world matrices for rendering).
  *
  * Order within a frame:
  *   1. IkDriver::ik_pre_solve() on every driver (e.g. FootIK: ground probes, pelvis offset,
  *      leg targets),
- *   2. every TwoBoneIK, in scene pre-order,
- *   3. every LookAtIK, in scene pre-order (so a head turn rides on any arm/spine solve above it),
- *   4. IkDriver::ik_post_solve() (e.g. FootIK aligning the feet to the ground normal).
+ *   2. every solver, by `priority` (lower first); equal priorities run every ChainIK, then every
+ *      TwoBoneIK, then every LookAtIK, each in scene pre-order -- a spine settles before the arms
+ *      hanging from it, and a head turn rides on both,
+ *   3. IkDriver::ik_post_solve() (e.g. FootIK aligning the feet to the ground normal).
  *
  * Solvers read world positions through TransformComponent::get_world_matrix(), which re-walks
  * any parent chain dirtied by the Animator or an earlier solve -- so each chain sees the pose as
@@ -27,6 +28,7 @@
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_system.h>
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -46,8 +48,8 @@ public:
 
     void execute(coopa::scene::Scene& scene, const coopa::scene::FrameContext& ctx) override {
         drivers_.clear();
-        two_bone_.clear();
-        look_at_.clear();
+        solvers_.clear();
+        chain_count_ = two_bone_count_ = look_at_count_ = 0;
         for (const auto& root : scene.root_objects()) {
             root->for_each_recursive([this](const coopa::scene::SceneObject& obj) {
                 if (!obj.active()) return;
@@ -55,28 +57,36 @@ public:
                     auto* ik = dynamic_cast<IkComponent*>(comp.get());
                     if (!ik) continue;
                     switch (ik->ik_kind()) {
-                        case IkComponent::Kind::TwoBone: two_bone_.push_back(static_cast<TwoBoneIK*>(ik)); break;
-                        case IkComponent::Kind::LookAt: look_at_.push_back(static_cast<LookAtIK*>(ik)); break;
                         case IkComponent::Kind::Driver: drivers_.push_back(static_cast<IkDriver*>(ik)); break;
+                        case IkComponent::Kind::Chain: ++chain_count_; solvers_.push_back(ik); break;
+                        case IkComponent::Kind::TwoBone: ++two_bone_count_; solvers_.push_back(ik); break;
+                        case IkComponent::Kind::LookAt: ++look_at_count_; solvers_.push_back(ik); break;
                     }
                 }
             });
         }
+        // Stable: scene pre-order within a (priority, kind) group.
+        std::stable_sort(solvers_.begin(), solvers_.end(), [](const IkComponent* a, const IkComponent* b) {
+            if (a->priority != b->priority) return a->priority < b->priority;
+            return static_cast<int>(a->ik_kind()) < static_cast<int>(b->ik_kind());
+        });
         const float dt = ctx.delta_time;
         for (IkDriver* d : drivers_) d->ik_pre_solve(dt);
-        for (TwoBoneIK* s : two_bone_) s->solve(dt);
-        for (LookAtIK* s : look_at_) s->solve(dt);
+        for (IkComponent* s : solvers_) s->solve(dt);
         for (IkDriver* d : drivers_) d->ik_post_solve(dt);
     }
 
-    size_t two_bone_count() const { return two_bone_.size(); }
-    size_t look_at_count() const { return look_at_.size(); }
+    size_t chain_count() const { return chain_count_; }
+    size_t two_bone_count() const { return two_bone_count_; }
+    size_t look_at_count() const { return look_at_count_; }
     size_t driver_count() const { return drivers_.size(); }
+    /** @brief This frame's solvers in solve order. */
+    const std::vector<IkComponent*>& solve_order() const { return solvers_; }
 
 private:
-    std::vector<IkDriver*>  drivers_;
-    std::vector<TwoBoneIK*> two_bone_;
-    std::vector<LookAtIK*>  look_at_;
+    std::vector<IkDriver*>    drivers_;
+    std::vector<IkComponent*> solvers_;
+    size_t chain_count_ = 0, two_bone_count_ = 0, look_at_count_ = 0;
 };
 
 /**
