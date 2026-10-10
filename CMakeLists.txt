@@ -38,6 +38,14 @@ target_compile_definitions(libcoopa_lib INTERFACE GLM_FORCE_DEPTH_ZERO_TO_ONE GL
 find_package(Threads REQUIRED)
 target_link_libraries(libcoopa_lib INTERFACE Threads::Threads)
 
+# --- Test framework ---
+# coopa/testing/test.h + this runner are what every coopa repo's tests (and toyengine's) are
+# written against: link coopa::test_main and register suites with coopa_add_test_suites().
+add_library(coopa_test_main STATIC ${CMAKE_CURRENT_SOURCE_DIR}/coopa/testing/test_main.cpp)
+add_library(coopa::test_main ALIAS coopa_test_main)
+target_link_libraries(coopa_test_main PUBLIC coopa::lib)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CoopaTesting.cmake)
+
 # Off by default so a consumer that add_subdirectory()s this library (e.g.
 # gfxcoopa) pays nothing for either unless it opts in.
 option(COOPA_JOB_DIAGNOSTICS "Enable JobEngine per-type job counters and thread/queue-depth snapshots" OFF)
@@ -49,10 +57,20 @@ if(COOPA_SCENE_THREAD_CHECKS)
     target_compile_definitions(libcoopa_lib INTERFACE COOPA_SCENE_THREAD_CHECKS)
 endif()
 
-# Add executable
-add_executable(libcoopa test.cpp)
-target_link_libraries(libcoopa PRIVATE coopa::lib)
-# Always exercised in this repo's own test build, regardless of the option
-# above's default, so the test suite actually catches a Scene single-owner
-# contract violation if one is ever introduced.
-target_compile_definitions(libcoopa PRIVATE COOPA_SCENE_THREAD_CHECKS)
+# --- Tests (standalone builds only) ---
+# One ctest entry per tests/<suite>_test.cpp (see coopa/testing/test.h). Only built when
+# libcoopa is the top-level project, so consumers that add_subdirectory() it never pay for it.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+    file(GLOB LIBCOOPA_TEST_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/*.cpp)
+    add_executable(libcoopa ${LIBCOOPA_TEST_SOURCES})
+    target_include_directories(libcoopa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(libcoopa PRIVATE coopa::lib coopa::test_main)
+    # Always exercised in this repo's own test build, regardless of the option
+    # above's default, so the test suite actually catches a Scene single-owner
+    # contract violation if one is ever introduced.
+    target_compile_definitions(libcoopa PRIVATE COOPA_SCENE_THREAD_CHECKS)
+    coopa_add_test_suites(libcoopa PREFIX libcoopa SOURCES ${LIBCOOPA_TEST_SOURCES} LABELS unit)
+endif()

@@ -168,16 +168,22 @@ Each module folder has a README with more examples. Start with
 
 ## Testing
 
-The repository builds one test executable, `libcoopa`, from [test.cpp](test.cpp). It covers
-every module and needs no window or GPU.
+The tests live in [tests/](tests/), one suite per system in `tests/<suite>_test.cpp`
+(`job_engine`, `dependency_graph`, `signal`, `asset_manager`, `scene_loader`, `animator`,
+`routine`, ...), with shared fixtures in `tests/support/`. They are written against the coopa
+test framework ([coopa/testing/test.h](coopa/testing/test.h)) and need no window or GPU. The
+`libcoopa` test executable is only built when libcoopa is the top-level CMake project.
 
 ```bash
-cmake -B build && cmake --build build -j
-./build/libcoopa
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target libcoopa -j
+ctest --test-dir build -j8 --output-on-failure   # one ctest entry per suite (libcoopa_<suite>)
+./build/libcoopa --suite signal                  # one suite; --list, -v and name filters also work
 ```
 
-It prints one line per test and a summary, and exits non-zero if any test fails. The test
-build always turns on `COOPA_SCENE_THREAD_CHECKS`.
+The test build always turns on `COOPA_SCENE_THREAD_CHECKS`. The job, deque, dependency-graph,
+signal and routine suites include concurrency and lifetime regression tests; they are most
+useful under ASan/TSan but assert their invariants (every job runs exactly once, nothing is
+touched after destruction) unconditionally.
 
 ## Project layout
 
@@ -199,7 +205,7 @@ coopa/
 └── util/         ids, strings, math, transforms, time, file paths
 includes/         vendored glm, fkYAML, parallel_hashmap
 configuration/    root_directory.h.in (generated into the build tree)
-test.cpp          the test suite
+tests/            test suites (one per system) and shared fixtures
 plans/            design notes
 ```
 
