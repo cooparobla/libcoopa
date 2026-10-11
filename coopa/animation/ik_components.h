@@ -152,7 +152,8 @@ public:
     enum class Kind { Driver, Chain, TwoBone, LookAt };
     virtual Kind ik_kind() const = 0;
 
-    /// Solve order across solvers: lower first. Ties: chains, then two-bone, then look-at.
+    /// Order: lower first. Solvers -- ties: chains, then two-bone, then look-at. Drivers run
+    /// their pre-/post-solves in this order too (ties: scene pre-order).
     int priority = 0;
 
     /** @brief One solve (solvers); drivers act through ik_pre_solve()/ik_post_solve() instead. */

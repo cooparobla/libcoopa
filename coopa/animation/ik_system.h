@@ -6,11 +6,14 @@
  *
  * Order within a frame:
  *   1. IkDriver::ik_pre_solve() on every driver (e.g. FootIK: ground probes, pelvis offset,
- *      leg targets),
+ *      leg targets), by `priority` (lower first; scene pre-order among equals) -- a driver that
+ *      reads a rig another driver poses (a rider seated on a horse whose FootIK pitches its body)
+ *      takes a higher priority,
  *   2. every solver, by `priority` (lower first); equal priorities run every ChainIK, then every
  *      TwoBoneIK, then every LookAtIK, each in scene pre-order -- a spine settles before the arms
  *      hanging from it, and a head turn rides on both,
- *   3. IkDriver::ik_post_solve() (e.g. FootIK aligning the feet to the ground normal).
+ *   3. IkDriver::ik_post_solve() (e.g. FootIK aligning the feet to the ground normal), in the
+ *      same order as step 1.
  *
  * Solvers read world positions through TransformComponent::get_world_matrix(), which re-walks
  * any parent chain dirtied by the Animator or an earlier solve -- so each chain sees the pose as
@@ -65,7 +68,11 @@ public:
                 }
             });
         }
-        // Stable: scene pre-order within a (priority, kind) group.
+        // Stable: scene pre-order among drivers of equal priority...
+        std::stable_sort(drivers_.begin(), drivers_.end(), [](const IkDriver* a, const IkDriver* b) {
+            return a->priority < b->priority;
+        });
+        // ...and within a (priority, kind) group of solvers.
         std::stable_sort(solvers_.begin(), solvers_.end(), [](const IkComponent* a, const IkComponent* b) {
             if (a->priority != b->priority) return a->priority < b->priority;
             return static_cast<int>(a->ik_kind()) < static_cast<int>(b->ik_kind());
@@ -80,6 +87,8 @@ public:
     size_t two_bone_count() const { return two_bone_count_; }
     size_t look_at_count() const { return look_at_count_; }
     size_t driver_count() const { return drivers_.size(); }
+    /** @brief This frame's drivers in pre-solve order. */
+    const std::vector<IkDriver*>& driver_order() const { return drivers_; }
     /** @brief This frame's solvers in solve order. */
     const std::vector<IkComponent*>& solve_order() const { return solvers_; }
 

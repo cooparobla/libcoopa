@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <string>
+#include <vector>
 
 COOPA_TEST_SUITE("ik");
 
@@ -140,4 +142,44 @@ COOPA_TEST(look_at_clamps_to_max_angle_without_roll_and_smooths_toward_target) {
     EXPECT_GT(glm::length(forward() - want2), 0.05f);
     step(scene, 1.0f / 60.0f, 120);
     EXPECT_LT(glm::length(forward() - want2), 1e-2f);
+}
+
+namespace {
+
+/** @brief A driver that logs its pre- and post-solves. */
+struct LoggingDriver : IkDriver {
+    std::string tag;
+    std::vector<std::string>* log = nullptr;
+    std::string type_name() const override { return "LoggingDriver"; }
+    void ik_pre_solve(float) override { log->push_back("pre:" + tag); }
+    void ik_post_solve(float) override { log->push_back("post:" + tag); }
+};
+
+} // namespace
+
+/**
+ * @brief Drivers run by `priority` (lower first), scene pre-order among equals -- so a driver
+ *        that reads a rig another driver poses (a rider on a horse whose FootIK pitches it) can
+ *        go after it whatever the scene order -- for the post-solves too.
+ */
+COOPA_TEST(drivers_run_by_priority_then_scene_order) {
+    Scene scene("ik_driver_order");
+    std::vector<std::string> log;
+    auto add = [&](const std::string& name, int priority) {
+        auto obj = std::make_unique<SceneObject>(name);
+        obj->add_component<TransformComponent>();
+        auto* d = obj->add_component<LoggingDriver>();
+        d->tag = name;
+        d->log = &log;
+        d->priority = priority;
+        scene.add_root_object(std::move(obj));
+    };
+    add("rider", 100);   // first in the scene, but reads the others' pose
+    add("horse", 0);
+    add("dog", 0);
+    scene.start();
+    install_ik_system(scene);
+    step(scene, 1.0f / 60.0f);
+    const std::vector<std::string> want = {"pre:horse", "pre:dog", "pre:rider", "post:horse", "post:dog", "post:rider"};
+    EXPECT_TRUE(log == want);
 }
