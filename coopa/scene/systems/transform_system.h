@@ -67,15 +67,14 @@ public:
             ctx.jobs->parallel_for_blocking(roots.size(), 1,
                 [&roots](size_t start, size_t end) {
                     for (size_t i = start; i < end; ++i) {
-                        resolve_subtree_(*roots[i]);
+                        resolve_subtree(*roots[i]);
                     }
                 });
         } else {
-            for (auto& root : roots) resolve_subtree_(*root);
+            for (auto& root : roots) resolve_subtree(*root);
         }
     }
 
-private:
     /**
      * @brief Recomputes `obj`'s Transform if dirty, then always recurses into
      *        every child regardless -- mark_dirty() only ever propagates
@@ -85,16 +84,30 @@ private:
      *        Pruning on this node's own dirty flag would silently skip that
      *        child.
      */
-    static void resolve_subtree_(SceneObject& obj) {
+    static void resolve_subtree(SceneObject& obj) {
         if (TransformComponent* tc = obj.get_transform()) {
             coopa::util::Transform& t = tc->transform();
             if (t.is_dirty()) t.recompute();
         }
         for (auto& child : obj.children()) {
-            resolve_subtree_(*child);
+            resolve_subtree(*child);
         }
     }
 };
+
+/**
+ * @brief Resolves every dirty Transform in `scene` right now, on the calling thread: the
+ *        TransformResolve pass, outside the update cycle.
+ *
+ * For a caller that builds or restructures a scene between an update and a render -- loading a
+ * scene, pushing one (the editor's Play), spawning or rebuilding an object from a UI callback --
+ * and so leaves world matrices dirty with no resolve pass left to run before the readers that
+ * take the cached Transform::world_matrix() (skinning, the render gather). Idempotent and cheap
+ * on an already-resolved scene: one tree walk, recomputing only what is dirty.
+ */
+inline void resolve_transforms(Scene& scene) {
+    for (auto& root : scene.root_objects()) TransformSystem::resolve_subtree(*root);
+}
 
 /**
  * @brief Constructs a TransformSystem and registers it at UpdatePhase::TransformResolve.
