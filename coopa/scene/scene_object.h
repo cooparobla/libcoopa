@@ -15,6 +15,8 @@
 #include <coopa/scene/component.h>
 #include <coopa/scene/components/transform_component.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
 #include <string>
@@ -62,7 +64,11 @@ public:
     bool active() const { return active_; }
 
     /** @brief Sets the active state. */
-    void set_active(bool active) { active_ = active; }
+    void set_active(bool active) {
+        if (active_ == active) return;
+        active_ = active;
+        notify_structure_changed_();
+    }
 
     /** @brief Returns the parent SceneObject (non-owning, may be nullptr). */
     SceneObject* parent() const { return parent_; }
@@ -85,6 +91,7 @@ public:
         comp->owner = this;
         T* raw = comp.get();
         components_.push_back(std::move(comp));
+        notify_structure_changed_();
         return raw;
     }
 
@@ -130,6 +137,7 @@ public:
         if (it == components_.end()) return false;
         (*it)->owner = nullptr;
         components_.erase(it);
+        notify_structure_changed_();
         return true;
     }
 
@@ -169,6 +177,7 @@ public:
     void attach_component(std::unique_ptr<Component> comp) {
         comp->owner = this;
         components_.push_back(std::move(comp));
+        notify_structure_changed_();
     }
 
     /** @brief Returns all components (read-only). */
@@ -222,6 +231,10 @@ public:
         child->parent_ = this;
         SceneObject* raw = child.get();
         children_.push_back(std::move(child));
+        // The added subtree joins this object's Scene (if any): it must share the Scene's
+        // structure counter so its own future edits invalidate the component caches too.
+        if (structure_hook_ != nullptr) raw->set_structure_hook(structure_hook_);
+        notify_structure_changed_();
         return raw;
     }
 
@@ -249,6 +262,7 @@ public:
         }
         children_.erase(it);
         detached->parent_ = nullptr;
+        notify_structure_changed_();
         return detached;
     }
 
@@ -286,6 +300,24 @@ public:
     const std::vector<std::unique_ptr<SceneObject>>& children() const { return children_; }
     /** @brief Returns the list of children (mutable). */
     std::vector<std::unique_ptr<SceneObject>>& children() { return children_; }
+
+    // --- Structure change tracking ---
+
+    /**
+     * @brief Points this object (and every descendant) at a scene-structure change counter.
+     *
+     * The owning Scene stamps this alongside Component::scene so that every structural edit --
+     * a component added or removed, a child attached or detached, an active flag flipped --
+     * bumps the Scene's counter and invalidates its cached component queries
+     * (Scene::get_components() et al.). add_child() propagates the parent's hook onto the added
+     * subtree, so an object spawned at runtime is covered from the moment it joins the tree.
+     * Null (the default, and for free-standing subtrees) makes the notifications no-ops.
+     *
+     * @param hook The counter to bump on structural changes, or nullptr to detach.
+     */
+    void set_structure_hook(std::atomic<std::uint64_t>* hook) {
+        for_each_recursive([hook](SceneObject& o) { o.structure_hook_ = hook; });
+    }
 
     /**
      * @brief Depth-first traversal of this object and all descendants.
@@ -392,11 +424,18 @@ public:
     }
 
 private:
+    /** @brief Bumps the owning Scene's structure counter -- see set_structure_hook(). */
+    void notify_structure_changed_() {
+        if (structure_hook_ != nullptr) structure_hook_->fetch_add(1, std::memory_order_relaxed);
+    }
+
     std::string                              name_;       /**< Object name. */
     bool                                     active_;     /**< Whether updates/rendering are active. */
     SceneObject*                             parent_;     /**< Non-owning parent pointer. */
     std::vector<std::unique_ptr<Component>>  components_; /**< Owned components. */
     std::vector<std::unique_ptr<SceneObject>>children_;  /**< Owned children. */
+    /** @brief The owning Scene's structure change counter, or null -- see set_structure_hook(). */
+    std::atomic<std::uint64_t>*              structure_hook_ = nullptr;
 };
 
 } // namespace scene

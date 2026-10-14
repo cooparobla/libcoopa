@@ -27,8 +27,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
 #include <thread>
+#include <typeindex>
+#include <unordered_map>
 
 #ifdef COOPA_SCENE_THREAD_CHECKS
 /// @brief Declares a scoped ownership check at the top of a Scene method.
@@ -142,6 +147,9 @@ public:
           worker_commands_(std::move(other.worker_commands_))
     {
         other.jobs_ = nullptr;
+        // The component cache is NOT moved: every SceneObject's structure hook must point at
+        // THIS Scene's counter (restamp below), and the fresh cache simply rebuilds on first
+        // query. structure_revision_ starts ahead of every (empty) cache entry.
         restamp_scene_pointers_();
     }
 
@@ -156,6 +164,12 @@ public:
         frame_index_.store(other.frame_index_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         worker_commands_  = std::move(other.worker_commands_);
         other.jobs_ = nullptr;
+        {
+            // Entries cached for the hierarchy this Scene owned before the assignment.
+            std::lock_guard<std::mutex> lock(component_cache_mutex_);
+            component_cache_.clear();
+        }
+        structure_revision_.fetch_add(1, std::memory_order_relaxed);
         restamp_scene_pointers_();
         return *this;
     }
@@ -174,6 +188,8 @@ public:
         COOPA_SCENE_ACCESS_GUARD(*this);
         SceneObject* raw = obj.get();
         root_objects_.push_back(std::move(obj));
+        raw->set_structure_hook(&structure_revision_);
+        bump_structure_revision();
         return raw;
     }
 
@@ -187,6 +203,7 @@ public:
             [obj](const std::unique_ptr<SceneObject>& o) { return o.get() == obj; });
         if (it == root_objects_.end()) return false;
         root_objects_.erase(it);
+        bump_structure_revision();
         return true;
     }
 
@@ -195,7 +212,13 @@ public:
         return root_objects_;
     }
 
-    /** @brief Returns the list of root SceneObjects (mutable). */
+    /**
+     * @brief Returns the list of root SceneObjects (mutable).
+     *
+     * Adding or removing entries directly through this reference bypasses the component query
+     * cache -- call bump_structure_revision() afterwards (add_root_object() /
+     * remove_root_object() already do).
+     */
     std::vector<std::unique_ptr<SceneObject>>& root_objects() {
         return root_objects_;
     }
@@ -242,9 +265,9 @@ public:
         FrameContext ctx{delta_time, frame_index_.load(std::memory_order_relaxed), jobs_,
                          &commands_for(widx), widx};
         for (auto& entry : systems_) {
-            if (entry.first < static_cast<int>(UpdatePhase::LateBehaviour) &&
-                (simulating_ || entry.second->runs_in_edit_mode())) {
-                entry.second->execute(*this, ctx);
+            if (entry.order < static_cast<int>(UpdatePhase::LateBehaviour) &&
+                (simulating_ || entry.system->runs_in_edit_mode())) {
+                execute_timed_(entry, ctx);
             }
         }
     }
@@ -271,9 +294,9 @@ public:
         FrameContext ctx{delta_time, frame_index_.load(std::memory_order_relaxed), jobs_,
                          &commands_for(widx), widx};
         for (auto& entry : systems_) {
-            if (entry.first >= static_cast<int>(UpdatePhase::LateBehaviour) &&
-                (simulating_ || entry.second->runs_in_edit_mode())) {
-                entry.second->execute(*this, ctx);
+            if (entry.order >= static_cast<int>(UpdatePhase::LateBehaviour) &&
+                (simulating_ || entry.system->runs_in_edit_mode())) {
+                execute_timed_(entry, ctx);
             }
         }
         flush_commands();
@@ -338,6 +361,8 @@ public:
         obj.for_each_recursive([this](SceneObject& o) {
             for (auto& comp : o.components()) comp->scene = this;
         });
+        obj.set_structure_hook(&structure_revision_);
+        bump_structure_revision();
     }
 
     /** @brief The scene-wide named EventBus — see coopa/event/event_bus.h. */
@@ -397,9 +422,9 @@ public:
     ISceneSystem* add_system(std::unique_ptr<ISceneSystem> system, int order) {
         COOPA_SCENE_ACCESS_GUARD(*this);
         ISceneSystem* raw = system.get();
-        systems_.emplace_back(order, std::move(system));
+        systems_.push_back(SystemEntry{order, std::move(system), 0.0});
         std::stable_sort(systems_.begin(), systems_.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
+            [](const auto& a, const auto& b) { return a.order < b.order; });
         raw->on_attach(*this);
         return raw;
     }
@@ -410,9 +435,9 @@ public:
      */
     bool remove_system(const std::string& system_name) {
         auto it = std::find_if(systems_.begin(), systems_.end(),
-            [&](const auto& entry) { return system_name == entry.second->system_name(); });
+            [&](const auto& entry) { return system_name == entry.system->system_name(); });
         if (it == systems_.end()) return false;
-        it->second->on_detach(*this);
+        it->system->on_detach(*this);
         systems_.erase(it);
         return true;
     }
@@ -420,9 +445,29 @@ public:
     /** @brief Finds a registered system by system_name(), or nullptr. */
     ISceneSystem* find_system(const std::string& system_name) const {
         for (const auto& entry : systems_) {
-            if (system_name == entry.second->system_name()) return entry.second.get();
+            if (system_name == entry.system->system_name()) return entry.system.get();
         }
         return nullptr;
+    }
+
+    /** @brief One registered system's execute() time from the current frame, milliseconds. */
+    struct SystemTiming {
+        const char* name;  /**< ISceneSystem::system_name(). */
+        double      ms;    /**< Owner-thread milliseconds of the most recent execute(). */
+    };
+
+    /**
+     * @brief Owner-thread milliseconds each registered system's most recent execute() took, in
+     *        pipeline order -- both update() and late_update() phases. A system that did not run
+     *        this frame (edit mode, wrong phase) reports its last value; 0 before its first run.
+     */
+    std::vector<SystemTiming> system_timings() const {
+        std::vector<SystemTiming> out;
+        out.reserve(systems_.size());
+        for (const auto& entry : systems_) {
+            out.push_back(SystemTiming{entry.system->system_name(), entry.last_execute_ms});
+        }
+        return out;
     }
 
     /** @brief Monotonically increasing frame counter, incremented once per late_update(). */
@@ -442,6 +487,15 @@ public:
     bool is_simulating() const { return simulating_; }
 
     // --- Generic queries ---
+    //
+    // All three queries are served from a per-type cache keyed to structure_revision_: the full
+    // hierarchy walk (and its dynamic_cast per component) runs only on the first query of a type
+    // after a structural change. SceneObject bumps the revision through its structure hook on
+    // every component add/remove, child attach/detach and active toggle, and Scene bumps it in
+    // add_root_object()/remove_root_object()/adopt() -- so with a static hierarchy the walks
+    // disappear from the frame entirely. The cache mutex keeps a read-only worker job's query
+    // safe against the owner thread querying concurrently (both are reads of scene state, but a
+    // miss writes the cache).
 
     /**
      * @brief Returns a flat list of every active component of type T in the scene hierarchy.
@@ -450,15 +504,13 @@ public:
      */
     template<typename T>
     std::vector<T*> get_components() const {
+        std::lock_guard<std::mutex> lock(component_cache_mutex_);
+        const ComponentCacheEntry& entry = cached_entry_<T>();
         std::vector<T*> result;
-        for (const auto& root : root_objects_) {
-            root->for_each_recursive([&](const SceneObject& obj) {
-                if (!obj.active()) return;
-                if (auto* c = const_cast<SceneObject&>(obj).template get_component<T>()) {
-                    result.push_back(c);
-                }
-            });
-        }
+        result.reserve(entry.components.size());
+        // static_cast, not another dynamic_cast: each pointer was produced by
+        // get_component<T>() during the cached walk, so its dynamic type is known.
+        for (Component* c : entry.components) result.push_back(static_cast<T*>(c));
         return result;
     }
 
@@ -469,16 +521,8 @@ public:
      */
     template<typename T>
     std::vector<SceneObject*> find_objects_with() const {
-        std::vector<SceneObject*> result;
-        for (const auto& root : root_objects_) {
-            root->for_each_recursive([&](const SceneObject& obj) {
-                if (!obj.active()) return;
-                if (obj.template get_component<T>()) {
-                    result.push_back(const_cast<SceneObject*>(&obj));
-                }
-            });
-        }
-        return result;
+        std::lock_guard<std::mutex> lock(component_cache_mutex_);
+        return cached_entry_<T>().objects;
     }
 
     /**
@@ -488,16 +532,20 @@ public:
      */
     template<typename T>
     T* find_first_component() const {
-        T* found = nullptr;
-        for (const auto& root : root_objects_) {
-            root->for_each_recursive([&](const SceneObject& obj) {
-                if (!found && obj.active()) {
-                    found = const_cast<SceneObject&>(obj).template get_component<T>();
-                }
-            });
-            if (found) return found;
-        }
-        return nullptr;
+        std::lock_guard<std::mutex> lock(component_cache_mutex_);
+        const ComponentCacheEntry& entry = cached_entry_<T>();
+        return entry.components.empty() ? nullptr : static_cast<T*>(entry.components.front());
+    }
+
+    /**
+     * @brief Invalidates the cached component queries after a structural change the Scene could
+     *        not observe (e.g. entries added to or removed from the mutable root_objects()
+     *        reference directly). The ordinary mutation paths -- SceneObject's component and
+     *        child methods on an adopted object, add_root_object(), adopt(), set_active() --
+     *        already do this.
+     */
+    void bump_structure_revision() {
+        structure_revision_.fetch_add(1, std::memory_order_relaxed);
     }
 
     /**
@@ -558,6 +606,59 @@ public:
     }
 
 private:
+    /** @brief One component type's cached query results -- see the queries' section doc. */
+    struct ComponentCacheEntry {
+        uint64_t                  revision = 0; /**< structure_revision_ the walk ran at. */
+        std::vector<Component*>   components;   /**< First T on each matching object, pre-order. */
+        std::vector<SceneObject*> objects;      /**< The objects those components sit on. */
+    };
+
+    /**
+     * @brief The cached (and, when stale, rebuilt) query results for T. Caller holds
+     *        component_cache_mutex_. The walk and filter are exactly the queries' documented
+     *        semantics: pre-order over every root, skipping each inactive object itself (an
+     *        inactive parent's active descendants are still visited), first component of type T
+     *        per object.
+     */
+    template<typename T>
+    const ComponentCacheEntry& cached_entry_() const {
+        ComponentCacheEntry& entry = component_cache_[std::type_index(typeid(T))];
+        const uint64_t revision = structure_revision_.load(std::memory_order_relaxed);
+        // COOPA_SCENE_NOCACHE=1 re-walks on every query -- the diagnostic for a suspected
+        // missing invalidation (a mutation path without a revision bump): behaviour that
+        // changes with it points there.
+        static const bool force_walk = std::getenv("COOPA_SCENE_NOCACHE") != nullptr;
+        if (!force_walk && entry.revision == revision) return entry;
+        entry.components.clear();
+        entry.objects.clear();
+        for (const auto& root : root_objects_) {
+            root->for_each_recursive([&entry](const SceneObject& obj) {
+                if (!obj.active()) return;
+                if (auto* c = const_cast<SceneObject&>(obj).template get_component<T>()) {
+                    entry.components.push_back(c);
+                    entry.objects.push_back(const_cast<SceneObject*>(&obj));
+                }
+            });
+        }
+        entry.revision = revision;
+        return entry;
+    }
+
+    /** @brief One registered system: its order slot, the system, and its last timing. */
+    struct SystemEntry {
+        int                           order;
+        std::unique_ptr<ISceneSystem> system;
+        double                        last_execute_ms = 0.0; /**< See system_timings(). */
+    };
+
+    /** @brief Runs one system's execute() and records its owner-thread milliseconds. */
+    void execute_timed_(SystemEntry& entry, const FrameContext& ctx) {
+        const auto start = std::chrono::steady_clock::now();
+        entry.system->execute(*this, ctx);
+        entry.last_execute_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+
     /**
      * @brief Stamps Component::scene = this on every component in the hierarchy.
      *
@@ -566,12 +667,15 @@ private:
      * via set_active(true). Shared by start() and the move operations (a
      * moved-into Scene has a different address than the one that may have
      * already run start() before the move — see the move ctor/assignment doc).
+     * Also points every object's structure hook at this Scene's revision
+     * counter, for the component query cache.
      */
     void restamp_scene_pointers_() {
         for (auto& root : root_objects_) {
             root->for_each_recursive([this](SceneObject& obj) {
                 for (auto& comp : obj.components()) comp->scene = this;
             });
+            root->set_structure_hook(&structure_revision_);
         }
     }
 
@@ -596,13 +700,23 @@ private:
     coopa::event::EventBus                    events_;       /**< Scene-wide named signal bus. */
 
     /** @brief Registered systems, kept sorted ascending by order; equal orders keep insertion order. */
-    std::vector<std::pair<int, std::unique_ptr<ISceneSystem>>> systems_;
+    std::vector<SystemEntry> systems_;
     coopa::job::JobEngine* jobs_ = nullptr; /**< Non-owning. See set_job_engine(). */
     bool                   simulating_ = true; /**< See set_simulating(). */
     std::atomic<uint64_t>  frame_index_{0}; /**< Bumped once per late_update(); atomic so a worker job may read it. */
 
     /// @brief Per-worker deferred command buffers -- see commands_for()/flush_commands().
     std::vector<SceneCommandBuffer> worker_commands_;
+
+    /// @brief Bumped on every structural change (see bump_structure_revision()); every adopted
+    /// SceneObject's structure hook points here. Atomic: workers read it through the hook, and
+    /// starts at 1 so a default ComponentCacheEntry (revision 0) is always stale.
+    mutable std::atomic<uint64_t> structure_revision_{1};
+    /// @brief Cached query results per component type -- see cached_entry_(). Mutable: queries
+    /// are const. Guarded by component_cache_mutex_ (a worker job may query concurrently with
+    /// the owner thread; neither mutex member takes part in a Scene move).
+    mutable std::unordered_map<std::type_index, ComponentCacheEntry> component_cache_;
+    mutable std::mutex component_cache_mutex_;
 
 #ifdef COOPA_SCENE_THREAD_CHECKS
     friend class SceneAccessGuard;
