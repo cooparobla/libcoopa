@@ -470,6 +470,19 @@ public:
         return out;
     }
 
+    /**
+     * @brief Every registered system's ISceneSystem::warm_up_state(), in pipeline order.
+     *
+     * For a host holding a loading screen up until a streamed world is actually built. Systems
+     * that stream nothing report `participates == false` and can simply be skipped.
+     */
+    std::vector<WarmupState> warm_up_states() const {
+        std::vector<WarmupState> out;
+        out.reserve(systems_.size());
+        for (const auto& entry : systems_) out.push_back(entry.system->warm_up_state());
+        return out;
+    }
+
     /** @brief Monotonically increasing frame counter, incremented once per late_update(). */
     uint64_t frame_index() const { return frame_index_.load(std::memory_order_relaxed); }
 

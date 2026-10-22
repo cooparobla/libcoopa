@@ -99,6 +99,27 @@ struct FrameContext {
 };
 
 /**
+ * @struct WarmupState
+ * @brief What a system still has to build before its scene is worth showing.
+ *
+ * A streamed world is not finished when its scene activates: terrain is still meshing, water is
+ * still baking, the navmesh has not been built. A host that wants to hold a loading screen up
+ * until the world is actually there asks every installed system for this and waits for all of
+ * them (see toy::core::SceneLoadStage::Warming).
+ *
+ * `participates` is what keeps the default harmless: a system that reports false is ignored
+ * entirely rather than counted as instantly warm, so a scene warms on exactly the systems that
+ * have something to warm.
+ */
+struct WarmupState {
+    bool        participates = false;  ///< False: this system has nothing to warm; ignore it.
+    bool        warm = true;           ///< True once its outstanding work is done.
+    float       progress = 1.0f;       ///< 0..1, for a loading bar.
+    int         remaining = 0;         ///< Items still outstanding, for a status line.
+    const char* what = "";             ///< What it is building: "terrain", "water", "navigation".
+};
+
+/**
  * @class ISceneSystem
  * @brief A unit of per-frame scene work, run at a fixed point in the phase order.
  *
@@ -137,6 +158,15 @@ public:
      * keep running. Default false: a system is gameplay unless it says otherwise.
      */
     virtual bool runs_in_edit_mode() const { return false; }
+
+    /**
+     * @brief What this system still has to build before the scene is worth showing.
+     *
+     * Default: participates in nothing, so a system that streams nothing needs no override and
+     * never holds a loading screen up. Called once per frame while a scene is warming, so it
+     * must be a cheap read of state the system already keeps -- never work of its own.
+     */
+    virtual WarmupState warm_up_state() const { return {}; }
 };
 
 /**

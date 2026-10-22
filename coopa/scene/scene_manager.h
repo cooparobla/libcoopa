@@ -270,10 +270,13 @@ private:
         if (active.empty()) return;
 
         if (jobs_ && active.size() > 1) {
+            // Normal help floor: a scene phase is frame-critical, so a thread waiting here must
+            // not run a background Low job (a terrain chunk mesh, an asset bake) mid-wait.
             jobs_->parallel_for_blocking(active.size(), 1,
                 [&active, &phase](size_t start, size_t end) {
                     for (size_t i = start; i < end; ++i) phase(*active[i]);
-                });
+                },
+                0, coopa::job::Priority::Normal, coopa::job::Priority::Normal);
         } else {
             for (Scene* s : active) phase(*s);
         }

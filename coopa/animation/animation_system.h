@@ -145,7 +145,7 @@ private:
                     animators_[i]->evaluate_(scratch_.data() + offsets_[i]);
                 }
             },
-            k_animation_job_type);
+            k_animation_job_type, coopa::job::Priority::Normal, coopa::job::Priority::Normal);
     }
 
     // Follows AssetManager::k_asset_io_job_type's precedent: any value >=

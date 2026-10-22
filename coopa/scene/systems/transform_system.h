@@ -69,7 +69,8 @@ public:
                     for (size_t i = start; i < end; ++i) {
                         resolve_subtree(*roots[i]);
                     }
-                });
+                },
+                0, coopa::job::Priority::Normal, coopa::job::Priority::Normal);
         } else {
             for (auto& root : roots) resolve_subtree(*root);
         }
