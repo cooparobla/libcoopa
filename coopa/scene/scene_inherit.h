@@ -36,6 +36,11 @@
  *   - `children:` entries match by `name`. Matched children merge in place
  *     (preserving the base's position — draw/traversal order is significant
  *     throughout this codebase); unmatched children append.
+ *   - An `Animator` component's `states:` entries match by `name` — the one
+ *     list field inside a component that merges entry-wise rather than
+ *     replacing. Matched states deep-merge in place (so a variant rig
+ *     re-points one `clip` without restating the set), unmatched append.
+ *     Every other sequence inside a component still replaces wholesale.
  *   - A component or child entry carrying `remove: true` deletes every
  *     matching base entry instead of merging.
  *
@@ -305,6 +310,13 @@ private:
 
             if (matches.size() == 1) {
                 fkyaml::node merged = merge_map_(seq[matches[0]], over_comp);
+                // An Animator's `states` is the one list field matched entry-wise (by `name`),
+                // so a variant rig can retarget or add a single clip without restating the set.
+                if (tag == "Animator" && seq[matches[0]].is_mapping() &&
+                    seq[matches[0]].contains("states") && over_comp.is_mapping() &&
+                    over_comp.contains("states")) {
+                    merged["states"] = merge_states_(seq[matches[0]].at("states"), over_comp.at("states"));
+                }
                 erase_key_(merged, "remove");
                 seq[matches[0]] = merged;
             } else {
@@ -315,6 +327,67 @@ private:
                         " base entries); appending instead of merging. Add an 'id:' to disambiguate.");
                 }
                 fkyaml::node appended = over_comp;
+                erase_key_(appended, "remove");
+                seq.push_back(appended);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @brief Merges an override Animator `states[]` list onto a base one, matched by `name`,
+     *        preserving base ordering.
+     *
+     * The single exception to "sequences replace wholesale" (see this file's merge rules).
+     * A state's `name` is its identity: a matched entry deep-merges, so re-pointing one
+     * `clip` is a one-key override and every other state keeps coming from the base.
+     * Unmatched entries append; `remove: true` drops a state the base declared.
+     *
+     * Two base states sharing a `name` is a malformed Animator — Animator::find_state()
+     * takes the first at runtime — so this merges into the first and warns, rather
+     * than appending a third entry none of the three would win.
+     */
+    static fkyaml::node merge_states_(const fkyaml::node& base_seq, const fkyaml::node& over_seq) {
+        if (!over_seq.is_sequence()) return over_seq;
+        fkyaml::node result = base_seq.is_sequence() ? base_seq : fkyaml::node::sequence();
+        auto& seq = result.as_seq();
+
+        for (const auto& over_state : over_seq) {
+            const std::string name = (over_state.is_mapping() && over_state.contains("name"))
+                ? over_state.at("name").get_value<std::string>() : "";
+
+            long match = -1;
+            int hits = 0;
+            if (!name.empty()) {
+                for (std::size_t i = 0; i < seq.size(); ++i) {
+                    if (!seq[i].is_mapping() || !seq[i].contains("name")) continue;
+                    if (seq[i].at("name").get_value<std::string>() != name) continue;
+                    ++hits;
+                    if (match < 0) match = static_cast<long>(i);
+                }
+            }
+            if (hits > 1) {
+                coopa::debug::Logger("SceneInheritance").warn(
+                    "the base Animator declares " + std::to_string(hits) + " states named '" + name +
+                    "'; merging the override into the first (give each state a unique name)");
+            }
+
+            if (truthy_(over_state, "remove")) {
+                for (std::size_t i = seq.size(); i-- > 0;) {
+                    if (seq[i].is_mapping() && seq[i].contains("name") &&
+                        seq[i].at("name").get_value<std::string>() == name) {
+                        seq.erase(seq.begin() + static_cast<long>(i));
+                    }
+                }
+                continue;
+            }
+
+            if (match >= 0) {
+                fkyaml::node merged = merge_map_(seq[static_cast<std::size_t>(match)], over_state);
+                erase_key_(merged, "remove");
+                seq[static_cast<std::size_t>(match)] = merged;
+            } else {
+                fkyaml::node appended = over_state;
                 erase_key_(appended, "remove");
                 seq.push_back(appended);
             }

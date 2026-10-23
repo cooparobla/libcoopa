@@ -16,8 +16,10 @@
 #include <coopa/job/engine.h>
 #include <coopa/scene/component.h>
 #include <coopa/scene/scene.h>
+#include <coopa/scene/scene_inherit.h>
 #include <coopa/scene/scene_loader.h>
 #include <coopa/scene/scene_object.h>
+#include <coopa/yaml/document.h>
 
 #include <chrono>
 #include <cmath>
@@ -102,6 +104,78 @@ std::string only_label(const coopa::scene::SceneObject& obj) {
 coopa::scene::Scene load(const std::string& path) {
     register_test_components();
     return coopa::scene::SceneLoader::load(path);
+}
+
+// The `states` merge is asserted on the merged YAML rather than on an attached Animator:
+// coopa::anim is a layer above this one, and SceneInheritance::resolve is the public entry
+// point that does expose the merged node (SceneLoader itself does not).
+fkyaml::node merged_components(const std::string& scene_path, const std::string& object_name) {
+    const fkyaml::node root = coopa::scene::SceneInheritance::resolve(
+        scene_path, [](const std::string& p) { return coopa::yaml::load_document(p); });
+    for (const auto& obj : root.at("scene").at("root_objects")) {
+        if (obj.contains("name") && obj.at("name").get_value<std::string>() == object_name) {
+            return obj.contains("components") ? obj.at("components") : fkyaml::node::sequence();
+        }
+    }
+    return fkyaml::node::sequence();
+}
+
+/** @brief The named component's named list field, or an empty sequence. */
+fkyaml::node merged_list(const std::string& scene_path, const std::string& type, const std::string& field) {
+    for (const auto& c : merged_components(scene_path, "Derived")) {
+        if (!c.contains("type") || c.at("type").get_value<std::string>() != type) continue;
+        return c.contains(field) ? c.at(field) : fkyaml::node::sequence();
+    }
+    return fkyaml::node::sequence();
+}
+
+/** @brief `field` of the entry named `name`, or "" when absent. */
+std::string entry_field(const fkyaml::node& list, const std::string& name, const std::string& field) {
+    for (const auto& e : list) {
+        if (!e.contains("name") || e.at("name").get_value<std::string>() != name) continue;
+        return e.contains(field) ? e.at(field).get_value<std::string>() : std::string();
+    }
+    return {};
+}
+
+/** @brief Numeric `field` of the entry named `name`, or NaN when absent. */
+double entry_number(const fkyaml::node& list, const std::string& name, const std::string& field) {
+    for (const auto& e : list) {
+        if (!e.contains("name") || e.at("name").get_value<std::string>() != name) continue;
+        if (e.contains(field)) return e.at(field).get_value<double>();
+    }
+    return std::nan("");
+}
+
+std::vector<std::string> entry_names(const fkyaml::node& list) {
+    std::vector<std::string> out;
+    for (const auto& e : list) {
+        out.push_back(e.contains("name") ? e.at("name").get_value<std::string>() : std::string());
+    }
+    return out;
+}
+
+/** @brief A base rig owning three clips, plus a derived object overriding `states` with `over`. */
+std::string write_rig_fixture(const std::string& over) {
+    write_scratch_file("rig.yaml",
+        "object:\n"
+        "  name: Rig\n"
+        "  components:\n"
+        "    - type: Animator\n"
+        "      auto_play: idle\n"
+        "      default_crossfade: 0.15\n"
+        "      states:\n"
+        "        - {name: idle, clip: animations/rig/idle.yaml}\n"
+        "        - {name: walk, clip: animations/rig/walk.yaml}\n"
+        "        - {name: run, clip: animations/rig/run.yaml}\n");
+    return write_scratch_file("scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: rig.yaml\n"
+        "      components:\n"
+        "        - type: Animator\n"
+        "          states:\n" + over);
 }
 
 } // namespace
@@ -256,6 +330,110 @@ COOPA_TEST(remove_true_drops_inherited_components_and_children) {
     EXPECT_EQ(only_label(*obj), std::string("keep"));
     ASSERT_EQ(obj->children().size(), 1u);
     EXPECT_EQ(obj->children()[0]->name(), std::string("KeepChild"));
+}
+
+COOPA_TEST(animator_states_merge_by_name_keeping_the_rest_of_the_set) {
+    const std::string scene = write_rig_fixture(
+        "            - {name: walk, clip: animations/derived/strut.yaml}\n");
+
+    const fkyaml::node states = merged_list(scene, "Animator", "states");
+    // The override names one state: the other two still come from the base, in base order.
+    ASSERT_EQ(states.size(), 3u);
+    EXPECT_EQ(entry_names(states), (std::vector<std::string>{"idle", "walk", "run"}));
+    EXPECT_EQ(entry_field(states, "walk", "clip"), std::string("animations/derived/strut.yaml"));
+    EXPECT_EQ(entry_field(states, "idle", "clip"), std::string("animations/rig/idle.yaml"));
+    EXPECT_EQ(entry_field(states, "run", "clip"), std::string("animations/rig/run.yaml"));
+}
+
+COOPA_TEST(animator_state_override_merges_key_by_key) {
+    const std::string scene = write_rig_fixture("            - {name: run, speed: 1.5}\n");
+
+    const fkyaml::node states = merged_list(scene, "Animator", "states");
+    ASSERT_EQ(states.size(), 3u);
+    // `speed` arrives without disturbing the clip the base pointed `run` at.
+    EXPECT_EQ(entry_field(states, "run", "clip"), std::string("animations/rig/run.yaml"));
+    EXPECT_NEAR(entry_number(states, "run", "speed"), 1.5, 1e-9);
+    // Scalars beside `states` on the same component keep inheriting.
+    bool checked = false;
+    for (const auto& c : merged_components(scene, "Derived")) {
+        if (!c.contains("type") || c.at("type").get_value<std::string>() != "Animator") continue;
+        EXPECT_EQ(c.at("auto_play").get_value<std::string>(), std::string("idle"));
+        checked = true;
+    }
+    EXPECT_TRUE(checked);
+}
+
+COOPA_TEST(animator_states_append_when_the_name_is_new) {
+    const std::string scene = write_rig_fixture(
+        "            - {name: swim, clip: animations/derived/swim.yaml}\n");
+
+    const fkyaml::node states = merged_list(scene, "Animator", "states");
+    ASSERT_EQ(states.size(), 4u);
+    EXPECT_EQ(entry_names(states), (std::vector<std::string>{"idle", "walk", "run", "swim"}));
+    EXPECT_EQ(entry_field(states, "swim", "clip"), std::string("animations/derived/swim.yaml"));
+}
+
+COOPA_TEST(animator_state_remove_true_drops_an_inherited_state) {
+    const std::string scene = write_rig_fixture("            - {name: walk, remove: true}\n");
+
+    const fkyaml::node states = merged_list(scene, "Animator", "states");
+    ASSERT_EQ(states.size(), 2u);
+    EXPECT_EQ(entry_names(states), (std::vector<std::string>{"idle", "run"}));
+    // `remove` is bookkeeping and must not survive into the merged document.
+    for (const auto& e : states) EXPECT_TRUE(!e.contains("remove"));
+}
+
+COOPA_TEST(animator_states_merge_into_the_first_of_a_duplicated_name) {
+    write_scratch_file("dup_rig.yaml",
+        "object:\n"
+        "  name: Rig\n"
+        "  components:\n"
+        "    - type: Animator\n"
+        "      states:\n"
+        "        - {name: walk, clip: animations/rig/walk_a.yaml}\n"
+        "        - {name: walk, clip: animations/rig/walk_b.yaml}\n");
+    const std::string scene = write_scratch_file("scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: dup_rig.yaml\n"
+        "      components:\n"
+        "        - type: Animator\n"
+        "          states:\n"
+        "            - {name: walk, clip: animations/derived/walk.yaml}\n");
+
+    // A duplicated name is a malformed Animator; the merge warns and takes the first, which is
+    // the one Animator::find_state() would play. It must not add a third.
+    const fkyaml::node states = merged_list(scene, "Animator", "states");
+    ASSERT_EQ(states.size(), 2u);
+    EXPECT_EQ(states[0].at("clip").get_value<std::string>(), std::string("animations/derived/walk.yaml"));
+    EXPECT_EQ(states[1].at("clip").get_value<std::string>(), std::string("animations/rig/walk_b.yaml"));
+}
+
+COOPA_TEST(lists_on_other_components_still_replace_wholesale) {
+    // The states merge is deliberately Animator-only: every other list field keeps the
+    // documented "sequences replace wholesale" behaviour.
+    write_scratch_file("loot_base.yaml",
+        "object:\n"
+        "  name: Base\n"
+        "  components:\n"
+        "    - type: LootTable\n"
+        "      entries:\n"
+        "        - {name: coin, chance: 0.5}\n"
+        "        - {name: gem, chance: 0.1}\n");
+    const std::string scene = write_scratch_file("scene.yaml",
+        "scene:\n"
+        "  root_objects:\n"
+        "    - name: Derived\n"
+        "      inherit_from: loot_base.yaml\n"
+        "      components:\n"
+        "        - type: LootTable\n"
+        "          entries:\n"
+        "            - {name: gem, chance: 0.9}\n");
+
+    const fkyaml::node entries = merged_list(scene, "LootTable", "entries");
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_EQ(entry_names(entries), (std::vector<std::string>{"gem"}));
 }
 
 COOPA_TEST(scene_level_inherit_merges_root_objects_and_settings) {
