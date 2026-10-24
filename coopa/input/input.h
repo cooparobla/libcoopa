@@ -78,8 +78,19 @@ public:
 
     /// @brief Records a keyboard transition. Repeats update key_events() but
     /// leave down/pressed/released untouched — the key was already down.
+    ///
+    /// A modifier key's own bit in the level-triggered mods() state comes from
+    /// the transition rather than from the event's mask: X11 — and so GLFW,
+    /// which passes the mask through unchanged — stamps a key event with the
+    /// modifier state from *before* it, so a Control press carries no Control
+    /// bit and a Control release still carries one. Latching the mask verbatim
+    /// leaves mods() reporting Control held until the next key or button
+    /// event, long after the user let go. The event's own mods stay exactly as
+    /// the platform reported them: that is what a chord like Ctrl+Z matches
+    /// on, and there the pre-event state is the correct one.
     void push_key(Key key, int scancode, KeyAction action, Mods mods) {
-        mods_ = mods;
+        const Mods own = mod_bit_of(key);
+        mods_ = action == KeyAction::Release ? mods & ~own : mods | own;
         key_events_.push_back(KeyEvent{key, scancode, action, mods});
         std::size_t i = index_of(key);
         if (i == kInvalid) return;
@@ -284,6 +295,17 @@ private:
     static std::size_t index_of(MouseButton button) {
         std::size_t i = static_cast<std::size_t>(button);
         return i < kButtonCount ? i : kInvalid;
+    }
+
+    /// @brief The modifier bit `key` is, or Mods::None for every other key.
+    static constexpr Mods mod_bit_of(Key key) {
+        switch (key) {
+            case Key::LeftShift:   case Key::RightShift:   return Mods::Shift;
+            case Key::LeftControl: case Key::RightControl: return Mods::Control;
+            case Key::LeftAlt:     case Key::RightAlt:     return Mods::Alt;
+            case Key::LeftSuper:   case Key::RightSuper:   return Mods::Super;
+            default: return Mods::None;
+        }
     }
 
     IInputBackend* backend_ = nullptr;

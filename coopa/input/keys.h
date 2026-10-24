@@ -99,6 +99,11 @@ constexpr Mods operator&(Mods a, Mods b) {
     return static_cast<Mods>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
 }
 
+/// @brief Complements a modifier mask, for clearing bits (`m & ~Mods::Control`).
+constexpr Mods operator~(Mods m) {
+    return static_cast<Mods>(static_cast<uint8_t>(~static_cast<uint8_t>(m)));
+}
+
 /// @brief True if `set` contains every bit set in `m` (e.g. a Ctrl+Shift
 /// chord's `has(mods, Mods::Control | Mods::Shift)`). `m == Mods::None`
 /// always returns true, since the empty mask's bits are trivially all

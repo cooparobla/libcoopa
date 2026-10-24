@@ -117,6 +117,10 @@ struct WarmupState {
     float       progress = 1.0f;       ///< 0..1, for a loading bar.
     int         remaining = 0;         ///< Items still outstanding, for a status line.
     const char* what = "";             ///< What it is building: "terrain", "water", "navigation".
+    /// ISceneSystem::system_name(), filled in by Scene::warm_up_states() -- a system reporting
+    /// its own state leaves this alone. A stable key for a host tracking one system across
+    /// frames, where `what` is a label meant for a status line.
+    const char* name = "";
 };
 
 /**

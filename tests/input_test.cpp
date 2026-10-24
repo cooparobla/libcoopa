@@ -2,7 +2,8 @@
  * @file input_test.cpp
  * @brief coopa::input::Input frame state: press/release edges cleared by begin_frame(), held
  *        time, sub-frame clicks registering both edges, cursor-delta suppression on the first
- *        sample and after a cursor-mode change, and releasing everything on focus loss.
+ *        sample and after a cursor-mode change, releasing everything on focus loss, and the
+ *        modifier level state surviving the platform's pre-event modifier masks.
  */
 #include <coopa/testing/test.h>
 
@@ -95,4 +96,34 @@ COOPA_TEST(focus_loss_releases_every_held_key) {
     EXPECT_FALSE(input.key_down(Key::W));
     EXPECT_TRUE(input.key_released(Key::W));
     EXPECT_FALSE(input.focused());
+}
+
+COOPA_TEST(a_modifier_release_clears_its_bit_despite_the_platform_mask) {
+    Input input;
+    input.begin_frame(0.016f);
+
+    // The exact event stream X11/GLFW deliver for Ctrl+Z: every event carries the
+    // modifier state from *before* it, so Control's own press reports no Control
+    // bit and its release still reports one.
+    input.push_key(Key::LeftControl, 0, KeyAction::Press, Mods::None);
+    EXPECT_TRUE(input.mod_down(Mods::Control));          // held, whatever the mask said
+
+    input.push_key(Key::Z, 0, KeyAction::Press, Mods::Control);
+    input.push_key(Key::Z, 0, KeyAction::Release, Mods::Control);
+    EXPECT_TRUE(input.mod_down(Mods::Control));          // still held here
+
+    input.push_key(Key::LeftControl, 0, KeyAction::Release, Mods::Control);
+    EXPECT_FALSE(input.mod_down(Mods::Control));         // let go, so not held
+
+    // And it stays let go across frames: nothing re-latches it, so a wheel notch
+    // (which carries no mods of its own) is not read as a Ctrl chord.
+    input.begin_frame(0.016f);
+    input.push_scroll(0.0, 1.0);
+    EXPECT_FALSE(input.mod_down(Mods::Control));
+    EXPECT_TRUE(input.mods() == Mods::None);
+
+    // Other keys' events still set the level state from their mask -- a chord
+    // pressed with Shift held reads as Shift held.
+    input.push_key(Key::A, 0, KeyAction::Press, Mods::Shift);
+    EXPECT_TRUE(input.mod_down(Mods::Shift));
 }
