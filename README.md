@@ -29,6 +29,12 @@ consumer.
   reads and writes (read-after-write, write-after-read, write-after-write).
 - **Thread-safe containers.** `ParallelQueue`, `ParallelVector` and `ParallelMap` (over
   `phmap`).
+- **Node graphs** (`coopa/nodegraph/`). A generic graph evaluator that knows no types of its own: a
+  consumer registers its socket types and node types, and the module validates, compiles and
+  evaluates the graph. Compilation flattens node groups, inserts implicit conversions, prunes
+  whatever cannot reach a requested output and fuses runs of cheap nodes into chains; evaluation
+  runs one job per chain over the job system, or inline on the calling thread when no `JobEngine`
+  is given. Both paths produce identical results.
 
 ### Scenes
 - **Scene graph** (`coopa/scene/`). `Scene` owns `SceneObject`s, which own `Component`s
@@ -191,6 +197,7 @@ touched after destruction) unconditionally.
 coopa/
 ├── job/          JobEngine, JobScheduler, handles, dependency graph, parallel_for
 │   └── collections/  work-stealing deque, ParallelQueue/Vector/Map
+├── nodegraph/    socket types, Graph, compile(), job-parallel evaluate(), diagnostics
 ├── scene/        Scene, SceneObject, Component, systems, SceneLoader, SceneManager
 ├── asset/        AssetManager, handles, loaders, search roots, name index
 ├── animation/    Animator, AnimationClip, curves, procedural tracks, AnimationSystem
@@ -232,6 +239,7 @@ plans/            design notes
 ## Documentation
 
 - Module READMEs: [job](coopa/job/README.md), [job collections](coopa/job/collections/README.md),
+  [nodegraph](coopa/nodegraph/README.md),
   [scene](coopa/scene/README.md), [scene components](coopa/scene/components/README.md),
   [asset](coopa/asset/README.md), [animation](coopa/animation/README.md),
   [routine](coopa/routine/README.md), [input](coopa/input/README.md),
