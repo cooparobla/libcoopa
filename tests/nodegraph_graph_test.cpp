@@ -245,6 +245,121 @@ COOPA_TEST(a_graph_survives_a_yaml_round_trip_byte_for_byte) {
     expect(loaded_mul->ui_position.x == 120.0f, "nodegraph: the UI position survived");
 }
 
+COOPA_TEST(links_can_be_found_from_either_end) {
+    nodegraph_fixtures::setup();
+    Graph g;
+    NodeId src = nodegraph_fixtures::add_const(g, 1.0f);
+    NodeId h1 = g.add_node("Heavy");
+    NodeId h2 = g.add_node("Heavy");
+    g.add_link(SocketRef{src, "value"}, SocketRef{h1, "a"});
+    g.add_link(SocketRef{src, "value"}, SocketRef{h2, "a"});
+
+    expect(g.links_from(SocketRef{src, "value"}).size() == 2,
+           "nodegraph: links_from finds both consumers of one output. Only links_into existed, so "
+           "an editor redrawing wires when a node moves had to rescan every link by hand");
+    expect(g.links_from(SocketRef{src, "nope"}).empty(),
+           "nodegraph: and an output nothing leaves reports none");
+
+    expect(g.links_of(src).size() == 2, "nodegraph: links_of finds a node's outgoing links");
+    expect(g.links_of(h1).size() == 1, "nodegraph: and its incoming ones");
+    expect(g.links_of(999).empty(), "nodegraph: a node that is not there has none");
+}
+
+COOPA_TEST(remove_link_takes_exactly_one_of_several_into_a_multi_input) {
+    nodegraph_fixtures::setup();
+    Graph g;
+    NodeId a = nodegraph_fixtures::add_const(g, 1.0f);
+    NodeId b = nodegraph_fixtures::add_const(g, 2.0f);
+    NodeId sum = g.add_node("Sum");
+    g.add_link(SocketRef{a, "value"}, SocketRef{sum, "values"}, true);
+    g.add_link(SocketRef{b, "value"}, SocketRef{sum, "values"}, true);
+
+    const Link first = g.links().front();
+    expect(g.remove_link(first), "nodegraph: the link was found and removed");
+    const auto left = g.links_into(SocketRef{sum, "values"});
+    expect(left.size() == 1 && left[0]->from.node == b,
+           "nodegraph: and ONLY it. remove_links_into() clears the whole socket, which is the "
+           "wrong answer when a user picked one wire of several to cut");
+
+    expect(!g.remove_link(first), "nodegraph: removing it twice reports that it was already gone");
+}
+
+COOPA_TEST(duplicating_remaps_internal_links_and_drops_boundary_ones) {
+    nodegraph_fixtures::setup();
+    Graph g;
+    NodeId outside = nodegraph_fixtures::add_const(g, 5.0f);
+    NodeId a = g.add_node("Heavy");
+    NodeId b = g.add_node("Heavy");
+    g.node(a)->ui_position = glm::vec2(10.0f, 20.0f);
+    g.add_link(SocketRef{outside, "value"}, SocketRef{a, "a"});
+    g.add_link(SocketRef{a, "result"}, SocketRef{b, "a"});
+
+    const std::vector<NodeId> made = g.duplicate_nodes({a, b}, glm::vec2(50.0f, 0.0f));
+    expect(made.size() == 2, "nodegraph: two copies were made");
+    expect(g.nodes().size() == 5, "nodegraph: and the originals survive");
+    expect(made[0] != a && made[1] != b, "nodegraph: the copies have fresh ids");
+    expect(g.node(made[0])->ui_position == glm::vec2(60.0f, 20.0f),
+           "nodegraph: offset by the requested amount, so a copy is visibly not on its original");
+
+    const auto internal = g.links_into(SocketRef{made[1], "a"});
+    expect(internal.size() == 1 && internal[0]->from.node == made[0],
+           "nodegraph: a link with BOTH ends in the set is remapped onto the copies");
+    expect(g.links_into(SocketRef{made[0], "a"}).empty(),
+           "nodegraph: and one that crossed the boundary is dropped -- copying it would silently "
+           "attach a second consumer to the original's upstream");
+
+    expect(g.duplicate_nodes({999}, glm::vec2(0.0f)).empty(),
+           "nodegraph: duplicating an id that names no node yields nothing");
+}
+
+COOPA_TEST(two_links_into_a_plain_input_are_reported) {
+    nodegraph_fixtures::setup();
+    Graph g;
+    NodeId a = nodegraph_fixtures::add_const(g, 1.0f);
+    NodeId b = nodegraph_fixtures::add_const(g, 2.0f);
+    NodeId add = g.add_node("Add");
+
+    // Pushed straight onto links(), which is exactly what graph_from_node() does when loading a
+    // hand-written file -- add_link() would have replaced rather than appended.
+    g.links().push_back(Link{SocketRef{a, "value"}, SocketRef{add, "a"}, 0});
+    g.links().push_back(Link{SocketRef{b, "value"}, SocketRef{add, "a"}, 0});
+
+    Diagnostics diag;
+    const bool valid = g.validate(diag);
+    expect(!valid,
+           "nodegraph: a plain input with two links fails validation. The loader bypasses "
+           "add_link(), so a hand-written file can state this and the compiler would silently use "
+           "one and discard the other");
+    const std::string text = diag.to_string();
+    expect(text.find("multi-input") != std::string::npos && text.find("'a'") != std::string::npos,
+           "nodegraph: and the message names the socket: " + text);
+
+    int mentions = 0;
+    for (const auto& e : diag.entries()) {
+        if (e.message.find("multi-input") != std::string::npos) ++mentions;
+    }
+    expect(mentions == 1,
+           "nodegraph: reported ONCE for the socket, not once per offending link -- two messages "
+           "for one mistake is noise");
+}
+
+COOPA_TEST(a_multi_input_with_many_links_still_validates) {
+    nodegraph_fixtures::setup();
+    Graph g;
+    NodeId sum = g.add_node("Sum");
+    for (int i = 0; i < 3; ++i) {
+        NodeId c = nodegraph_fixtures::add_const(g, static_cast<float>(i));
+        g.add_link(SocketRef{c, "value"}, SocketRef{sum, "values"}, true);
+    }
+    nodegraph_fixtures::wire_float_output(g, "out", sum, "result");
+
+    Diagnostics diag;
+    const bool valid = g.validate(diag);
+    expect(valid,
+           "nodegraph: the new check is about PLAIN inputs only -- a multi-input exists precisely "
+           "to take several: " + diag.to_string());
+}
+
 COOPA_TEST(a_node_added_after_a_load_cannot_collide_with_a_loaded_id) {
     nodegraph_fixtures::setup();
     Graph g;

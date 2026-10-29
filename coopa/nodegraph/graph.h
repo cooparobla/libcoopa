@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -231,6 +232,25 @@ public:
     const std::vector<Link>& links() const { return links_; }
     std::vector<Link>&       links() { return links_; }
 
+    /**
+     * @brief Removes exactly one link.
+     *
+     * `remove_links_into()` removes every link into a socket, which is the wrong answer for a
+     * multi-input where a user picked one wire to cut. Matched by both endpoints and `order`, so
+     * two links differing only in order are distinguishable.
+     *
+     * @return Whether a matching link was found.
+     */
+    bool remove_link(const Link& link) {
+        for (auto it = links_.begin(); it != links_.end(); ++it) {
+            if (it->from == link.from && it->to == link.to && it->order == link.order) {
+                links_.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// @brief Every link feeding `to`, ordered by `order`.
     std::vector<const Link*> links_into(const SocketRef& to) const {
         std::vector<const Link*> out;
@@ -241,6 +261,66 @@ public:
             for (size_t j = i; j > 0 && out[j]->order < out[j - 1]->order; --j) std::swap(out[j], out[j - 1]);
         }
         return out;
+    }
+
+    /**
+     * @brief Every link leaving `from`, in declaration order.
+     *
+     * The mirror of `links_into()`. An editor needs it constantly -- to re-route wires when a node
+     * moves, to grey an output that feeds nothing, to warn before deleting a node -- and without
+     * it every caller re-scans `links()` by hand.
+     */
+    std::vector<const Link*> links_from(const SocketRef& from) const {
+        std::vector<const Link*> out;
+        for (const auto& l : links_) {
+            if (l.from == from) out.push_back(&l);
+        }
+        return out;
+    }
+
+    /// @brief Every link touching `node`, either end. For a deletion preview or a node drag.
+    std::vector<const Link*> links_of(NodeId node_id) const {
+        std::vector<const Link*> out;
+        for (const auto& l : links_) {
+            if (l.from.node == node_id || l.to.node == node_id) out.push_back(&l);
+        }
+        return out;
+    }
+
+    /**
+     * @brief Copies `ids` with fresh node ids, offset by `offset`.
+     *
+     * A link is copied only when **both** of its ends are in the set: a duplicated subgraph keeps
+     * its internal wiring, and its connections to the nodes it was copied away from are dropped
+     * rather than silently doubled onto the originals' upstream.
+     *
+     * @return The new ids, in the same order as `ids`. Ids that name no node are skipped.
+     */
+    std::vector<NodeId> duplicate_nodes(const std::vector<NodeId>& ids, glm::vec2 offset) {
+        std::unordered_map<NodeId, NodeId> remap;
+        std::vector<NodeId> made;
+        made.reserve(ids.size());
+        for (NodeId id : ids) {
+            const Node* src = node(id);
+            if (src == nullptr || remap.count(id) != 0) continue;
+            Node copy = *src;             // props, group_ref and ui_position come along.
+            copy.id = next_id_++;
+            copy.ui_position += offset;
+            remap.emplace(id, copy.id);
+            made.push_back(copy.id);
+            nodes_.push_back(std::move(copy));
+        }
+        // Collected first: push_back below would invalidate an iterator over links_.
+        std::vector<Link> fresh;
+        for (const auto& l : links_) {
+            auto from_it = remap.find(l.from.node);
+            auto to_it   = remap.find(l.to.node);
+            if (from_it == remap.end() || to_it == remap.end()) continue;
+            fresh.push_back(Link{SocketRef{from_it->second, l.from.socket},
+                                 SocketRef{to_it->second, l.to.socket}, l.order});
+        }
+        for (auto& l : fresh) links_.push_back(std::move(l));
+        return made;
     }
 
     // --- Interface ---
@@ -264,6 +344,32 @@ public:
             if (outputs_[i].identifier == id) return static_cast<int>(i);
         }
         return -1;
+    }
+
+    /**
+     * @brief The declaration a GroupInput / GroupOutput node carries, built from the interface.
+     *
+     * Those two node types are not in the NodeTypeRegistry -- their sockets ARE the interface, so
+     * there is nothing static to register. Anything that needs to know what sockets they have
+     * (validate(), compile(), and an editor laying them out or deciding whether a wire may land
+     * on one) must come through here, or it will see a node with no sockets at all.
+     *
+     * @param as_outputs True for GroupInput (the graph's inputs are its outputs), false for
+     *        GroupOutput (the graph's outputs are its inputs).
+     */
+    NodeDeclaration interface_declaration(bool as_outputs) const {
+        NodeDeclaration decl;
+        const std::vector<InterfaceSocket>& from = as_outputs ? inputs_ : outputs_;
+        std::vector<SocketDecl>& into = as_outputs ? decl.outputs : decl.inputs;
+        for (const auto& is : from) {
+            SocketDecl sd;
+            sd.identifier    = is.identifier;
+            sd.label         = is.label;
+            sd.type          = is.type;
+            sd.default_value = is.default_value;
+            into.push_back(std::move(sd));
+        }
+        return decl;
     }
 
     /**
@@ -299,11 +405,11 @@ public:
             // interface -- and it is what keeps validate() and compile() agreeing on what a valid
             // graph is, which they must, or a graph compiles but will not validate.
             if (n.type == k_group_input_type) {
-                decls.emplace(n.id, interface_declaration_(/*as_outputs=*/true));
+                decls.emplace(n.id, interface_declaration(/*as_outputs=*/true));
                 continue;
             }
             if (n.type == k_group_output_type) {
-                decls.emplace(n.id, interface_declaration_(/*as_outputs=*/false));
+                decls.emplace(n.id, interface_declaration(/*as_outputs=*/false));
                 continue;
             }
             const NodeType* type = NodeTypeRegistry::instance().find(n.type);
@@ -314,6 +420,9 @@ public:
             decls.emplace(n.id, type->declaration_for(n.props));
         }
 
+        // One message per over-subscribed socket, not one per offending link. Keyed by a
+        // comparable pair rather than SocketRef, which has equality but no ordering.
+        std::set<std::pair<NodeId, std::string>> counted_doubles;
         for (const auto& l : links_) {
             const Node* from_node = node(l.from.node);
             const Node* to_node   = node(l.to.node);
@@ -348,6 +457,57 @@ public:
                         "cannot connect " + reg.name_of(ft) + " to " + reg.name_of(tt) +
                         " (no conversion registered)");
             }
+
+            // A plain input takes ONE link. add_link() enforces that by replacing, but a file
+            // loaded through graph_from_node() pushes straight onto links_ and bypasses it -- so
+            // a hand-written graph can state two, and the compiler would silently use the first
+            // and discard the rest. Counted here rather than in the loader because it is the
+            // graph's invariant, not the file format's.
+            const std::pair<NodeId, std::string> socket_key{l.to.node, l.to.socket};
+            if (!to_it->second.inputs[ii].multi_input() && !counted_doubles.count(socket_key)) {
+                size_t n = 0;
+                for (const auto& other : links_) {
+                    if (other.to == l.to) ++n;
+                }
+                if (n > 1) {
+                    counted_doubles.insert(socket_key);
+                    out.add(Severity::Error, l.to.node, to_node->type,
+                            "input '" + l.to.socket + "' is not a multi-input but has " +
+                            std::to_string(n) + " links; only one would be used");
+                }
+            }
+        }
+
+        // An interface socket nothing is wired to is DEAD: the graph declares a parameter, a
+        // consumer binds it, and changing it does nothing at all. Nothing else reports this --
+        // the bake succeeds, the value is simply never read -- so it is a warning here, where
+        // both the editor and a headless compile will see it.
+        for (const InterfaceSocket& is : inputs_) {
+            bool read = false;
+            for (const Node& n : nodes_) {
+                if (n.type != k_group_input_type) continue;
+                for (const Link& l : links_) {
+                    if (l.from.node == n.id && l.from.socket == is.identifier) read = true;
+                }
+            }
+            if (!read) {
+                out.add(Severity::Warning, 0, k_group_input_type,
+                        "input '" + is.identifier + "' is declared but no node reads it, so "
+                        "changing it has no effect");
+            }
+        }
+        for (const InterfaceSocket& is : outputs_) {
+            bool written = false;
+            for (const Node& n : nodes_) {
+                if (n.type != k_group_output_type) continue;
+                for (const Link& l : links_) {
+                    if (l.to.node == n.id && l.to.socket == is.identifier) written = true;
+                }
+            }
+            if (!written) {
+                out.add(Severity::Warning, 0, k_group_output_type,
+                        "output '" + is.identifier + "' is declared but nothing is wired to it");
+            }
         }
 
         detect_cycles_(out);
@@ -355,26 +515,6 @@ public:
     }
 
 private:
-    /**
-     * @brief The declaration a GroupInput / GroupOutput node carries, built from the interface.
-     * @param as_outputs True for GroupInput (the graph's inputs are its outputs), false for
-     *        GroupOutput (the graph's outputs are its inputs).
-     */
-    NodeDeclaration interface_declaration_(bool as_outputs) const {
-        NodeDeclaration decl;
-        const std::vector<InterfaceSocket>& from = as_outputs ? inputs_ : outputs_;
-        std::vector<SocketDecl>& into = as_outputs ? decl.outputs : decl.inputs;
-        for (const auto& is : from) {
-            SocketDecl sd;
-            sd.identifier    = is.identifier;
-            sd.label         = is.label;
-            sd.type          = is.type;
-            sd.default_value = is.default_value;
-            into.push_back(std::move(sd));
-        }
-        return decl;
-    }
-
     /// @brief Kahn's algorithm; whatever is left when no node has in-degree 0 is in a cycle.
     void detect_cycles_(Diagnostics& out) const {
         std::unordered_map<NodeId, int> in_degree;
