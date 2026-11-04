@@ -391,6 +391,15 @@ public:
      * @param path The document's file path, existing or not.
      */
     static Scene load_from_node(const fkyaml::node& root, const std::string& path) {
+        return load_from_node(root, path, LoadOptions{});
+    }
+
+    /** @brief load_from_node(), with LoadOptions -- e.g. `{.start = false}` to build the scene
+     *         unstarted, so a caller whose components bind eagerly in start() (not lazily, on
+     *         their first real tick) can drain any load_async() asset loads the parsers just
+     *         queued before starting it, instead of components binding against assets that
+     *         are still Loading. */
+    static Scene load_from_node(const fkyaml::node& root, const std::string& path, const LoadOptions& options) {
         std::error_code ec;
         const std::filesystem::path self = std::filesystem::weakly_canonical(path, ec);
         fkyaml::node resolved = SceneInheritance::resolve(path, [&](const std::string& p) {
@@ -398,7 +407,7 @@ public:
             if (std::filesystem::weakly_canonical(p, ec2) == self || p == path) return root;
             return load_node_(p);
         });
-        return build_(resolved, path, LoadOptions{});
+        return build_(resolved, path, options);
     }
 
     /**

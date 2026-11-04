@@ -7,6 +7,17 @@ component types libcoopa never names (uicoopa's `RectTransform`,
 `Graphic::color`, a future gfxcoopa material property, ...) without a
 virtual hook on `coopa::scene::Component`.
 
+This is **property animation**: a clip's tracks address a scene object's path
+and a named property on one of its components (a `Transform`, or anything
+else `AnimatedPropertyRegistry` knows). It covers a camera move, a light
+flicker, a UI panel slide, procedural sway — and still covers a rig built the
+older way, as an object hierarchy posed by its own Transforms (`robot_arm`,
+`bouncing_ball`). A Blender-style skeleton — named bones with a rest pose,
+posed in a pose buffer and skinned to a mesh — is a separate module,
+`coopa/rig/` (see its own README); its `SkeletalAnimator` reuses this
+module's curve/keyframe/event/root-motion machinery directly, but blends by
+slerp into bone-space pose deltas rather than lerping a Transform's fields.
+
 It is a sibling of `coopa::scene`, not part of it — `coopa/scene/README.md`
 keeps that module free of any dependency beyond vendored fkYAML/glm and
 libcoopa's own `coopa::event`/`coopa::job`, and this module needs
@@ -241,7 +252,12 @@ the root stays, every segment keeps its length, and from the input pose each joi
 it can), `look_at_delta()` (clamped to `max_angle`, keeping the bone's up axis from rolling) and the
 world/local rotation helpers.
 
-`ik_components.h` wraps it:
+`ik_components.h` wraps it, addressing bones as paths through the scene-object hierarchy -- for an
+embedder with no skeleton component of its own. **toyengine itself does not use this path**:
+`Engine::init()` installs `coopa::rig`'s own `TwoBoneIK`/`ChainIK`/`LookAtIK` (same class names,
+bone-space, `coopa/rig/ik_components.h`) via `register_component_parser()` AFTER this module's,
+and that call is last-registration-wins, so in every toyengine asset these YAML keys always mean
+the rig-space form -- see `coopa/rig/README.md` and the `create-animation` skill.
 
 ```yaml
 - type: TwoBoneIK
